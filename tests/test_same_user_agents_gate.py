@@ -10,7 +10,8 @@ import time
 
 import pytest
 
-from synapse.daemon.same_user_gate import SameUserAgentsRefused, check_same_user_agents
+from synapse.daemon.same_user_gate import (
+    SameUserAgentsRefused, assess_exposure, check_same_user_agents, sandbox_note)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -83,3 +84,40 @@ def test_acknowledged_start_logs_warning_and_audits(world, via_env):
     with sqlite3.connect(state / "synapse.sqlite") as db:
         rows = db.execute("SELECT principal, decision FROM audit_entries WHERE action='agent_runtime.same_user_acknowledged'").fetchall()
     assert rows == [("daemon:startup", "allowed")]
+
+
+@pytest.mark.parametrize("owner,agent,sandbox,exposed,reason", [
+    (1000, 1000, False, True, "same_uid_no_sandbox"),
+    (1000, 1000, True, True, "same_uid_sandboxed"),
+    (1000, 1001, False, False, "different_uid"),
+    (1000, 1001, True, False, "different_uid"),
+    (None, 1000, True, True, "unknown_input"),
+    (1000, None, False, True, "unknown_input"),
+    ("1000", 1000, True, True, "unknown_input"),
+    (True, 1, True, True, "unknown_input"),
+    (-1, 1000, True, True, "unknown_input"),
+])
+def test_assess_exposure_verdicts_fail_closed(owner, agent, sandbox, exposed, reason):
+    verdict = assess_exposure(owner, agent, sandbox)
+    assert (verdict.exposed, verdict.reason) == (exposed, reason)
+
+
+@pytest.mark.parametrize("sandbox", [None, "yes", 1, 0])
+def test_unknown_sandbox_value_counts_as_unsandboxed(sandbox):
+    verdict = assess_exposure(1000, 1000, sandbox)
+    assert verdict.exposed and verdict.reason == "same_uid_no_sandbox" and not verdict.sandbox_configured
+    assert "no sandbox" in sandbox_note(verdict)
+
+
+def test_sandbox_does_not_bypass_flag_and_message_states_it(tmp_path, caplog):
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    with pytest.raises(SameUserAgentsRefused) as err:
+        check_same_user_agents(state, agents_enabled=True, allow=False, sandbox_configured=True)
+    assert "--allow-same-user-agents" in str(err.value) and "reduces but does not remove" in str(err.value)
+    with pytest.raises(SameUserAgentsRefused) as err:
+        check_same_user_agents(state, agents_enabled=True, allow=False, sandbox_configured=False)
+    assert "no sandbox is configured" in str(err.value)
+    with caplog.at_level("WARNING", logger="synapse.daemon"):
+        assert check_same_user_agents(state, agents_enabled=True, allow=True, sandbox_configured=True) is True
+    assert any("reduces but does not remove" in r.getMessage() for r in caplog.records)
