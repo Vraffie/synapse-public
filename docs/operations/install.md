@@ -32,6 +32,10 @@ It holds `synapse.sqlite`, the socket `agentd.sock` and the token files. Back it
 - `operator.token` is created by the daemon on first start (0600) and read by `agentctl` and the desktop.
 - The approver token is provisioned once with `agentctl --state-dir ... approver-init` (add `--rotate` to replace it). It is a same-user file: any process running as you can read it.
 
+## Threat model
+
+Everything here runs as one OS user. The opt-in user-scope sandbox (`sandbox` in the Claude CLI profile; needs `bwrap` and unprivileged user namespaces, and it fails closed when they are missing) and the opt-in passphrase verifier (`approver-passphrase.md`) are same-uid mitigations, not a security boundary. A sandboxed agent still runs as your uid with the network shared, and `--allow-same-user-agents` is still required with it. Same-uid code can brute-force the passphrase verifier offline. Do not describe approvals as human-only or as protecting you from a hostile agent; they catch mistakes and honest components. See `approver-identity.md` and ADR 019.
+
 ## Check it works
 
 ```sh
