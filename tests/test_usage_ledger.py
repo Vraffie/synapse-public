@@ -194,9 +194,9 @@ def test_usage_endpoint_returns_the_ledger_and_maps_errors(tmp_path):
         _seed(db)
         _observe(db, "a1", input_tokens=7, cost_usd=0.1)
 
-    def reader(run_id):  # a fresh connection per call, as the daemon's per-request readers do
+    def reader(run_id, limit, cursor):  # a fresh connection per call, as the daemon's per-request readers do
         with closing(open_database(path)) as db:
-            return read_run_usage(db, run_id)
+            return read_run_usage(db, run_id, limit=limit, cursor=cursor)
     with _client(reader) as client:
         ok = client.get("/api/v1/runs/r1/usage", headers=HEADERS)
         missing = client.get("/api/v1/runs/nope/usage", headers=HEADERS)
@@ -219,7 +219,7 @@ def test_cli_usage_command_requests_the_run_usage_endpoint(monkeypatch, capsys):
     seen = []
     monkeypatch.setattr(cli, "_request", lambda state_dir, endpoint, **kw: seen.append(endpoint) or {"run_id": "r1"})
     assert cli.main(["--state-dir", "/state", "usage", "r1"]) == 0
-    assert seen == ["/api/v1/runs/r1/usage"] and json.loads(capsys.readouterr().out) == {"run_id": "r1"}
+    assert seen == ["/api/v1/runs/r1/usage?limit=200"] and json.loads(capsys.readouterr().out) == {"run_id": "r1"}
     with pytest.raises(SystemExit):
         cli.main(["--state-dir", "/state", "usage", "a/b"])
     assert len(seen) == 1

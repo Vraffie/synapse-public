@@ -13,10 +13,10 @@ from PySide6.QtCore import QThread, Signal
 
 from synapse.cli.__main__ import DaemonHTTPError, _get, _request
 from synapse.desktop import approval_decision
-from synapse.desktop.agent_usage import sanitize_usage
+from synapse.desktop.agent_usage import MAX_ROWS, sanitize_usage
 from synapse.desktop.agent_view import UNAVAILABLE_STATUSES, clean, sanitize_detail
 from synapse.desktop.cursor_store import Cursor, CursorError, cursor_path, read_cursor, valid_event_id, write_cursor
-from synapse.desktop.mock_resume import ASSERTION, collect_evidence
+from synapse.desktop.mock_resume import ASSERTION, collect_evidence, fetch_all_tasks
 
 API_VERSION = "v1"  # the only API prefix this client speaks (/api/v1/...)
 MAX_BACKOFF = 15.0
@@ -316,7 +316,7 @@ class Poller(QThread):
 
     def _poll_usage(self, run_id, generation):
         try:
-            usage = sanitize_usage(self.fetch(self.state_dir, "/api/v1/runs/" + quote(run_id, safe="") + "/usage"))
+            usage = sanitize_usage(self.fetch(self.state_dir, "/api/v1/runs/" + quote(run_id, safe="") + f"/usage?limit={MAX_ROWS}"))
             if usage is None:
                 raise ValueError("invalid usage response")
             self.agent_usage.emit(run_id, generation, usage)
@@ -422,7 +422,7 @@ class Poller(QThread):
                     try:
                         base = '/api/v1/runs/' + quote(run_id, safe='')
                         before = self.fetch(self.state_dir, base)
-                        details = self.fetch(self.state_dir, base + '/tasks')
+                        details = fetch_all_tasks(self.fetch, self.state_dir, base)
                         after = self.fetch(self.state_dir, base)
                         prepared = collect_evidence(run_id, before, details, after)
                     except Exception:

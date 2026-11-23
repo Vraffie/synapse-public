@@ -1456,6 +1456,8 @@ Get Tasks.
 | Name | In | Required | Constraints |
 | --- | --- | --- | --- |
 | `run_id` | path | yes | string, minLength=1, maxLength=256 |
+| `cursor` | query | no | string, minLength=1, maxLength=1024 or null |
+| `limit` | query | no | integer, min=1, max=500, default=200 |
 
 **Responses**
 
@@ -1489,7 +1491,8 @@ Success (or idempotent replay of an earlier command).
         }
       ]
     }
-  ]
+  ],
+  "next_cursor": "string"
 }
 ```
 
@@ -1790,6 +1793,8 @@ Get Usage.
 | Name | In | Required | Constraints |
 | --- | --- | --- | --- |
 | `run_id` | path | yes | string, minLength=1, maxLength=256 |
+| `cursor` | query | no | string, minLength=1, maxLength=1024 or null |
+| `limit` | query | no | integer, min=1, max=500, default=200 |
 
 **Responses**
 
@@ -1846,7 +1851,8 @@ Success (or idempotent replay of an earlier command).
       "known": 1,
       "attempts": 1
     }
-  }
+  },
+  "next_cursor": "string"
 }
 ```
 

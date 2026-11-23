@@ -52,7 +52,7 @@ class Console:
                 return {'approvals': list(approvals)}
             if '/threads' in endpoint:
                 return {'threads': []}
-            if endpoint.endswith('/usage'):
+            if '/usage?' in endpoint:
                 if isinstance(self.usage, int):
                     raise DaemonHTTPError(self.usage)
                 return self.usage
@@ -529,6 +529,19 @@ def test_usage_table_distinguishes_zero_from_unknown(console):
     assert 'cache read unknown' in pane.totals.text().lower() and 'lower bound, 2/3' in pane.totals.text()
     assert 'estimate' in pane.table.horizontalHeaderItem(6).text() and 'never zero' in pane.intro.text()
     assert '2 of 3' in pane.status.text()
+    assert 'more exist' not in pane.status.text()
+
+
+def test_usage_pane_says_more_rows_exist_when_the_daemon_has_another_page(console):
+    from synapse.desktop import agent_usage
+    assert agent_usage.sanitize_usage(USAGE)['more'] is False
+    assert agent_usage.sanitize_usage(dict(USAGE, next_cursor=None))['more'] is False
+    assert agent_usage.sanitize_usage(dict(USAGE, next_cursor='abc'))['more'] is True
+    c = console(agent=DETAIL, usage=dict(USAGE, next_cursor='abc'))
+    select(c)
+    pane = c.window.usage_pane
+    spin(c.app, lambda: pane.table.rowCount() == 2)
+    assert 'first 2 rows; more exist (totals cover all rows)' in pane.status.text()
 
 
 def test_usage_empty_unavailable_and_invalid_states(console):
@@ -553,7 +566,7 @@ def test_sanitize_usage_rejects_bad_values_and_bounds_rows():
         assert agent_usage.sanitize_usage(dict(USAGE, observations=[dict(bad, **patch)])) is None, patch
     many = dict(USAGE, observations=[bad] * 500)
     out = agent_usage.sanitize_usage(many)
-    assert len(out['rows']) == agent_usage.MAX_ROWS and out['rows_total'] == 500
+    assert len(out['rows']) == agent_usage.MAX_ROWS and out['rows_total'] == 500 and out['more'] is True
     assert agent_usage.sanitize_usage([]) is None
 
 

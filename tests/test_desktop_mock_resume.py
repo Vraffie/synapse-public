@@ -85,7 +85,7 @@ def test_lost_response_retries_identical_confirmed_evidence(tmp_path, monkeypatc
             return {'approvals': []}
         if '/threads?' in endpoint:
             return {'threads': []}
-        if endpoint.endswith('/tasks'):
+        if '/tasks?' in endpoint:
             return details
         return snapshot
     def send(_dir, endpoint, **kwargs):
@@ -126,7 +126,7 @@ def test_changed_selection_during_confirmation_does_not_submit(tmp_path, monkeyp
         if 'events' in endpoint: return {'events': []}
         if 'approvals' in endpoint: return {'approvals': []}
         if '/threads?' in endpoint: return {'threads': []}
-        if endpoint.endswith('/tasks'): return details
+        if '/tasks?' in endpoint: return details
         return snapshot
     window = MainWindow(tmp_path, poller=Poller(tmp_path, fetch=fetch, send=lambda *a, **k: calls.append(a), interval=0.01))
     def change_input(parent, _preview):
@@ -192,7 +192,7 @@ def test_definite_conflict_can_be_discarded_only_explicitly_then_reinspected(tmp
         if 'events' in endpoint: return {'events': []}
         if 'approvals' in endpoint: return {'approvals': []}
         if '/threads?' in endpoint: return {'threads': []}
-        if endpoint.endswith('/tasks'): return state['details']
+        if '/tasks?' in endpoint: return state['details']
         return state['snapshot']
     def send(_dir, endpoint, **kwargs):
         requests.append(kwargs)
