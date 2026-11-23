@@ -16,15 +16,15 @@ Progress below describes merged `main` as of 2026-11-21 (through the merge of PR
 | M1 — Domain, contracts, persistence | 11 | 11 | 100% |
 | M2 — Communication and mock orchestration | 9 | 16 | 56% |
 | M3 — Local API and native clients | 4 | 10 | 40% |
-| M4 — Real provider adapters and profile isolation | 9 | 16 | 56% |
+| M4 — Real provider adapters and profile isolation | 10 | 16 | 63% |
 | M2/M3 close-out required before M6 (cross-cutting trust work) | 0 | 4 | 0% |
-| M5 — Token optimization and analytics | 5 | 10 | 50% |
-| M6 — Git and Domain plugin | 2 | 8 | 25% |
+| M5 — Token optimization and analytics | 7 | 10 | 70% |
+| M6 — Git and Domain plugin | 3 | 8 | 38% |
 | M7 — Deployment, packaging and hardening | 3 | 7 | 43% |
-| **Overall** | **48** | **87** | **55%** |
+| **Overall** | **52** | **87** | **60%** |
 
 ```text
-Overall  [###########---------] 55%  (48/87 checkboxes)
+Overall  [###########---------] 60%  (52/87 checkboxes)
 ```
 
 Security findings F1-F14: 10 fixed, 4 open (list under M7.5).
@@ -114,7 +114,7 @@ Design: ADR 015 (PR #85) and ADR 016 (PR #95), both merged.
 - [ ] Wire 2–3 Claude profiles into runs: fixed primary, policy fallback and cooldowns; never try to evade subscription limits. PR #88 has landed; the registry wiring from ADR 016 remains.
 - [x] Usage ledger: provider-reported usage persisted append-only with unknown as NULL, never zero (PR #92, migration 0014); quota stays `unknown` without a reliable source.
 - [x] Codex CLI adapter (1 profile): disabled by default, hardened like the Claude adapter, normalised to `ProviderEvent` (PR #93, `docs/operations/codex-cli-provider.md`); flags stay unverified until probed against an installed Codex.
-- [ ] Wire the Codex adapter into the runtime and probe the installed Codex version and flags first (blocked: needs a Codex install to probe).
+- [x] Wire the Codex adapter into the runtime and probe the installed Codex version and flags first (blocked: needs a Codex install to probe). Landed: PR #33 (optional, refused under the base sandbox, version-gated; installed 0.171.0 is unverified so Codex edits stay off; the opt-in real Codex run is still to do).
 - [ ] Explicit user-initiated CLI authentication per profile; MCP capability probe with checkpoint fallback.
 - Exit: parallel real runs on two profiles, a failover test, no credential leakage.
 
@@ -129,12 +129,12 @@ Design: ADR 015 (PR #85) and ADR 016 (PR #95), both merged.
 Design: ADR 017 (PR #98, merged). Rules: optimization never bypasses mandatory checks (invariant 10); measured usage is reported apart from estimated savings; the quality metric is tokens per independently verified task; unknown quota stays unknown.
 - [x] M5.1 Usage ledger: append-only usage records migration, ingest of provider `result` usage and `total_cost_usd`, API route and `agentctl usage` totals (PRs #92, #123). Missing usage is "unknown", never zero.
 - [x] M5.2 policy module: budgets per run, task and profile with fail-closed `budget_exceeded` and unknown usage never zero (PR #100, pure, not wired).
-- [ ] M5.2 wiring: check budgets before scheduling and spawn with a policy version; breach fails closed with a distinct reason and never retries. The multi-task scheduling from PR #88 has landed; the budget check before scheduling is not wired.
+- [x] M5.2 wiring: check budgets before scheduling and spawn with a policy version; breach fails closed with a distinct reason and never retries. The multi-task scheduling from PR #88 has landed; the budget check before scheduling is not wired. Landed: PR #39 (budget checked on every spawn path, `budget_exceeded` never retried).
 - [x] M5.3 Deterministic output reducer: keeps every unique failure, dedupes, returns the raw-output hash, no LLM; golden corpus tests (PR #106, pure, not wired).
 - [x] M5.3 wiring: raw output stored as an artifact (hash recoverable), reduced text clipped by serialised size and forwarded through the agent path (this repo's #1, 2026-11-23).
 - [ ] M5.4 Context manifests (repo SHA, requirement refs, file ranges and hashes, validation results) and exact cache keyed on input hashes, tool version, configuration and policy version; no semantic reuse for edits or reviews; invalidation tests.
 - [x] M5.5 routing policy module: tier decision with confidence and downgrade rules, reviews and approval-gated steps never downgrade (PR #100, pure, not wired).
-- [ ] M5.5 wiring: log each pick and estimated cost difference, deterministic rules in dry-run mode first; add an LLM judge only if data justifies it, under its own budget and through the hardened adapter. Needs M5.1 data in real runs.
+- [x] M5.5 wiring: log each pick and estimated cost difference, deterministic rules in dry-run mode first; add an LLM judge only if data justifies it, under its own budget and through the hardened adapter. Needs M5.1 data in real runs. Landed: PR #5 (dry-run routing log).
 - [ ] M5.6 Compaction and handoff checkpoint preserving hard requirements, unresolved issues, decisions and citations, triggered by the provider `context_limit`.
 - [ ] M5.7 Analytics views (agents, messages, tokens, retries) with measured, estimated and unknown shown distinctly; reproducible from the event log.
 - Exit: reproducible metrics, cache invalidation tests pass, no savings claim without an A/B baseline.
@@ -145,7 +145,7 @@ Existing base: `WorktreeManager` (allowlist, per-task worktrees, bounded status/
 - [ ] M6.1 Multi-repository registry (roots, baseline refs, protected paths), one worktree per task attempt per repo, retention-based cleanup. (Allowlist hardening landed in PR #142: `RepoNotAllowlistedError`, nested entries refused, escape tests; registry, refs and cleanup remain.)
 - [x] M6.2 Candidate manifest library: repository ID, baseline SHA, candidate SHA, diff artifact hash, validation results, hashed (PR #97, library, not wired; `docs/operations/candidate-manifest.md`).
 - [ ] M6.2 wiring: store the manifest immutably as the single object approvals, review and deployment bind to.
-- [ ] M6.3 Plugin framework (ADR-011): trusted versioned packages, explicit operator enablement pinned by hash, no database handle in the plugin API, privileged operations only through PolicyPort and the approval service; hostile-plugin test.
+- [x] M6.3 Plugin framework (ADR-011): trusted versioned packages, explicit operator enablement pinned by hash, no database handle in the plugin API, privileged operations only through PolicyPort and the approval service; hostile-plugin test. Landed: PR #16 (framework and hostile-plugin tests; unwired, and in-process plugins can defeat later pins, so wiring needs one process per plugin).
 - [ ] M6.4 XML dependency index (rebuilt on SHA change) and validators with exact executable/argument schemas, no shell strings; Catalog Validator adapter (blocked: Catalog Validator commands unknown).
 - [x] M6.5 Agent role definitions: core roles, Domain drafts, validator and catalog (PR #105, `docs/operations/agent-roles.md`). Plugin-role loading through the validator (draft-only, namespace-bound, approved-Bash set) landed in PR #140; roles are still not wired into the runtime.
 - [ ] M6.5 Domain roles in a workflow: architect, requirement analyst, XML editor, schema expert, reviewer, Lens runner, QA verifier, deployment verifier, and the `domain.catalog-change` workflow with a bounded review loop; reviewer differs from editor.
@@ -180,6 +180,16 @@ Existing base: hash, policy and expiry binding with execution-time recheck; syst
 
 ## M8 — Post-v1 (P2, not planned in detail)
 Knowledge index, optional browser client, remote workers, additional plugins, semantic caching only after an evaluation.
+
+## Roadmap to 100% (no checkboxes here; the boxes above are the source of truth)
+Owners: A = integrator and trust lane, B = clients, API routes, CLI, plugins, you = owner decisions. Numbers refer to the plan agreed 2026-11-23.
+0. Land in-flight work: #41 (auto-resume, migration 0017), wire ADR 025 review enforcement into the daemon (first fix the `skip-worktree` bypass and FIFO hang found in review), merge ADR 026 (#43), tick the boxes for merged PRs, post late-review items to B. [A]
+1. Close M2/M3: secure session credentials and live MCP/fallback messaging (ADR first, builds on ADR 019); human identity closed with the documented passphrase-verifier limit; fencing follow-ups (`daemon_epoch`, setsid/cgroup containment, F7); M3 client work (run control, messaging, recovery, paging, fence and Codex in the desktop, commit-dialog test). [A, B]
+2. M4 leftovers: per-profile concurrency up to 6 tasks; 2 to 3 Claude profiles with fallback and cooldowns; `claude --version` probe with a recorded fixture per verified version; per-profile CLI authentication; opt-in real-run matrix (asks the owner each time); worktree garbage collection with M6.1. [A; owner approves real runs]
+3. M5 close-out: cache storage (migration 0018) and wiring, M5.6 handoff wiring, M5.7 desktop pane, `on_unknown: allow` budget gap and the ADR 020 amendment, routing judge only if data justifies it. [B, A]
+4. M6: owner supplies repo ids, paths, baseline refs, protected paths, Catalog Validator commands and XML layout; then M6.1 and M6.2 wiring per ADR 026 (migration 0019), B's routes, CLI and desktop views, plugin wiring with process isolation, M6.4 to M6.6. [owner, A, B]
+5. M7: owner chooses the STAGING transport; M7.1 adapter with approval binding and recheck; M7.2 reconciliation; M7.4 fault-injection harness for the ten invariants; M7.5 threat model and findings F1/F2 (accepted), F7, F10; owner-only GitHub settings. [owner, A, B]
+6. Final gate: independent full security review, regenerated progress table, end-to-end real run on this machine (Claude, then Codex if wanted, then multi-repo), results recorded in the docs. [A, B]
 
 ## Ordering
 M4-A first. M4-B, the trust close-out and M5.1/M5.2 can proceed in parallel branches. Worker fencing, human identity and review enforcement depend on PRs #75–#77. M5.5 routing needs M5.1 data. M6 needs M4-B and the trust close-out. M7 needs the M6 candidate manifest.
