@@ -264,7 +264,8 @@ def run(state_dir: Path, migrations: Path, *, enable_mock_mcp_ipc: bool = False,
         # Fail closed (security review F1/F2) before touching state unless the operator acknowledged.
         acknowledged = check_same_user_agents(
             state_dir, agents_enabled=agent_config is not None and agent_config.profile.enabled,
-            allow=allow_same_user_agents)
+            allow=allow_same_user_agents,
+            sandbox_configured=None if agent_config is None else bool(agent_config.profile.sandbox))
         worktrees = None
         if agent_config is not None and agent_config.repos:
             try:

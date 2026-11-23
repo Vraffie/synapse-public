@@ -11,7 +11,7 @@ Agents run as the daemon's user, so they can read the approver and operator toke
 approvals are therefore **not** a security boundary against them ([security review](../security/review-2026-11-20.md), F1/F2).
 `agentd` refuses to start with an enabled `--claude-cli-config` (exit status 2, nothing touched) unless you pass
 `--allow-same-user-agents` (or set `SYNAPSE_ALLOW_SAME_USER_AGENTS=1`). The acknowledgement is logged at WARNING on
-every start and recorded as an `agent_runtime.same_user_acknowledged` audit entry (principal `daemon:startup`).
+every start (the message states whether a sandbox is configured; a sandbox reduces but does not remove the exposure and never replaces the flag) and recorded as an `agent_runtime.same_user_acknowledged` audit entry (principal `daemon:startup`).
 Example: `agentd --state-dir D --claude-cli-config FILE --allow-same-user-agents`. The demo script passes it for you.
 
 ## Operator configuration
