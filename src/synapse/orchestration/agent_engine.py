@@ -9,8 +9,12 @@ differences, all deliberately conservative:
 * an ``unknown`` provider outcome, or any error after the process may have
   started, records the attempt as ``unknown`` and blocks the task for an
   operator; nothing re-spawns it;
-* provider output is reduced to a bounded summary (capped text, tool names
-  only) stored as an artifact; usage is recorded as an event.
+* the full provider text output is stored as a raw artifact (its SHA-256 is
+  recorded in the summary), and the summary carries the deterministic reduction
+  of it (every unique failure kept, see ``application.output_reducer``) plus
+  tool names only, stored as a second artifact; usage is recorded as an event.
+  Reduction affects only what is forwarded; the outcome and the verifier never
+  depend on it, so mandatory checks cannot be reduced away.
 """
 from __future__ import annotations
 
@@ -24,6 +28,7 @@ from typing import Any
 
 from synapse.domain.contracts import EventEnvelope, encode_payload, new_id
 from synapse.domain.runs import RunChange, RunState
+from synapse.application.output_reducer import reduce_output
 from synapse.domain.workflow import State
 from synapse.infrastructure.artifact_blobs import ArtifactBlobStore
 from synapse.orchestration.mock_engine import MockWorkflowEngine, _RunInterrupted
@@ -38,6 +43,7 @@ _LOG = logging.getLogger(__name__)
 MAX_SUMMARY_TEXT_BYTES = 16 * 1024
 MAX_TOOL_NAMES = 100
 _PROVIDER_OUTPUT_CAP = 4 * 1024 * 1024
+RAW_OUTPUT_KIND = "agent_raw_output"
 _ATTEMPT_STATE = {"succeeded": "completed", "failed": "failed", "timed_out": "failed",
                   "cancelled": "cancelled", "unknown": "unknown"}
 VERIFIER_ID = "builtin.agent.process-outcome-verifier.v1"
@@ -130,7 +136,8 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                  verifier_id: str = VERIFIER_ID, max_concurrency: int = 2, approval_requester=None,
                  worktree_check: Callable[[str, str, str], tuple[str, bool]] | None = None,
                  profile_check: Callable[[str], str | None] | None = None,
-                 profile_limits_check: Callable[[Mapping[str, Any]], str | None] | None = None):
+                 profile_limits_check: Callable[[Mapping[str, Any]], str | None] | None = None,
+                 raw_blobs: ArtifactBlobStore | None = None):
         # max_attempts=2: a gated task spends one attempt on the approval wait.
         super().__init__(connection, router, blobs, verify, verifier_id=verifier_id,
                          max_concurrency=max_concurrency, max_attempts=2, approval_requester=approval_requester)
@@ -139,6 +146,8 @@ class AgentWorkflowEngine(MockWorkflowEngine):
         self._profile_check = profile_check  # profile_id -> refusal reason or None; only asked for named profiles
         # spec -> refusal reason or None: the recorded tools, mode and timeout must still fit the named profile
         self._profile_limits_check = profile_limits_check
+        # Raw provider output may exceed the summary blob bound; same directory, larger limit.
+        self.raw_blobs = raw_blobs if raw_blobs is not None else blobs.with_max_bytes(_PROVIDER_OUTPUT_CAP)
 
     def _profile_for(self, run_id: str, task_id: str, default_profile_id: str) -> str:
         """A task that named a registry profile claims capacity under it (its own cap, ADR 016).
@@ -293,25 +302,49 @@ class AgentWorkflowEngine(MockWorkflowEngine):
             principal=self._principal, idempotency_key=attempt_id).response
         return artifact_id, ref
 
+    async def _store_raw_and_reduce(self, run_id: str, task_id: str, attempt_id: str, raw: bytes,
+                                    raw_capped: bool) -> dict[str, Any]:
+        """Store ``raw`` as an artifact and return the reduction fields for the summary.
+
+        The raw artifact is published before the summary so the summary can cite it.
+        """
+        reduced = await asyncio.to_thread(reduce_output, raw, max_bytes=MAX_SUMMARY_TEXT_BYTES)
+        artifact_id = None
+        if raw:
+            artifact_id = new_id()
+            ref = publish_artifact(self.db, self.raw_blobs, chunks=[raw], artifact_id=artifact_id,
+                media_type="text/plain; charset=utf-8",
+                provenance={"run_id": run_id, "task_id": task_id, "attempt_id": attempt_id, "kind": RAW_OUTPUT_KIND},
+                principal=self._principal, idempotency_key=attempt_id + ":raw").response
+            if ref["sha256"] != reduced.raw_sha256:
+                raise RuntimeError("Stored raw output does not match its reduction hash")
+        return {"output_text": reduced.reduced, "output_truncated": bool(reduced.truncated or reduced.dropped_lines or reduced.rules_applied or raw_capped),
+                "raw_sha256": reduced.raw_sha256, "raw_artifact_id": artifact_id,
+                "raw_complete": not raw_capped,
+                "reduction": {"rules": list(reduced.rules_applied), "dropped_lines": reduced.dropped_lines,
+                              "kept_failures": len(reduced.kept_failures), "over_budget": reduced.over_budget}}
+
     async def _execute(self, run_id: str, task_id: str, attempt_id: str, profile_id: str, scenario: str,
                        version: int, attempt_no: int) -> None:
         spec = self.specs[task_id]
-        text, texts_total, truncated = bytearray(), 0, False
+        raw, texts_total, raw_capped = bytearray(), 0, False
         tools: list[str] = []
         tool_count = 0
         terminal: ProviderEvent | None = None
 
         async def emit(event: ProviderEvent) -> None:
-            nonlocal terminal, texts_total, truncated, tool_count
+            nonlocal terminal, texts_total, raw_capped, tool_count
             if terminal is not None:
                 raise RuntimeError("Provider emitted after terminal outcome")
             if event.kind == "output" and isinstance(event.text, str):
                 data = event.text.encode("utf-8")
+                if not data.endswith(b"\n"):
+                    data += b"\n"  # raw text is the output events, one per line
                 texts_total += len(data)
-                room = MAX_SUMMARY_TEXT_BYTES - len(text)
+                room = _PROVIDER_OUTPUT_CAP - len(raw)
                 if room < len(data):
-                    truncated = True
-                text.extend(data[:max(room, 0)])
+                    raw_capped = True  # the stored raw is a prefix; raw_complete=false records that
+                raw.extend(data[:max(room, 0)])
             elif event.kind == "tool_use" and isinstance(event.text, str):
                 tool_count += 1
                 if len(tools) < MAX_TOOL_NAMES:
@@ -373,10 +406,19 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                     self._check_running(run_id)
                     set_attempt(self.db, attempt_id=attempt_id, before="running", after=_ATTEMPT_STATE[outcome], run_id=run_id, task_id=task_id)
                     self._change(task_id, State.RUNNING, target, version)
+            try:
+                reduction = await self._store_raw_and_reduce(run_id, task_id, attempt_id, bytes(raw), raw_capped)
+            except Exception:
+                if outcome == "succeeded":
+                    raise  # fail closed: a success whose raw output cannot be kept is blocked for an operator
+                _LOG.exception("Could not store raw output for task %s", task_id)
+                cut = bytes(raw[:MAX_SUMMARY_TEXT_BYTES]).decode("utf-8", "ignore")
+                reduction = {"output_text": cut, "output_truncated": True, "raw_sha256": None,
+                             "raw_artifact_id": None, "raw_complete": False, "reduction": None}
             summary = {"v": 1, "run_id": run_id, "task_id": task_id, "attempt_id": attempt_id, "outcome": outcome,
                        "detail": detail if isinstance(detail, str) else None,
-                       "output_text": bytes(text).decode("utf-8", "ignore"), "output_bytes": texts_total,
-                       "output_truncated": truncated, "tool_names": tools, "tool_use_count": tool_count,
+                       "output_bytes": texts_total, **reduction,
+                       "tool_names": tools, "tool_use_count": tool_count,
                        "usage": None if usage is None else {"input_tokens": usage.input_tokens,
                                                             "output_tokens": usage.output_tokens, "source": usage.source}}
             try:

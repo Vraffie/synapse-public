@@ -63,8 +63,15 @@ combination with `dataclasses.replace` on the operator profile (re-validated).
 | `unknown`, or any error after a process may exist | unknown | blocked; **never re-spawned**, the run goes to `recovering` for an operator |
 | provider `start` rejects (no process ever spawned) | failed | failed |
 
-Per attempt a bounded summary (assistant text capped at 16 KiB, at most 100 tool
-names, never tool inputs) is published as an `application/json` artifact, and the
+Per attempt the full assistant text (one output event per line, capped at 4 MiB) is published as a
+`text/plain` artifact with provenance `kind=agent_raw_output`, then a bounded summary is published as an
+`application/json` artifact: `output_text` is the deterministic [output reduction](output-reducer.md) of the raw
+text (at most 16 KiB; every distinct failure line is kept), `raw_sha256` and `raw_artifact_id` name the raw artifact
+so the unreduced output stays recoverable, `raw_complete` is false when the 4 MiB cap cut it, `reduction` holds the
+rules applied, dropped line count and kept-failure count, plus at most 100 tool names and never tool inputs. Reduction
+only changes what is forwarded; the outcome and the verifier do not depend on it. If the raw artifact cannot be stored,
+a succeeded attempt fails closed (the task is blocked for an operator, nothing re-spawns); a failed attempt still
+records its summary with `raw_artifact_id` null and `raw_complete` false. The
 provider's usage observation is recorded as an `agent.usage_observed` event and as an append-only
 `usage_observations` ledger row, readable with `agentctl usage RUN` (see [usage-ledger](usage-ledger.md); missing
 usage records nothing and is never shown as zero).

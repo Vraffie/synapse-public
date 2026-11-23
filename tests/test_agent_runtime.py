@@ -36,6 +36,17 @@ if mode.startswith("ok"):
     text("hello " + "x" * 40000 if mode == "ok-long" else "hello")
     emit({{"type": "assistant", "message": {{"content": [{{"type": "tool_use", "name": "Edit", "input": {{"secret": "TOPSECRET"}}}}]}}}})
     ok()
+elif mode == "noisy":
+    for i in range(3000):
+        text("progress step %d" % i)
+    text("FAILED tests/test_a.py::test_one - AssertionError: boom")
+    for i in range(3000, 6000):
+        text("progress step %d" % i)
+    text("FAILED tests/test_b.py::test_two - ValueError: bad")
+    ok()
+elif mode == "noisy-fail":
+    text("FAILED tests/test_c.py::test_three - KeyError: k")
+    sys.exit(3)
 elif mode == "usage-full":
     text("hi")
     emit({{"type": "result", "subtype": "success", "is_error": False, "total_cost_usd": 0.0131914,
@@ -187,6 +198,68 @@ def test_success_completes_with_bounded_summary_and_usage(env):
     assert env.runtime.blobs.read(spec["prompt_sha256"]) == b"ok-long"
     assert at.is_agent_run(env.db, env.run_id) and ms.mock_kind(env.db, env.run_id) is None
     assert env.db.execute("SELECT DISTINCT json_extract(payload_json,'$.principal') FROM events WHERE type='task.state_changed' AND json_extract(payload_json,'$.after')<>'completed'").fetchall() == [("agent-engine",)]
+
+
+def _only(env, kind):
+    rows = env.db.execute("SELECT id,sha256,byte_size FROM artifacts WHERE json_extract(provenance_json,'$.kind')=?", (kind,)).fetchall()
+    return rows
+
+
+def test_raw_output_is_stored_and_summary_carries_reduction_and_raw_hash(env):
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(prompt="noisy"))
+        await finish(env)
+    asyncio.run(go())
+    assert env.states() == ("succeeded", {"work": "completed"})
+    (summary,) = env.summaries()
+    (raw_row,) = _only(env, "agent_raw_output")
+    raw = env.runtime.blobs.with_max_bytes(4 * 1024 * 1024).read(raw_row[1])
+    # The raw hash in the summary is recoverable: it names the stored raw artifact, byte for byte.
+    assert summary["raw_sha256"] == raw_row[1] == hashlib.sha256(raw).hexdigest()
+    assert summary["raw_artifact_id"] == raw_row[0] and summary["raw_complete"] is True
+    assert summary["output_bytes"] == len(raw) == raw_row[2] > 60000
+    assert raw.count(b"progress step") == 6000
+    # The forwarded text is much smaller yet keeps every failure line.
+    reduced = summary["output_text"]
+    assert len(reduced.encode()) <= 16 * 1024 and "progress step 4000" not in reduced and "similar lines" in reduced
+    assert "FAILED tests/test_a.py::test_one - AssertionError: boom" in reduced
+    assert "FAILED tests/test_b.py::test_two - ValueError: bad" in reduced
+    assert summary["reduction"]["kept_failures"] == 2 and summary["output_truncated"] is True
+    assert env.db.execute("SELECT outcome FROM verification_results").fetchall() == [("approved",)]
+
+
+def test_failed_attempt_still_stores_raw_and_keeps_failure_lines(env):
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(prompt="noisy-fail"))
+        await finish(env)
+    asyncio.run(go())
+    assert env.states()[1] == {"work": "failed"}
+    (summary,) = env.summaries()
+    (raw_row,) = _only(env, "agent_raw_output")
+    assert summary["raw_sha256"] == raw_row[1] and "test_c.py::test_three" in summary["output_text"]
+
+
+def test_no_output_stores_no_raw_artifact(env):
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(prompt="fail"))
+        await finish(env)
+    asyncio.run(go())
+    (summary,) = env.summaries()
+    assert summary["raw_artifact_id"] is None and summary["output_bytes"] == 0
+    assert summary["raw_sha256"] == hashlib.sha256(b"").hexdigest() and _only(env, "agent_raw_output") == []
+
+
+def test_succeeded_attempt_fails_closed_when_raw_cannot_be_stored(env, monkeypatch):
+    class Full:
+        def put(self, chunks):
+            raise OSError("disk full")
+    monkeypatch.setattr(type(env.runtime.blobs), "with_max_bytes", lambda self, n: Full())
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(prompt="ok"))
+        await finish(env)
+    asyncio.run(go())
+    assert env.states()[1] == {"work": "blocked"}
+    assert env.db.execute("SELECT count(*) FROM verification_results").fetchone() == (0,)
 
 
 def test_two_tasks_run_in_dependency_order(tmp_path):

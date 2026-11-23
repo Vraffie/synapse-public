@@ -38,6 +38,10 @@ class ArtifactBlobStore:
         self._root = Path(root)
         self._max_bytes = max_bytes
 
+    def with_max_bytes(self, max_bytes: int) -> "ArtifactBlobStore":
+        """Return a store over the same directory with a different size bound."""
+        return ArtifactBlobStore(self._root, max_bytes=max_bytes)
+
     def _open_root(self) -> int:
         fd = os.open(self._root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
         info = os.fstat(fd)
