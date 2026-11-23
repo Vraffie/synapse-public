@@ -22,7 +22,7 @@ def manifest(head=HEAD, clean=True, spec="spec", task="t1"):
 
 def inputs(**over):
     base = CacheKeyInputs(
-        task_class="validation", operator_marked_cacheable=True, approval_gated=False,
+        task_class="read_only_analysis", operator_marked_cacheable=True, approval_gated=False,
         policy_version="policy-1", approval_policy_sha256=H("approval-policy-1"),
         provider="claude", profile_id="default", cli_version="2.1.0", model="model-a",
         allowed_tools=["Read", "Grep"], permission_mode="plan", settings={"max_turns": 3},
@@ -68,12 +68,22 @@ def test_same_inputs_same_key_and_set_order_does_not_matter():
     {"manifest": manifest(head="b" * 40)},
     {"manifest": manifest(spec="other spec")},
     {"manifest": manifest(task="t2")},
-    {"task_class": "read_only_analysis"},
     {"validator_sha256s": []},
     {"validator_sha256s": [H("ruff")]},
 ])
 def test_every_key_component_change_gives_a_different_key(change):
     assert key(**change).sha256 != key().sha256
+
+
+def test_task_class_is_keyed(monkeypatch):
+    # only one class is cacheable today; a second operator-approved class must still key apart
+    monkeypatch.setattr(ck, "CACHEABLE_CLASSES", frozenset({"read_only_analysis", "other_analysis"}))
+    assert key(task_class="other_analysis").sha256 != key().sha256
+
+
+def test_validation_is_never_cacheable_even_when_marked():
+    # ADR 017 D6: verifications and independent checks are never cached; a validation is such a check
+    assert bypass(task_class="validation", operator_marked_cacheable=True) == "validation_task"
 
 
 def test_schema_version_bump_changes_key(monkeypatch):
@@ -89,7 +99,7 @@ def test_exact_equality_only_no_semantic_normalisation():
 
 @pytest.mark.parametrize("task_class,reason", [
     ("edit", "edit_task"), ("review", "review_task"), ("verification", "verification_task"),
-    ("independent_check", "independent_check_task"), ("summarise", "unknown_task_class"),
+    ("validation", "validation_task"), ("independent_check", "independent_check_task"), ("summarise", "unknown_task_class"),
 ])
 def test_never_cacheable_task_classes(task_class, reason):
     assert bypass(task_class=task_class) == reason

@@ -101,6 +101,11 @@ claim (retry next tick) while any attempt in it is unresolved. A denial leaves n
 `ready -> blocked`, and writes a `budget.exceeded` event and a `budget.denied` audit row with reason
 `budget_exceeded` or `usage_unknown`. Nothing is downgraded or retried.
 
+That is the mock engine's behaviour. The agent engine (real-provider runs) fails a task refused for a breach
+(`budget_exceeded`) instead of blocking it, blocks with `budget_check_failed` when the budget cannot be read,
+records usage in the attempt's terminal transaction, and logs the policy version per attempt: see
+`budget-enforcement.md`.
+
 Approval-gated steps are checked twice, because an approved step is a real provider run:
 
 - **At park**: `ApprovalGateCoordinator.park` passes the same check into its claim. A denial rolls the park
@@ -124,7 +129,8 @@ Approval-gated steps are checked twice, because an approved step is a real provi
 
 ## Not implemented
 
-- Wiring (beyond the claim-time budget check above): nothing rechecks at spawn, and nothing routes a task. The
+- Wiring (beyond the claim-time budget check above): nothing rechecks at spawn (see `budget-enforcement.md`
+  for why the agent engine does not need to), and nothing routes a task. The
   intended points are the scheduler's claim step (budget) and spawn-time profile/model choice (routing).
 - Persisting policies or decisions (no table, no event), operator config for them, an API or CLI.
 - Mid-run enforcement: a provider reports usage only when it ends, so a running attempt is bounded by

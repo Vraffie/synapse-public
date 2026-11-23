@@ -25,6 +25,10 @@ optional keys that must be given together:
 ```
 
 `repos`: 1 to 32 absolute, normalized, symlink-free repositories with a real `.git` directory.
+The list is fixed when the daemon starts and is an operator decision: nothing in the daemon API or an agent
+can change it. To pick repositories out of a project folder that holds several (for example a workspace with
+sibling repos and plain data folders), run `python scripts/synapse_up.py workspace FOLDER` and register the
+chosen ones with `up --workspace FOLDER --repo NAME ...` (see workspace.md); restart the daemon afterwards.
 `worktree_root`: absolute, outside the state directory, not overlapping any repo (created `0700`).
 Optional approval policy keys (F6): `"require_approval": true` makes every run need an
 `approval_step`; `"require_approval_for_modes": ["acceptEdits"]` and

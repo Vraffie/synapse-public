@@ -14,8 +14,11 @@ from jsonschema import Draft202012Validator
 from synapse.api.agent_commands import AgentRunError
 from synapse.api.app import create_app
 from synapse.api.openapi_contracts import RESPONSES
+from synapse.application.analytics_views import (USAGE_FIELDS, Kind, MessageAnalytics, ProfileAnalytics, Quantity,
+                                                 RunAnalytics, TaskAnalytics)
 from synapse.application.approval_service import ApprovalAccessDenied
 from synapse.persistence.idempotency import CommandResult, IdempotencyConflict
+from synapse.persistence.paging import InvalidPageCursor
 from synapse.persistence.run_list import InvalidCursor
 from synapse.persistence.run_snapshot import RunNotFound
 from synapse.persistence.state_store import StateConflict
@@ -45,6 +48,14 @@ def _page(rows, after, limit, key="cursor"):
     return [r for r in rows if r[key] > after][:limit]
 
 
+def _keyset_page(rows, limit, cursor):
+    """Stub of the opaque string-cursor readers: the cursor is the last id; "bad" is a tampered cursor."""
+    if cursor == "bad":
+        raise InvalidPageCursor("Invalid cursor")
+    rest = [r for r in rows if cursor is None or r["id"] > cursor]
+    return rest[:limit], (rest[limit - 1]["id"] if len(rest) > limit else None)
+
+
 def _result(body, replayed=False):
     return CommandResult(body, replayed)
 
@@ -63,17 +74,16 @@ def stubs():
             raise RunNotFound()
         return {"run": RUN, "mock_config": None, "tasks": [TASK], "dependencies": [], "last_sequence": 1}
 
-    def read_tasks(run_id):
-        if run_id == "missing":
-            raise RunNotFound()
-        return {"tasks": [{**TASK, "attempts": []}]}
+    tasks = [{**TASK, "id": "t%d" % n, "attempts": []} for n in range(1, 8)]
+    fields = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "cost_usd")
+    observations = [{"id": "o%d" % n, "attempt_id": "a", "task_id": "t1", "profile_id": "p", "source": "s",
+                     "confidence": "reported", "observed_at": TS, **dict.fromkeys(fields)} for n in range(1, 8)]
 
-    def read_usage(run_id):
+    def read_tasks(run_id, limit, cursor):
         if run_id == "missing":
             raise RunNotFound()
-        nulls = dict.fromkeys(("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "cost_usd"))
-        return {"run_id": run_id, "attempts_total": 0, "attempts_with_usage": 0, "observations": [],
-                "totals": nulls, "coverage": {k: {"known": 0, "attempts": 0} for k in nulls}}
+        rows, next_cursor = _keyset_page(tasks, limit, cursor)
+        return {"tasks": rows, "next_cursor": next_cursor}
 
     def read_runs(state, limit, cursor):
         if cursor == "bad":
@@ -97,15 +107,33 @@ def stubs():
             raise RunNotFound()
         return agent
 
-    def read_usage(run_id):
+    def read_usage(run_id, limit, cursor):
         if run_id == "missing":
             raise RunNotFound()
-        fields = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "cost_usd")
-        return {"run_id": run_id, "attempts_total": 0, "attempts_with_usage": 0, "observations": [],
+        rows, next_cursor = _keyset_page(observations, limit, cursor)
+        return {"run_id": run_id, "attempts_total": 1, "attempts_with_usage": 1, "observations": rows,
                 "totals": {f: None for f in fields},
-                "coverage": {f: {"known": 0, "attempts": 0} for f in fields}}
+                "coverage": {f: {"known": 0, "attempts": 1} for f in fields}, "next_cursor": next_cursor}
+
+    def read_analytics(run_id, limit, cursor):
+        if run_id == "missing":
+            raise RunNotFound()
+        if cursor == "bad":
+            raise InvalidCursor()
+        one = Quantity(Kind.MEASURED, 1, "count", "daemon_record", 1, 1, False)
+        none = Quantity(Kind.UNKNOWN, None, "tokens", "provider_reported", 0, 1, False)
+        usage = dict.fromkeys(USAGE_FIELDS, none)
+        msgs = MessageAnalytics(*(one,) * 6)
+        return RunAnalytics(
+            run_id=run_id, source="tables", attempts=one, retries=Quantity(Kind.MEASURED, 0, "count", "daemon_record", 0, 0, False),
+            outcome_mix={"succeeded": one}, usage=usage, attempts_with_any_usage=0,
+            estimated={"m": {"est_tokens": Quantity(Kind.ESTIMATED, 5, "est_tokens", "m", 1, 1, False)}},
+            messages=msgs, tasks=(TaskAnalytics("t1", one, one, {"succeeded": one}, usage),), next_cursor=None,
+            per_profile={"p": ProfileAnalytics(one, usage)}, per_profile_truncated=False, not_reproducible=(),
+            replay_ignored_events=None, ignored_estimate_events=0).to_dict()
 
     return {
+        "read_analytics": read_analytics,
         "read_events": lambda after, limit: _page(events, after, limit, "sequence"),
         "read_run": read_run, "read_tasks": read_tasks, "read_usage": read_usage, "read_runs": read_runs,
         "read_approvals": lambda after, limit: [a for a in approvals if a["id"] > after][:limit],
@@ -230,11 +258,11 @@ def _get_cases(path, reader, missing_arg):
 CASES[("/api/v1/runs/{run_id}", "get")] = _get_cases("/api/v1/runs/r1", "read_run", "run")
 CASES[("/api/v1/runs/{run_id}/tasks", "get")] = _get_cases("/api/v1/runs/r1/tasks", "read_tasks", "run")
 CASES[("/api/v1/runs/{run_id}/usage", "get")] = _get_cases("/api/v1/runs/r1/usage", "read_usage", "run")
+CASES[("/api/v1/runs/{run_id}/analytics", "get")] = _get_cases("/api/v1/runs/r1/analytics", "read_analytics", "run")
 CASES[("/api/v1/runs/{run_id}/threads", "get")] = _get_cases("/api/v1/runs/r1/threads", "read_threads", "run")
 CASES[("/api/v1/runs/{run_id}/threads/{thread_id}/messages", "get")] = _get_cases(
     "/api/v1/runs/r1/threads/th1/messages", "read_messages", "thread")
 CASES[("/api/v1/runs/{run_id}/agent", "get")] = _get_cases("/api/v1/runs/r1/agent", "read_agent_run", "run")
-CASES[("/api/v1/runs/{run_id}/usage", "get")] = _get_cases("/api/v1/runs/r1/usage", "read_usage", "run")
 CASES[("/api/v1/runs/{run_id}/mock-start", "post")] = _post_cases(
     "/api/v1/runs/{run_id}/mock-start", None, "start_mock", 202, blank=True)
 CASES[("/api/v1/runs/{run_id}/mock-cancel", "post")] = _post_cases(
@@ -442,7 +470,11 @@ PAGED = [  # path, list key, max limit, cursor param is integer
     ("/api/v1/approvals", "approvals", 1000),
     ("/api/v1/runs/r1/threads", "threads", 100),
     ("/api/v1/runs/r1/threads/th1/messages", "messages", 100),
+    ("/api/v1/runs/r1/tasks", "tasks", 500),
+    ("/api/v1/runs/r1/usage", "observations", 500),
 ]
+INTEGER_CURSOR_PAGED = [p for p in PAGED if "approvals" not in p[0] and p[1] not in ("tasks", "observations")]
+STRING_CURSOR_PAGED = [p for p in PAGED if p[1] in ("tasks", "observations")]
 
 
 def get(path, **params):
@@ -472,21 +504,21 @@ def test_list_limit_one_returns_exactly_one_item(path, key, maximum):
     assert r.status_code == 200 and len(r.json()[key]) == 1
 
 
-@pytest.mark.parametrize("path,key,maximum", [p for p in PAGED if "approvals" not in p[0]])
+@pytest.mark.parametrize("path,key,maximum", INTEGER_CURSOR_PAGED)
 @pytest.mark.parametrize("after", ["-1", "abc", "1.5", str(INT_MAX + 1)])
 def test_integer_cursor_after_invalid_is_422(path, key, maximum, after):
     r = get(path, after=after)
     assert r.status_code == 422 and (len(after) < 4 or after not in r.text)
 
 
-@pytest.mark.parametrize("path,key,maximum", [p for p in PAGED if "approvals" not in p[0]])
+@pytest.mark.parametrize("path,key,maximum", INTEGER_CURSOR_PAGED)
 def test_integer_cursor_past_the_end_is_an_empty_page(path, key, maximum):
     for after in (7, 8, 10 ** 6, INT_MAX):
         r = get(path, after=after)
         assert r.status_code == 200 and r.json() == {key: []}
 
 
-@pytest.mark.parametrize("path,key,maximum", [p for p in PAGED if "approvals" not in p[0]])
+@pytest.mark.parametrize("path,key,maximum", INTEGER_CURSOR_PAGED)
 def test_integer_cursor_pages_without_overlap(path, key, maximum):
     first = get(path, limit=3).json()[key]
     second = get(path, after=first[-1].get("sequence", first[-1].get("cursor")), limit=3).json()[key]
@@ -514,10 +546,31 @@ def test_runs_list_limit_bounds_and_cursor():
 def test_pagination_defaults_apply_without_params():
     seen = []
     with make_client(read_events=lambda a, l: seen.append((a, l)) or [],
-                     read_threads=lambda r, a, l: seen.append((a, l)) or []) as client:
+                     read_threads=lambda r, a, l: seen.append((a, l)) or [],
+                     read_tasks=lambda r, l, c: seen.append((r, l, c)) or {"tasks": [], "next_cursor": None},
+                     read_usage=lambda r, l, c: seen.append((r, l, c)) or {}) as client:
         client.get("/api/v1/events", headers=AUTH)
         client.get("/api/v1/runs/r1/threads", headers=AUTH)
-    assert seen == [(0, 100), (0, 100)]
+        client.get("/api/v1/runs/r1/tasks", headers=AUTH)
+        client.get("/api/v1/runs/r1/usage", headers=AUTH)
+    assert seen == [(0, 100), (0, 100), ("r1", 200, None), ("r1", 200, None)]
+
+
+@pytest.mark.parametrize("path,key,maximum", STRING_CURSOR_PAGED)
+def test_string_cursor_pages_follow_next_cursor_without_overlap(path, key, maximum):
+    first = get(path, limit=3).json()
+    second = get(path, limit=3, cursor=first["next_cursor"]).json()
+    last = get(path, limit=3, cursor=second["next_cursor"]).json()
+    ids = [x["id"] for x in first[key] + second[key] + last[key]]
+    assert len(ids) == 7 == len(set(ids)) and last["next_cursor"] is None and first["next_cursor"] is not None
+
+
+@pytest.mark.parametrize("path,key,maximum", STRING_CURSOR_PAGED)
+@pytest.mark.parametrize("cursor", ["bad", "", "c" * 1025])
+def test_string_cursor_invalid_is_422_without_echo(path, key, maximum, cursor):
+    r = get(path, cursor=cursor)
+    assert r.status_code == 422 and not LEAK.search(r.text)
+    assert len(cursor) < 4 or cursor not in r.text
 
 
 # (5) error bodies never leak ------------------------------------------------------------------

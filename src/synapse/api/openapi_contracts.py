@@ -63,12 +63,35 @@ def _page(name, item):
     return _object({name: {"type": "array", "items": item}})
 
 
+QUANTITY = _object({"kind": {"type": "string", "enum": ["measured", "estimated", "unknown"]},
+                    "value": {"anyOf": [{"type": "null"}, {"type": "integer"}, {"type": "number"}]},
+                    "unit": STRING, "basis": STRING, "known": INTEGER, "of": INTEGER, "lower_bound": {"type": "boolean"}})
+_QUANTITIES = {"type": "object", "additionalProperties": QUANTITY}
+_USAGE_QUANTITIES = _object({f: QUANTITY for f in (
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "cost_usd")})
+ANALYTICS = _object({
+    "run_id": STRING, "source": STRING, "attempts": QUANTITY, "retries": QUANTITY, "outcome_mix": _QUANTITIES,
+    "usage": _USAGE_QUANTITIES, "attempts_with_any_usage": INTEGER,
+    "estimated": {"type": "object", "additionalProperties": _QUANTITIES},
+    "messages": _object({f: QUANTITY for f in (
+        "sent", "deliveries_created", "claimed", "redeliveries", "acknowledged", "dead_lettered")}),
+    "tasks": {"type": "array", "items": _object({
+        "task_id": STRING, "attempts": QUANTITY, "retries": QUANTITY, "outcome_mix": _QUANTITIES,
+        "usage": _USAGE_QUANTITIES})},
+    "next_cursor": _nullable(),
+    "per_profile": {"anyOf": [{"type": "null"}, {"type": "object", "additionalProperties": _object({
+        "attempts": QUANTITY, "usage": _USAGE_QUANTITIES})}]},
+    "per_profile_truncated": {"type": "boolean"},
+    "not_reproducible": {"type": "array", "items": STRING},
+    "replay_ignored_events": _nullable("integer"), "ignored_estimate_events": INTEGER})
+
 RESPONSES = {
     ("/api/v1/system/health", "get"): (200, _object({"status": {"type": "string", "const": "ok"}})),
     ("/api/v1/events", "get"): (200, _page("events", EVENT)),
     ("/api/v1/runs", "get"): (200, _object({"runs": {"type": "array", "items": RUN_SUMMARY}, "next_cursor": _nullable()})),
     ("/api/v1/runs/{run_id}", "get"): (200, _object({"run": RUN, "mock_config": {"anyOf": [{"type": "null"}, _object({"fixture": STRING, "profile_id": STRING, "provider": _nullable()})]}, "tasks": {"type": "array", "items": TASK}, "dependencies": {"type": "array", "items": DEPENDENCY}, "last_sequence": INTEGER})),
-    ("/api/v1/runs/{run_id}/tasks", "get"): (200, _page("tasks", TASK_DETAIL)),
+    ("/api/v1/runs/{run_id}/tasks", "get"): (200, _object({"tasks": {"type": "array", "items": TASK_DETAIL},
+                                                           "next_cursor": _nullable()})),
     ("/api/v1/runs/{run_id}/usage", "get"): (200, _object({
         "run_id": STRING, "attempts_total": INTEGER, "attempts_with_usage": INTEGER,
         "observations": {"type": "array", "items": _object({
@@ -80,7 +103,9 @@ RESPONSES = {
                            "cache_read_tokens": _nullable("integer"), "cache_write_tokens": _nullable("integer"),
                            "cost_usd": _nullable("number")}),
         "coverage": _object({f: _object({"known": INTEGER, "attempts": INTEGER}) for f in (
-            "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "cost_usd")})})),
+            "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "cost_usd")}),
+        "next_cursor": _nullable()})),
+    ("/api/v1/runs/{run_id}/analytics", "get"): (200, ANALYTICS),
     ("/api/v1/runs/{run_id}/threads", "get"): (200, _page("threads", THREAD)),
     ("/api/v1/runs/{run_id}/threads/{thread_id}/messages", "get"): (200, _page("messages", MESSAGE)),
     ("/api/v1/approvals", "get"): (200, _page("approvals", APPROVAL)),

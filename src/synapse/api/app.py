@@ -16,7 +16,7 @@ from fastapi.security import HTTPBearer
 from fastapi.responses import JSONResponse
 
 from synapse.api.operator_messages import MessageReader, ThreadReader, message_query_router
-from synapse.api.run_queries import RunListReader, RunReader, run_query_router
+from synapse.api.run_queries import AnalyticsReader, RunListReader, RunPageReader, RunReader, run_query_router
 from synapse.api.approvals import ApprovalReader, approval_router
 from synapse.api.profile_commands import ClearCooldown, ListProfiles, SetCooldown, profile_router
 from synapse.api.approval_decisions import DecideCommand, approval_decision_router
@@ -30,8 +30,8 @@ EventReader = Callable[[int, int], list[dict[str, Any]]]
 
 
 def create_app(*, token: str, read_events: EventReader, poll_seconds: float = 0.25,
-               read_run: RunReader | None = None, read_tasks: RunReader | None = None, read_runs: RunListReader | None = None,
-               read_usage: RunReader | None = None,
+               read_run: RunReader | None = None, read_tasks: RunPageReader | None = None, read_runs: RunListReader | None = None,
+               read_usage: RunPageReader | None = None, read_analytics: AnalyticsReader | None = None,
                read_approvals: ApprovalReader | None = None,
                read_threads: ThreadReader | None = None, read_messages: MessageReader | None = None,
                publish_workflow: PublishCommand | None = None, create_run: RunCommand | None = None,
@@ -157,6 +157,6 @@ def create_app(*, token: str, read_events: EventReader, poll_seconds: float = 0.
         except WebSocketDisconnect:
             return
 
-    app.include_router(run_query_router(read_run, read_tasks, read_runs, read_usage))
+    app.include_router(run_query_router(read_run, read_tasks, read_runs, read_usage, read_analytics))
     install_openapi_contracts(app)
     return app
