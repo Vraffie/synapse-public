@@ -28,6 +28,7 @@ from synapse.domain.workflow import State, StateChange
 from synapse.infrastructure.worktrees import BoundedText, WorktreeError, WorktreeManager
 from synapse.persistence import agent_tasks as at
 from synapse.persistence import mock_scenarios as ms
+from synapse.persistence.attempt_resume import resumed_count
 from synapse.persistence.idempotency import CommandResult, IdempotencyConflict, canonical_request_hash, execute_idempotent
 from synapse.persistence.run_snapshot import RunNotFound
 from synapse.persistence.run_store import write_run_transition
@@ -617,6 +618,7 @@ class AgentRunService:
                 "tool_names": summary.get("tool_names", []) if summary else [],
                 "worktree": flat,
                 "cancellation_requested": self.db.execute("SELECT 1 FROM events WHERE run_id=? AND type='agent.cancellation_requested' LIMIT 1", (run_id,)).fetchone() is not None,
+                "attempts_resumed": resumed_count(self.db, run_id),  # never-spawned attempts re-queued at startup (ADR 024)
                 "tasks": tasks}
 
     def _summary(self, task_id: str) -> dict | None:

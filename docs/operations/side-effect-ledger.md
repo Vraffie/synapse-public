@@ -25,7 +25,7 @@ Every transition is recorded in `side_effect_ledger_transitions` (append-only, s
 
 ## Wiring plan (not done)
 
-- Promote `SCHEMA` to migration 0017 (after 0015/0016 merge) and drop runtime `ensure_schema`.
+- Promote `SCHEMA` to a migration with the next free number (0017 is taken by ADR 024) and drop runtime `ensure_schema`.
 - Daemon startup: call `recover_side_effects` next to `recover_mock_run`, under the ownership lock.
 - Deployment executor (future): wrap each irreversible step as above, with the candidate hash taken from the approved manifest and rechecked by the approval-binding execution-time check (`approval-binding.md`).
 - Local API/CLI: list `unknown` steps, an authenticated operator resolve command (reuse approver identity), event emission for each transition.

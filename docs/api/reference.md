@@ -2719,6 +2719,7 @@ Success (or idempotent replay of an earlier command).
   "run_id": "string",
   "run_state": "string",
   "cancellation_requested": false,
+  "attempts_resumed": 1,
   "outcome": "string",
   "summary_text": "string",
   "tool_names": [

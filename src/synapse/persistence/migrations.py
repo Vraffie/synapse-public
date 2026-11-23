@@ -36,6 +36,8 @@ def open_database(path: str | Path) -> sqlite3.Connection:
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
     connection.execute("PRAGMA journal_mode = WAL")
+    # Explicit, not a build default: a committed attempt spawn mark (ADR 024) must survive a power loss.
+    connection.execute("PRAGMA synchronous = FULL")
     return connection
 
 

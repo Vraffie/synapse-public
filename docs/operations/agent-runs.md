@@ -73,7 +73,8 @@ What happens when a prerequisite does not complete:
   `failed`.
 - **No established outcome** (`unknown`, or any attempt still unresolved). The dependents stay waiting and the run
   goes to `recovering` for an operator, exactly like a single task; nothing is auto-resolved (end it with
-  `agent-abandon`). If one run has both a failed branch and an `unknown` attempt, `recovering` wins.
+  `agent-abandon`). The one exception is an attempt that provably never reached a provider when the daemon
+  crashed: it is re-queued with a new attempt at restart (see agent-runtime.md, ADR 024). If one run has both a failed branch and an `unknown` attempt, `recovering` wins.
 
 Replaying an idempotency key with the same tasks listed in a different order is a different request and gets
 409; send the tasks in the same order when retrying. Response **201**/**200**: `{run_id, state, repo, base_ref, tasks: [{id, task_id, worktree_path}]}`
@@ -271,5 +272,5 @@ reviewed yet.
 Tests use a fake executable. The opt-in `SYNAPSE_REAL_CLAUDE=1 python scripts/demo_agent.py` runs a
 read-only prompt (tools Read/Glob/Grep) and an approval-gated variant against a throwaway repo with the
 real `claude`; it consumes a small amount of Claude CLI subscription usage. Default `python scripts/demo_agent.py` uses the fake.
-Only one run at a time (shared with mock runs). No resume of `recovering` agent runs exists yet. Finished worktrees are removed on request (above), never
+Only one run at a time (shared with mock runs). No resume of `recovering` agent runs exists yet; only never-spawned attempts are re-queued at restart (ADR 024, `attempts_resumed` in `agent-show`). Finished worktrees are removed on request (above), never
 automatically.
