@@ -41,3 +41,17 @@ Items from the earlier list that are no longer true: stale `agentd.sock` blocks 
 - Genuinely independent reviewer; stronger distinct-human identity.
 - Wiring of the Codex adapter and profile registry, budget and routing policy, output reducer and usage analytics (M4 remainder, M5; the adapter, registry, policy modules and usage ledger are merged but not wired or only partly wired), multi-repo plugin (M6), deployment and release gates (M7).
 - No live provider is enabled by default and no deployment has occurred.
+
+## Session 2026-11-23 (A, `claude-personal`)
+
+Baseline: `main` at `3eb4143` (one squashed snapshot, no PRs, no other branches before this session). Full suite run on that commit: 2697 passed, 22 skipped, 0 failed, exit 0, 239 s (`QT_QPA_PLATFORM=offscreen uv run --extra test --extra desktop --with-editable . python -m pytest -q`). Migrations 0001-0016.
+
+PR numbers elsewhere in this file (#1-#162) refer to the earlier private history and do not exist in this repository; treat them as provenance only. Whether each item they describe is present was checked against the code where noted below, not assumed.
+
+- ADR 016 W0 (finished runs do not hold capacity slots) was already in the snapshot (`persistence/task_claim.py`).
+- PR #4 (A7b W1): per-task `profile`, claims under the named profile's row, spawn through the registry executable (fails closed, never the default), `agent.profile_selected` before spawn, spawn-time rechecks (`profile_narrowed`, `profile_assignment_mismatch`). Full suite on the branch: 2710 passed, 22 skipped. Independent `security-reviewer` report: no critical findings; its two important findings were fixed with tests.
+- PR #6 (A7b W2, stacked on #4): profile list, audited operator cooldowns, `agentctl profiles` and `profile-cooldown`. Full suite on the branch: 2750 passed, 22 skipped. Independent review: no important findings; nits fixed.
+- Neither PR has had CI or a second-session review; neither is merged.
+- Verified on this machine: `bwrap` is installed (`/usr/bin/bwrap`), unprivileged user namespaces work, and the 79 sandbox/bwrap tests run and pass (1 skipped: the opt-in real Codex test). This answers part of ADR 019 open question 7; the polkit, `systemd-run`, uvicorn peer-credential and `python-fido2` items remain unverified.
+- Known limits that remain true: the `--agent-config` registry gives every profile the base executable, credentials and `state_dir`, so profiles do not isolate accounts; `per_profile` budgets keyed to the built-in id do not cover tasks naming a registry profile; operator and approver tokens are same-user files (F2), agents still need `--allow-same-user-agents`; the cooldown routes use the shared operator token.
+- Session B (`claude-personal-ios`) had not been started by the end of this session; a handoff comment is on PR #4 and the brief for B is kept outside the repository.
