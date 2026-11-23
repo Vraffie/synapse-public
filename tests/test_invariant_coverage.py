@@ -40,11 +40,16 @@ COVERAGE = {
         "test_fault_injection_approvals.py::test_a_decision_bound_to_a_changed_candidate_or_policy_is_refused_and_launches_nothing",
         "test_fault_injection_approvals.py::test_parked_approval_survives_a_crash_and_expires_only_forward_in_time",
     ], ""),
-    6: ("no capability elevation by message or prompt", "outside-harness", [
+    6: ("no capability elevation by message or prompt", "partial", [
         "test_message_gateway.py::test_untrusted_fields_size_invalid_json_and_capability_are_rejected",
         "test_session_authority.py::test_credentials_bind_identity_and_exact_capabilities",
         "test_message_service.py::test_forged_and_cross_run_sessions_cannot_read_or_complete",
-    ], "security-style unit tests, not a fault scenario; no end-to-end test that a real agent message cannot widen its tools"),
+        "test_capability_elevation.py::test_a_message_that_asks_for_power_is_only_data_and_changes_no_grant",
+        "test_capability_elevation.py::test_request_fields_that_try_to_set_identity_or_capability_are_refused",
+        "test_capability_elevation.py::test_a_sender_without_the_recipient_or_thread_grant_cannot_reach_other_agents",
+        "test_capability_elevation.py::test_hostile_text_in_a_prompt_value_cannot_close_its_fence_or_outrank_the_guard",
+        "test_capability_elevation.py::test_a_prompt_value_cannot_inject_new_template_fields_or_extra_values",
+    ], "message and prompt seams are tested (grants unchanged after a message that asks for power, forged fields refused, hostile text cannot close its fence); not tested: a real spawned agent, whose only enforcement is the spawn's tool and permission allowlist, and a real model's obedience"),
     7: ("unknown quota displayed as unknown", "partial", [
         "test_usage_ledger.py::test_partial_usage_keeps_unknown_fields_none_not_zero",
         "test_budget_wiring.py::test_missing_usage_is_unknown_never_zero",

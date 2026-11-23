@@ -60,13 +60,18 @@ Status: `covered`.
 
 ## 6. no capability elevation by message or prompt
 
-Status: `outside-harness`.
+Status: `partial`.
 
 - `test_message_gateway.py::test_untrusted_fields_size_invalid_json_and_capability_are_rejected`
 - `test_session_authority.py::test_credentials_bind_identity_and_exact_capabilities`
 - `test_message_service.py::test_forged_and_cross_run_sessions_cannot_read_or_complete`
+- `test_capability_elevation.py::test_a_message_that_asks_for_power_is_only_data_and_changes_no_grant`
+- `test_capability_elevation.py::test_request_fields_that_try_to_set_identity_or_capability_are_refused`
+- `test_capability_elevation.py::test_a_sender_without_the_recipient_or_thread_grant_cannot_reach_other_agents`
+- `test_capability_elevation.py::test_hostile_text_in_a_prompt_value_cannot_close_its_fence_or_outrank_the_guard`
+- `test_capability_elevation.py::test_a_prompt_value_cannot_inject_new_template_fields_or_extra_values`
 
-Not covered: security-style unit tests, not a fault scenario; no end-to-end test that a real agent message cannot widen its tools.
+Not covered: message and prompt seams are tested (grants unchanged after a message that asks for power, forged fields refused, hostile text cannot close its fence); not tested: a real spawned agent, whose only enforcement is the spawn's tool and permission allowlist, and a real model's obedience.
 
 ## 7. unknown quota displayed as unknown
 
@@ -118,7 +123,7 @@ its observable effect on the daemon is exactly these dropped sockets.
 
 ## Remaining gaps
 
-- Invariant 6: no end-to-end test that an agent message cannot widen the agent's own tools.
+- Invariant 6: a real spawned agent and a real model's obedience are not tested; only the message and prompt seams are.
 - Invariant 7: the display of unknown quota in the desktop and CLI is not asserted by the harness.
 - Invariant 10: reduction is covered through the engine since M5.3; scenarios for the exact cache wait for the M5.4 second half, and routing is dry-run only.
 - Stability: the harness (`tests/test_invariants.py`, `tests/test_fault_injection*.py`, this map) passed 5 consecutive runs of 98 tests each (2026-11-23, local, about 15 s per run). That is evidence against obvious flakiness, not a proof, and CI was not used.
