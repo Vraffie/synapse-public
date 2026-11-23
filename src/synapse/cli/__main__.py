@@ -67,6 +67,21 @@ def _load_token(state_dir: Path) -> str:
         os.close(directory)
 
 
+def _follow_fetch(state_dir: Path):
+    """``events --follow`` fetcher. A missing state dir or operator token is a configuration error, not a daemon
+    that is down: it raises FollowError (never retried), so only the socket itself is a transient failure."""
+    from synapse.cli.follow import FollowError
+
+    def fetch(endpoint: str) -> object:
+        try:
+            _load_token(state_dir)
+        except (OSError, ValueError) as exc:
+            raise FollowError(f"cannot use state directory {state_dir}: "
+                              f"{getattr(exc, 'strerror', None) or exc}") from None
+        return _request(state_dir, endpoint)
+    return fetch
+
+
 def _request(state_dir: Path, endpoint: str, *, body: bytes | None = None,
              idempotency_key: str | None = None, correlation_id: str | None = None,
              approver_token: str | None = None, plain_method: str | None = None) -> object:
@@ -602,8 +617,9 @@ def main(argv: list[str] | None = None) -> int:
             from synapse.cli.follow import CURSOR_NAME, follow_events
             if not 0.05 <= args.interval <= 60:
                 parser.error("--interval must be between 0.05 and 60 seconds")
-            return follow_events(lambda endpoint: _request(args.state_dir, endpoint),
-                                 cursor_file=args.cursor_file or args.state_dir / CURSOR_NAME, after=args.after,
+            return follow_events(_follow_fetch(args.state_dir),
+                                 cursor_file=args.cursor_file or args.state_dir / CURSOR_NAME,
+                                 cursor_file_explicit=args.cursor_file is not None, after=args.after,
                                  limit=args.limit, interval=args.interval, stop_when_idle=args.stop_when_idle)
         endpoint = "/api/v1/events?" + urlencode({"after": args.after or 0, "limit": args.limit})
     else:
