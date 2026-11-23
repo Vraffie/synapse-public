@@ -403,6 +403,7 @@ class WorktreeManager:
         """Side-effect-free pre-flight for ``create``: allowlist, ref syntax, no dangerous
         repo config and the ref resolves. Returns the commit SHA; raises ValueError/WorktreeError."""
         if isinstance(repo, str) and repo in self._repos:
+            self._check_repo(repo)  # a missing/odd .git stays a ValueError, as before
             self._refuse_dangerous_config(repo)  # guard first: no git query at all on a refused repo
         sha = self._resolve_base(repo, base_ref)
         self._refuse_dangerous_config(repo)
@@ -418,6 +419,7 @@ class WorktreeManager:
             raise ValueError("invalid base_ref")
         branch = self._branch(run_id, task_id)
         with self._lock(repo):
+            self._refuse_dangerous_config(repo)  # also on the idempotent path below
             if os.path.lexists(path):
                 self._contained(path)
                 if self._repo_of(path) != repo:

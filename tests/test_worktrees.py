@@ -638,3 +638,15 @@ def test_worktree_commondir_must_point_at_its_repository(mgr, repo, tmp_path):
     with pytest.raises(WorktreeError, match="commondir"):
         mgr.status("run1", "task1")
     assert os.path.isdir(path)
+
+
+def test_check_base_keeps_value_error_for_missing_dot_git_and_idempotent_create_is_guarded(mgr, repo, tmp_path):
+    marker = tmp_path / "marker"
+    mgr.create("run1", "task1", repo, "main")
+    add_config_hooks(repo, marker)
+    with pytest.raises(WorktreeError, match="hook.pwn"):
+        mgr.create("run1", "task1", repo, "main")  # same (run, task): idempotent path is guarded too
+    assert not marker.exists()
+    os.rename(os.path.join(repo, ".git"), os.path.join(repo, "moved-git"))
+    with pytest.raises(ValueError, match="real .git directory"):
+        mgr.check_base(repo, "main")

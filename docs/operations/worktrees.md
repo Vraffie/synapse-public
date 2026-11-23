@@ -68,7 +68,11 @@ The agent-runs API uses it for the per-run worktree.
   from another directory; also refused when the allowlist is loaded). The check lists
   the effective config with an explicit `--git-dir=<repo>/.git config --local`, so it
   never walks up to another repo. The check runs first in `check_base` (before any other
-  git query) and also before `remove`, including `remove(force=True)`.
+  git query), at the start of `create` (the idempotent path too) and before `remove`,
+  including `remove(force=True)`. So a worktree of a repository whose config became
+  unsafe cannot be removed through Synapse: fix (or remove) the offending key in the
+  repository's `.git/config` first, or delete the worktree directory yourself and run
+  `git worktree prune` in that repository after checking its config.
 - Host-side `status`/`diff` in a worktree pass `--ignore-submodules=all`, so git never
   starts a child process inside a nested repository the agent created (its own config
   and `info/attributes` are not checked by the guard). A linked worktree's
