@@ -314,3 +314,18 @@ change could alter what is attempted; the file-existence assertions are about wh
   `--tools` equals the allowlist's base names, so such a tool cannot occur and this case was not exercised.
 - Authentication methods other than whatever the scrubbed environment
   (`PATH`, `HOME`, `LANG`, optional `ANTHROPIC_API_KEY`) supports.
+
+## Sandbox and the native Claude install location
+
+The native Claude Code installer puts the binary at `~/.local/share/claude/versions/<version>`, with
+`~/.local/bin/claude` as a symlink. The sandbox treats `~/.local/share` as a protected directory and refuses an
+executable that lies under (or contains) a protected path, so with `"sandbox": true` such a profile cannot start
+an agent: the run ends with `spawn_failed` and the daemon log shows
+`agent spawn failed: a sandbox mount would expose a protected path`. (Found in a live run on 2026-11-23; the
+sandbox tests use a fake executable outside the home directory, so they did not cover this.)
+
+Workaround that keeps the sandbox on: copy the self-contained binary to a directory the sandbox does not protect
+(for example `~/.local/lib/synapse/claude`, mode 0755, owned by you, not inside the state directory or a worktree)
+and set `"executable"` to that copy. Re-copy it after each Claude Code update. Do not disable the sandbox to get
+around the refusal. Whether the sandbox should accept a single-file read-only mount under `.local/share` is an open
+owner decision; until then the protected-path rule stays strict.

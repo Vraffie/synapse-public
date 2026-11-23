@@ -718,3 +718,17 @@ def test_linked_worktree_common_git_config_is_masked(box):
     assert out["log"][0] == 0 and "first" in out["log"][1], out
     assert out["config"] == "ok:" and out["config_unlink"].startswith("err:")
     assert "ghp_SECRETTOKEN" in (repo / ".git" / "config").read_text()
+
+
+def test_sandbox_refusal_reason_is_logged_not_just_spawn_failed(box, caplog):
+    """The run only says spawn_failed; the daemon log must say a protected path blocked the mount, and must
+    never carry the prompt or paths. Reproduces the native Claude install under a protected directory."""
+    import logging
+    _, exe, _, _ = box
+    prov = ClaudeCliProvider(make_profile(box, state_dir=str(exe.parent)))  # executable lies under a protected path
+    with caplog.at_level(logging.WARNING, logger="synapse.providers.claude_cli"):
+        ev = asyncio.run(run(prov, make_request(box, "ok")))
+    assert ev[-1].kind == "failed" and ev[-1].text == "spawn_failed"
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("a sandbox mount would expose a protected path" in m for m in messages)
+    assert not any(str(exe.parent) in m for m in messages)
