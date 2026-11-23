@@ -5,7 +5,8 @@ An entry pins id, version and the package SHA-256; granting anything beyond what
 requested is refused. A plugin that is not listed, or whose bytes changed, does not load.
 
 Same-uid assumption: the daemon, the operator and every enabled plugin run as the same user, so an
-enabled plugin can rewrite this file (for example to raise its own grants for the next start). That
+enabled plugin can rewrite this file (for example to raise grants for the next start), and one that runs in the host process can also edit the
+host's in-memory copy of the entries, which takes effect at once and can raise ANOTHER plugin's grants. That
 cannot be prevented in-process. What this module offers is *detection by the operator*, not a
 boundary: ``enable_plugin`` returns the SHA-256 of the exact file it wrote and ``read_enablement``
 returns the SHA-256 of the exact bytes it read, so a host or operator that kept the digest somewhere

@@ -148,7 +148,7 @@ def test_malformed_enablement_and_manifests_are_rejected(tmp_path):
     parse_manifest(json.dumps(good).encode())
     bad = [{**good, "capabilities": ["deploy.production"]}, {**good, "api_version": 2}, {**good, "id": "../x"},
            {**good, "entrypoint": "../plugin.py"}, {**good, "extra": 1}, {**good, "capabilities": ["git.push", "git.push"]},
-           {**good, "version": "1.0"}]
+           {**good, "version": "1.0"}, {**good, "version": "1.1\u0663.0"}, {**good, "version": "1.0.0\n"}]
     for doc in bad:
         with pytest.raises(ManifestError):
             parse_manifest(json.dumps(doc).encode())

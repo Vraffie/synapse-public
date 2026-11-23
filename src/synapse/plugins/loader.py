@@ -49,7 +49,8 @@ import sys as _sys
 
 # Framework modules plus the standard-library modules the verification path relies on. package.py also
 # binds its primitives at import time, so a later patch of e.g. hashlib.sha256 does not reach it; this
-# list makes such a patch *during* register() visible (core_tampering) and undoes it.
+# list makes a naive patch *during* register() visible (core_tampering) and undoes it. A plugin written to
+# beat the check can still do so (it can alter this function's own locals); this is a tripwire, not a boundary.
 _GUARDED = (roles_module, api_module, policy_module, manifest_module, package_module, enablement_module,
             safe_text_module, hashlib, json, json.decoder, json.encoder, os, stat, _sys.modules[__name__])
 

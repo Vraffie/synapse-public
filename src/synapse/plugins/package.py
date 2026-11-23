@@ -7,8 +7,10 @@ oversized or too many files, too many or too deep directories are refused.
 Every primitive this verification path uses (SHA-256, the os calls, the stat tests) is bound once,
 when this module is first imported, to a private name. Another plugin that later replaces
 ``hashlib.sha256`` or ``os.open`` therefore does not change how a package is hashed. This is a
-narrow defence, not isolation: an in-process plugin can still reach this module's own globals (the
-loader's tripwire watches them while ``register()`` runs; see docs/operations/plugin-framework.md).
+narrow defence, not isolation: an in-process plugin can still reach and replace this module's own globals,
+during or after its ``register()``, and can also blind the loader's tripwire (it can rewrite the loader's
+local variables through the call stack). Any enabled plugin can defeat the pin of every plugin loaded after
+it in the same process; see docs/operations/plugin-framework.md.
 """
 from __future__ import annotations
 

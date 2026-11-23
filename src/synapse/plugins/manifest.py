@@ -12,7 +12,7 @@ MANIFEST_NAME = "manifest.json"
 API_VERSION = 1
 MAX_MANIFEST_BYTES = 16 * 1024
 _ID = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
-_VERSION = re.compile(r"^(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})$")
+_VERSION = re.compile(r"^(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\Z")
 _ENTRY = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}\.py$")
 
 # What a plugin may ask for. Registration rights and privileged actions use one vocabulary so a

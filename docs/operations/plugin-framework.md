@@ -33,10 +33,14 @@ so a huge directory is refused without being listed in full).
 `version`, the package SHA-256 and the `granted` capabilities. A missing file means nothing is enabled.
 
 ```
-python -m synapse.plugins hash   plugins/<id>                              # review the code, note package_sha256
-python -m synapse.plugins enable <state>/plugins.json plugins/<id> <package_sha256> register.roles ...
-python -m synapse.plugins digest <state>/plugins.json                       # later: compare with the recorded digest
+python -I -m synapse.plugins hash   plugins/<id>                              # review the code, note package_sha256
+python -I -m synapse.plugins enable <state>/plugins.json plugins/<id> <package_sha256> register.roles ...
+python -I -m synapse.plugins digest <state>/plugins.json                       # later: compare with the recorded digest
 ```
+
+Always use `-I` and run from a trusted directory (not inside the package): without it, Python puts the
+current directory first on the import path and a planted `json.py` in an unreviewed package runs before
+anything is hashed (proved by probe).
 
 `enable` (`enable_package` in code) hashes the directory again and records nothing unless it still matches
 the hash you reviewed. `enable_plugin` is the low-level call that trusts the hash its caller passes; prefer
@@ -50,16 +54,20 @@ the hash you reviewed. `enable_plugin` is the low-level call that trusts the has
 - It is **only as strong as every other enabled plugin.** Verification runs in the same process as plugins
   that already loaded. `package.py` binds SHA-256 and the `os`/`stat` primitives it uses once, at import
   time, so a later `hashlib.sha256 = Fake` by another plugin does not change how packages are hashed, and
-  the loader's tripwire watches `hashlib`, `json`, `os` and `stat` during `register()` (a patch there is
-  undone and refused as `core_tampering`). But a plugin can still patch `synapse.plugins.package` itself,
-  or the loader, from a thread or a validator after its own load, outside the tripwire's window. Then the
-  next plugin's pin means nothing.
+  the loader's tripwire watches `hashlib`, `json`, `os` and `stat` during `register()` (a naive patch there
+  is undone and refused as `core_tampering`). But any enabled plugin can defeat every later plugin's pin
+  and grants in the same process, during or after its own `register()`: it can patch
+  `synapse.plugins.package` itself (from a thread, a validator, or inside `register()` while also
+  overwriting the loader's local snapshot through `sys._getframe(1).f_locals` on Python 3.13+), and it can
+  edit the loader's in-memory enablement table. Both were reproduced by probe. After that, the next plugin's
+  pin and grants mean nothing. The eventual wiring into the daemon must therefore load each plugin in its
+  own process (or an equivalent boundary) for the pin and grant checks to hold.
 - It says **which** code runs, not that the code is harmless.
 
 ### `plugins.json` can be rewritten by any enabled plugin
 
 Because daemon, operator and plugins share one uid, an enabled plugin can rewrite `plugins.json` (for
-example to raise its own grants for the next start). File mode and ownership checks cannot prevent that.
+example to raise grants for the next start). File mode and ownership checks cannot prevent that.
 Decision: **detect, do not pretend to prevent.**
 
 - `enable` prints the SHA-256 of the exact file it wrote; `digest` (`read_enablement` in code) prints the
@@ -69,8 +77,10 @@ Decision: **detect, do not pretend to prevent.**
 - We deliberately did **not** add a checksum or "grants digest" field inside the file: a plugin can
   recompute it as easily as the host can, so it would only look like protection. A keyed MAC has the same
   problem while its key is readable by the same uid.
-- The host should read `plugins.json` once, before any plugin code runs, so a rewrite takes effect at the
-  next start at the earliest. (Not enforced yet: the loader is not wired into the daemon.)
+- Reading `plugins.json` once before any plugin code runs does NOT make a rewrite wait for the next start:
+  a plugin that runs in the host process can edit the host's in-memory copy of the entries (through the
+  loader's frame) and raise ANOTHER plugin's grants immediately (proved by probe). Only process isolation
+  closes that. (The loader is not wired into the daemon yet.)
 
 ## What a plugin can do
 
@@ -120,13 +130,16 @@ The stored roles are therefore separate objects that the plugin cannot edit afte
   user's files directly. "No database handle" describes the API, not a sandbox.
 - **The tamper check is a tripwire.** Around `register()` it snapshots builtins, the framework and roles
   modules (including this loader), `hashlib`, `json` (with `json.decoder`/`json.encoder`), `os` and `stat`,
-  their class attributes and function code, and undoes and refuses changes it finds (`core_tampering`). It
+  their class attributes and function code, and undoes and refuses the changes it finds (`core_tampering`). A plugin written
+  to defeat it can (it can rewrite the check's own local variables through the call stack). It
   does not see instance state (for example `json._default_decoder`'s attributes), changes made later (from
   a thread the plugin starts or from a validator the host later calls), and it can be raced. A legitimate
   plugin that imports a new submodule of a watched package (e.g. `import json.tool`) is refused too, and
   so is any load during which *another* daemon thread adds an attribute to a watched module (the undo then
   also removes that thread's attribute): load plugins before starting other threads.
-  **Known gaps, both verified by probe and not detected:** (1) the check's own function objects can be
+  **Known gaps, all verified by probe and not detected:** (0) a plugin can overwrite the loader's own
+  snapshot variable via `sys._getframe(1).f_locals` and patch `package._sha256` in the same `register()`;
+  (1) the check's own function objects can be
   mutated in place, for example `sys.modules['synapse.plugins.loader']._undo_tampering.__code__ = ...` makes
   it report nothing (binding the names locally only defeats replacing the module attribute, not changing the
   function object); (2) code state is recorded only for module-level functions, so changing a class method's

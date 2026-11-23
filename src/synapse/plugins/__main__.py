@@ -5,6 +5,10 @@
 enable it only if it still matches the reviewed hash, and print the enablement file's new SHA-256.
 ``python -m synapse.plugins digest PLUGINS_JSON``: print the enablement file's current SHA-256 and
 entries, to compare with the digest the operator recorded (see docs/operations/plugin-framework.md).
+
+Run these with ``python -I -m synapse.plugins ...`` from a trusted directory, never from inside an
+unreviewed package: Python puts the current directory first on the import path, so a planted ``json.py``
+there would run before anything is hashed.
 """
 from __future__ import annotations
 
