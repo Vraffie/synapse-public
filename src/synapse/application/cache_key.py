@@ -50,6 +50,7 @@ MAX_TOOLS = 64
 MAX_VALIDATORS = 64
 MAX_SETTINGS_BYTES = 64 * 1024
 MAX_SETTINGS_DEPTH = 8
+MAX_SETTINGS_NODES = 2048  # counted during the walk, before any serialisation: bounds breadth
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _HEAD = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
@@ -122,7 +123,13 @@ def _settings_digest(settings: object) -> str:
     if not isinstance(settings, Mapping):
         raise ValueError("settings")
 
+    nodes = 0
+
     def walk(value: object, depth: int) -> None:
+        nonlocal nodes
+        nodes += 1
+        if nodes > MAX_SETTINGS_NODES:
+            raise ValueError("settings_nodes")
         if depth > MAX_SETTINGS_DEPTH:
             raise ValueError("settings")
         if isinstance(value, Mapping):

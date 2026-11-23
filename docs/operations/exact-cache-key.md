@@ -27,6 +27,7 @@ All `CacheKeyInputs` fields are daemon-owned facts. The agent never supplies any
 | `write_capable_mode`, `unknown_mode` | permission mode `acceptEdits`, `bypassPermissions`, `auto`, or one that is not recognised. Allowed: `plan`, `dontAsk`, `manual` |
 | `unknown_head`, `unknown_cleanliness`, `dirty_worktree` | the manifest head is unknown, or the worktree is not known to be clean |
 | `unknown_tool_version` | `cli_version` is `None` |
+| `invalid_input:settings_nodes` | settings exceed the node cap (breadth bound) |
 | `credential_in_settings` | a settings key name looks like a credential (token, secret, password, api key, auth, cookie, session, private key) |
 | `budget_blocked`, `outcome_unknown`, `outcome_failed`, `outcome_cancelled`, `outcome_timed_out`, `outcome_unrecognised` | `store_decision` only. Only a `succeeded` attempt that was not budget-blocked may be stored |
 
@@ -40,7 +41,7 @@ The key is the SHA-256 of canonical JSON over the following material:
 - `provider`
 - `profile_id`
 - `cli_version`
-- `model`: `None` means unknown, and that is distinct from any named model
+- `model`: `None` means unknown, and that is distinct from any named model. This is a deliberate tradeoff, following ADR 017 D6 ("model (if known)"): an unknown model still caches, but only against other unknown-model attempts, so a hit can never cross to or from a named model. If the CLI silently changes its default model while reporting none, such attempts would share a key; set an explicit model where that matters
 - the sorted, de-duplicated `allowed_tools`
 - `permission_mode`
 - `settings_sha256`
@@ -61,7 +62,7 @@ Settings are hashed, and only the digest enters the material. A secret value und
 - `allowed_tools`: 1 to 64 entries.
 - `validator_sha256s`: up to 64 entries.
 - Hashes: 64 lowercase hex characters.
-- Settings: a JSON-compatible mapping with string keys, nesting depth up to 8, at most 64 KiB encoded. NaN and non-JSON values are refused.
+- Settings: a JSON-compatible mapping with string keys, nesting depth up to 8, at most 2048 nodes (every mapping, list and scalar counts), at most 64 KiB encoded. The node cap is enforced during the walk, before any serialisation, so a huge flat mapping or list bypasses as `invalid_input:settings_nodes` after at most 2049 steps. NaN and non-JSON values are refused.
 
 ## Not done (the storage half, 2/2)
 
