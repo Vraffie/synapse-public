@@ -135,6 +135,11 @@ Approval-gated steps are checked twice, because an approved step is a real provi
 
 ## Routing dry-run log
 
+**On by default.** `AgentWorkflowEngine(routing_dry_run=RoutingDryRunConfig())` is the default, so every attempt does one extra
+write transaction (`BEGIN IMMEDIATE`: one `optimization_decisions` row, one event, one outbox row) just before the spawn.
+Pass `routing_dry_run=None` to turn it off (tested: nothing is written). A failure of the log is logged and never
+affects the attempt.
+
 `synapse.application.routing_dry_run` (M5.5 wiring). `AgentWorkflowEngine` calls it once per attempt, just
 before the provider is started, and records what `decide` would pick. **It never applies anything**: `dry_run`
 is fixed to True, the record says `applied: false`, and the engine's profile, model and tools are unchanged.
