@@ -183,6 +183,31 @@ continued.
 
 ## Removing a finished run's worktree
 
+### Getting the edits out: `agent-worktree-commit`
+
+A sandboxed agent cannot write to the repository's git metadata, so its edits stay as uncommitted changes in
+the run's worktree. `agentctl agent-worktree-commit RUN -m "message"` (operator Bearer; body `{"message"}`, 1-2000
+characters) has the daemon commit them host-side onto each task's own branch `synapse/<run>/<task>`:
+
+- Only for a FINISHED run; tasks whose tree is clean or already removed are skipped, and if nothing at all is
+  left to commit the call is refused with 409.
+- It never touches your checkout or any other branch and never pushes. To use the work, review the diff
+  (`agent-show`) and merge or cherry-pick the branch yourself.
+- Same hardened git as every host-side operation (hooks, filters, attributes and config guard as for `status`).
+  The check runs on what is actually STAGED (`git add -A`, then the cached raw diff with submodule ignoring
+  forced off, because the agent writes `.gitmodules`): refused with 409 for a nested repository (gitlink), any
+  `.gitmodules` change, or more than 1000 changed files (files, not folded directories); an oversized listing
+  fails closed. A refusal resets the index to what the agent left. The commit author is
+  `synapse <synapse@localhost>`; signing is off.
+- A multi-task run commits task by task; if a later task is refused the 409 does not list the earlier commits,
+  the `agent.worktree_committed` audit event does. The `Idempotency-Key` header is required but a replay simply
+  re-runs the commit (a clean tree then answers 409).
+- Run it only once the run is finished. After `agent-abandon` of a RECOVERING run, the abandon assertion that no
+  agent process remains is the guard against an old process still writing to the tree; the commit does not
+  re-check it.
+- Audited as an `agent.worktree_committed` event carrying the task ids and commit ids, never the message.
+
+
 `POST /api/v1/runs/{run_id}/agent-worktree-remove[?force=true]` (operator Bearer, `Idempotency-Key` and
 `X-Correlation-ID` headers, no body) or `agentctl agent-worktree-remove RUN [--force]`. Removal is always
 operator-requested; nothing deletes worktrees automatically, because a worktree may hold work nobody has

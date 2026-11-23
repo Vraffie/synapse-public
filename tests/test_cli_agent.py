@@ -194,3 +194,12 @@ def test_cooldown_command_refuses_bad_input_before_any_request(calls, args):
     with pytest.raises(SystemExit):
         run(*args)
     assert calls == []
+
+
+def test_worktree_commit_command(calls):
+    assert run("agent-worktree-commit", "run-1", "-m", "fix: it") == 0
+    endpoint, kw = calls[0]
+    assert endpoint == "/api/v1/runs/run-1/agent-worktree-commit" and kw["idempotency_key"]
+    assert json.loads(kw["body"]) == {"message": "fix: it"}
+    with pytest.raises(SystemExit):  # the message is mandatory
+        run("agent-worktree-commit", "run-1")

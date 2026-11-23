@@ -22,7 +22,8 @@ from synapse.api.profile_commands import ClearCooldown, ListProfiles, SetCooldow
 from synapse.api.approval_decisions import DecideCommand, approval_decision_router
 from synapse.api.workflow_commands import PublishCommand, RunCommand, workflow_command_router
 from synapse.api.mock_commands import mock_command_router
-from synapse.api.agent_commands import AbandonAgent, CancelAgent, ReadAgent, RemoveWorktree, StartAgent, agent_command_router
+from synapse.api.agent_commands import (AbandonAgent, CancelAgent, CommitWorktree, ReadAgent, RemoveWorktree, StartAgent,
+                                      agent_command_router)
 from synapse.api.openapi_contracts import install_openapi_contracts
 
 EventReader = Callable[[int, int], list[dict[str, Any]]]
@@ -39,6 +40,7 @@ def create_app(*, token: str, read_events: EventReader, poll_seconds: float = 0.
                start_agent_run: StartAgent | None = None, read_agent_run: ReadAgent | None = None,
                cancel_agent_run: CancelAgent | None = None, abandon_agent_run: AbandonAgent | None = None,
                remove_agent_worktree: RemoveWorktree | None = None,
+               commit_agent_worktree: CommitWorktree | None = None,
                list_profiles: ListProfiles | None = None, set_profile_cooldown: SetCooldown | None = None,
                clear_profile_cooldown: ClearCooldown | None = None) -> FastAPI:
     """Create an operator-only app for serving on a protected Unix socket.
@@ -104,7 +106,7 @@ def create_app(*, token: str, read_events: EventReader, poll_seconds: float = 0.
     app.include_router(workflow_command_router(publish_workflow, create_run))
     app.include_router(mock_command_router(start_mock, cancel_mock, resume_mock))
     app.include_router(agent_command_router(start_agent_run, read_agent_run, cancel_agent_run, abandon_agent_run,
-                                            remove_agent_worktree))
+                                            remove_agent_worktree, commit_agent_worktree))
     app.include_router(profile_router(list_profiles, set_profile_cooldown, clear_profile_cooldown))
     app.include_router(approval_router(read_approvals))
     app.include_router(approval_decision_router(decide_approval, audit_denied_decision, preauthenticate_decision))
