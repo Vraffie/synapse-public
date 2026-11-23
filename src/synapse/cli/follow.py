@@ -27,6 +27,7 @@ MAX_SEQUENCE = 9223372036854775807
 MAX_BACKOFF_SECONDS = 10.0
 DEFAULT_MAX_ERRORS = 60
 MAX_CURSOR_BYTES = 256
+MAX_PAGE = 1000  # the API's page size cap
 MIN_INTERVAL, MAX_INTERVAL = 0.05, 60.0
 _EVENT_ID = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 
@@ -60,7 +61,7 @@ def read_cursor(path: Path) -> Cursor | None:
     fields = data.decode("ascii", "replace").split()
     if (len(data) > MAX_CURSOR_BYTES or not 1 <= len(fields) <= 2 or not fields[0].isascii() or not fields[0].isdigit()
             or int(fields[0]) > MAX_SEQUENCE or (len(fields) == 2 and not _EVENT_ID.fullmatch(fields[1]))):
-        raise FollowError(f"cursor file {path} is corrupt; delete it or pass --after")
+        raise FollowError(f"cursor file {path} is corrupt; delete it")
     return Cursor(int(fields[0]), fields[1] if len(fields) == 2 else None)
 
 
@@ -101,10 +102,15 @@ class _Stop(Exception):
 
 
 def _quiet_stdout(out: IO[str]) -> None:
-    """After a BrokenPipe, point fd 1 at /dev/null so the interpreter's flush at exit does not print a second error."""
+    """After a failed stdout write, point fd 1 at /dev/null so the interpreter's flush at exit does not print a second
+    error. The redirect is permanent for the process (this is a CLI helper; a library caller passes its own ``out``)."""
     if out is sys.stdout:
         try:
-            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+            null = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(null, sys.stdout.fileno())
+            finally:
+                os.close(null)
         except (OSError, ValueError):
             pass
 
@@ -131,11 +137,10 @@ def follow_events(fetch: Callable[[str], object], *, cursor_file: Path, after: i
               "pass --cursor-file to replay into a separate file (the saved cursor is never moved backwards)", file=err)
         return 2
     failures, delay = 0, 0.5
-    reconnected = False
 
     def get(after_sequence: int, page_limit: int) -> list:
         """One page, retrying transient failures; raises _Stop with the exit code on anything else."""
-        nonlocal failures, delay, reconnected
+        nonlocal failures, delay
         while True:
             try:
                 page = fetch("/api/v1/events?" + urlencode({"after": after_sequence, "limit": page_limit}))
@@ -144,7 +149,6 @@ def follow_events(fetch: Callable[[str], object], *, cursor_file: Path, after: i
                     print(f"agentctl: {type(exc).__name__}: {exc}", file=err)
                     raise _Stop(1) from None
                 failures += 1
-                reconnected = True
                 if failures > max_errors:
                     print(f"agentctl: giving up after {max_errors} failed attempts: {type(exc).__name__}", file=err)
                     raise _Stop(1) from None
@@ -176,21 +180,26 @@ def follow_events(fetch: Callable[[str], object], *, cursor_file: Path, after: i
     try:
         cursor_id = None
 
-        def verify(sequence: int, event_id: str | None) -> bool:
-            """The event AT ``sequence`` must exist (and have ``event_id`` when known): same database as before."""
-            head = get(sequence - 1, 1) if sequence > 0 else []
-            at = head[0] if head and isinstance(head[0], dict) else None
-            if sequence > 0 and (at is None or at.get("sequence") != sequence):
+        def check(at: object, sequence: int, event_id: str | None) -> bool:
+            """``at`` (the event the log has at ``sequence``) must exist and have ``event_id`` when known."""
+            if not isinstance(at, dict) or at.get("sequence") != sequence:
                 print(f"agentctl: the cursor {sequence} in {cursor_file} is ahead of the event log (the database "
                       f"was recreated or restored?); delete the cursor file {cursor_file} and run again to start over",
                       file=err)
                 return False
-            if sequence > 0 and event_id is not None and at.get("id") != event_id:
+            if event_id is not None and at.get("id") != event_id:
                 print(f"agentctl: the event at sequence {sequence} is not the one the cursor in {cursor_file} was "
                       f"saved for (the database was recreated or restored?); delete the cursor file {cursor_file} "
                       "and run again to start over", file=err)
                 return False
             return True
+
+        def verify(sequence: int, event_id: str | None) -> bool:
+            """Startup check: the event AT ``sequence`` must exist (and have ``event_id`` when known)."""
+            if sequence <= 0:
+                return True
+            head = get(sequence - 1, 1)
+            return check(head[0] if head else None, sequence, event_id)
 
         if after is not None:
             cursor = after
@@ -213,13 +222,17 @@ def follow_events(fetch: Callable[[str], object], *, cursor_file: Path, after: i
         if cursor > 0:
             cursor_id = saved.event_id if saved is not None and saved.sequence == cursor else None
         while True:
-            events = get(cursor, limit)
-            # After a reconnect (or on an idle poll) the log must still be the one the cursor came from.
-            if cursor > 0 and (reconnected or not events):
-                reconnected = False
-                if not verify(cursor, cursor_id):
+            if cursor > 0:
+                # Every page starts AT the cursor: the first event must be the one the cursor was saved for, so a log
+                # replaced between two polls (even by a longer one) or wiped while idle (empty page) is caught with
+                # no extra request. (The API caps a page at 1000 events.)
+                events = get(cursor - 1, min(limit + 1, MAX_PAGE))
+                if not check(events[0] if events else None, cursor, cursor_id):
                     return 1
-                reconnected = False
+                cursor_id = events[0].get("id")
+                events = events[1:]
+            else:
+                events = get(cursor, limit)
             last, last_id = cursor, None
             lines = []
             for event in events:
@@ -241,6 +254,7 @@ def follow_events(fetch: Callable[[str], object], *, cursor_file: Path, after: i
                     _quiet_stdout(out)
                     return 1  # the reader went away: do not claim the page was delivered
                 except OSError as exc:
+                    _quiet_stdout(out)
                     print(f"agentctl: cannot write events to stdout ({exc.strerror or type(exc).__name__}); "
                           "the cursor was not moved", file=err)
                     return 1

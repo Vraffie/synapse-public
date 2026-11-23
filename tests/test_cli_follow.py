@@ -435,3 +435,47 @@ def test_cli_naming_the_default_cursor_file_does_not_allow_rewinding(tmp_path):
                              "--after", "0", "--cursor-file", str(state / ".." / "state" / "events.cursor")],
                             capture_output=True, text=True, timeout=30, cwd=ROOT, env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
     assert result.returncode == 2 and read_cursor(state / "events.cursor") == (5, "evt-5")
+    assert "below the saved cursor 5" in result.stderr and "usage:" not in result.stderr
+
+
+def test_a_longer_log_swapped_in_after_startup_prints_nothing_foreign(tmp_path):
+    run(Feed(5), tmp_path)
+    state = {"n": 0, "feed": Feed(5)}
+    def fetch(endpoint):
+        state["n"] += 1
+        if state["n"] == 2:  # after the startup check: the daemon restarted with a longer, different log, no error
+            state["feed"] = Feed(10, salt="new-")
+        return state["feed"](endpoint)
+    out, err = io.StringIO(), io.StringIO()
+    code = follow_events(fetch, cursor_file=tmp_path / "cursor", after=None, limit=3, interval=0.1,
+                         stop_when_idle=True, out=out, err=err, sleep=lambda s: None)
+    assert code == 1 and out.getvalue() == "" and "not the one the cursor" in err.getvalue()
+    assert read_cursor(tmp_path / "cursor") == (5, "evt-5")
+
+
+def test_a_wipe_while_idle_is_detected_on_the_next_poll(tmp_path):
+    run(Feed(5), tmp_path)
+    state = {"n": 0, "feed": Feed(5)}
+    def fetch(endpoint):
+        state["n"] += 1
+        if state["n"] == 3:
+            state["feed"] = Feed(0)
+        return state["feed"](endpoint)
+    def sleep(seconds):
+        if state["n"] > 20:
+            raise KeyboardInterrupt
+    err = io.StringIO()
+    code = follow_events(fetch, cursor_file=tmp_path / "cursor", after=None, limit=3, interval=0.1,
+                         stop_when_idle=False, out=io.StringIO(), err=err, sleep=sleep)
+    assert code == 1 and state["n"] <= 4 and "ahead of the event log" in err.getvalue()
+
+
+def test_stdout_to_dev_full_is_one_line_with_no_exit_time_error(tmp_path):
+    code = ("import sys, pathlib\nfrom synapse.cli.follow import follow_events\n"
+            "sys.exit(follow_events(lambda e: {'events': [{'sequence': 1, 'id': 'e1'}]}, cursor_file=pathlib.Path(sys.argv[1]),"
+            " after=None, limit=2, interval=0.1, stop_when_idle=True))\n")
+    with open("/dev/full", "w") as full:
+        result = subprocess.run([sys.executable, "-c", code, str(tmp_path / "c")], stdout=full, stderr=subprocess.PIPE,
+                                text=True, timeout=15, env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+    assert result.returncode == 1 and "Traceback" not in result.stderr and "Exception ignored" not in result.stderr
+    assert not (tmp_path / "c").exists()

@@ -22,15 +22,19 @@ handled and its id, which binds the cursor to one database.
   the two replays that page on the next run. A consumer that needs exactly-once should dedupe on `sequence`.
 - **Cursor bound to the database.** On resume the event AT the cursor is fetched (`after=cursor-1&limit=1`). If the
   log is shorter than the cursor, or the event there has a different id (database recreated or restored), it exits 1
-  with a message and prints nothing; to start over, delete the cursor file. The same check runs after every
-  reconnect and on every idle poll while following, so a daemon restarted with a wiped or restored database stops the
-  follower with exit 1 instead of polling an empty log forever. `--after N` (N > 0) gets the same check: an N beyond the
+  with a message and prints nothing; to start over, delete the cursor file. The same check runs on every
+  poll while following at no extra request: each page is fetched from `after=cursor-1` and its first event must be the
+  one at the cursor (then it is dropped). A daemon restarted with a wiped, restored or longer replaced database stops
+  the follower with exit 1, before anything foreign is printed, instead of polling an empty log forever. (A page holds
+  at most 999 new events when `--limit 1000`, because of the API's 1000 cap.) `--after N` (N > 0) gets the same check: an N beyond the
   end of the log exits 1 instead of stalling. A legacy cursor file (a
   bare integer, written by the previous version) is accepted once: the log must still contain that sequence, a
   warning goes to stderr, and the file is rewritten in the new format with the id of that event.
 - **`--after` never moves a saved cursor backwards.** `--after N` below the saved cursor
   exits 2 with a message and changes nothing, unless `--cursor-file` names a file other than the default
   `STATE/events.cursor` (compared by resolved path), for example a separate file for a replay. `--after` at or above the saved cursor is allowed.
+- **Stdout write error** other than a closed pipe (full disk, `/dev/full`): one line on stderr, exit 1, cursor not
+  advanced; fd 1 is then pointed at /dev/null for the rest of the process so exit does not print a second error.
 - **Cursor cannot be saved** (full disk, missing directory, read-only): one line on stderr, exit 1. The page was
   already printed, so the next run replays it.
 - **Daemon down or restarting** (connection refused, missing socket, timeout, HTTP 5xx): retried with backoff
