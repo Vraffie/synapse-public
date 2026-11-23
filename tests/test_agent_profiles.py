@@ -254,3 +254,91 @@ def test_task_profile_only_changes_the_fingerprint_when_named(env):
     assert "profile" not in svc._fingerprint(plain)["tasks"][0]  # earlier receipts still replay
     assert svc._fingerprint(named)["tasks"][0]["profile"] == "reader"
     assert svc._fingerprint(named) != svc._fingerprint(plain)
+
+
+def _events(svc, kind):
+    import json as _json
+    return [_json.loads(r[0]) for r in svc.db.execute("SELECT payload_json FROM events WHERE type=? ORDER BY sequence", (kind,))]
+
+
+def test_list_profiles_shows_state_without_paths_or_credentials(env):
+    svc = make_service(env, True, "s")
+    listed = svc.list_profiles()["profiles"]
+    by_id = {p["id"]: p for p in listed}
+    assert set(by_id) == {"default", "reader", "off"}
+    assert by_id["reader"]["enabled"] and not by_id["off"]["enabled"] and by_id["reader"]["load"] == 0
+    assert by_id["default"]["position"] == "primary" and by_id["reader"]["position"] is None
+    assert by_id["default"]["load"] is None
+    flat = repr(listed)
+    assert "/" not in flat and "executable" not in flat and "credentials" not in flat.lower()
+    assert [p["id"] for p in make_service(env, False, "s2").list_profiles()["profiles"]] == ["default"]
+
+
+def test_cooldown_set_and_clear_are_audited_and_validated(env):
+    svc = make_service(env, True, "s")
+    assert svc.set_cooldown("reader", 60)["cooldown_remaining_seconds"] > 59
+    assert {p["id"]: p for p in svc.list_profiles()["profiles"]}["reader"]["cooldown_remaining_seconds"] > 59
+    (event,) = _events(svc, "profile.cooldown_set")
+    assert event["profile_id"] == "reader" and event["seconds"] == 60 and event["principal"]
+    assert svc.clear_cooldown("reader")["cooldown_remaining_seconds"] == 0.0
+    assert _events(svc, "profile.cooldown_cleared")[0]["was_cooling"] is True
+    for bad in (0, -1, 86401, True, float("nan"), "5"):
+        with pytest.raises(AgentRunError, match="seconds"):
+            svc.set_cooldown("reader", bad)
+    for pid in ("default", "nope", None, 5):
+        with pytest.raises(AgentRunError, match="unknown profile"):
+            svc.set_cooldown(pid, 10)
+        with pytest.raises(AgentRunError, match="unknown profile"):
+            svc.clear_cooldown(pid)
+    assert len(_events(svc, "profile.cooldown_set")) == 1  # refusals are not recorded as changes
+
+
+def test_unaudited_cooldown_never_takes_effect_and_clear_needs_its_audit(env):
+    svc = make_service(env, True, "s")
+    svc.db.execute("DROP TABLE outbox")  # make the audit insert fail
+    with pytest.raises(AgentRunError) as err:
+        svc.set_cooldown("reader", 60)
+    assert err.value.status == 503 and svc.runtime.cooldowns.remaining("reader") == 0.0
+    svc.runtime.cooldowns.set("reader", 60)
+    with pytest.raises(AgentRunError):
+        svc.clear_cooldown("reader")
+    assert svc.runtime.cooldowns.remaining("reader") > 0  # still in force: clearing needs its audit
+
+
+def test_profiles_and_cooldown_end_to_end_through_a_real_daemon(env):
+    import signal
+    import time
+    tmp, state, _ = env
+    agents = write(tmp, [entry()])
+    daemon = subprocess.Popen([sys.executable, "-m", "synapse.daemon", "--state-dir", str(state),
+                               "--migrations", str(ROOT / "migrations"), "--claude-cli-config", str(tmp / "base.json"),
+                               "--agent-config", str(agents), "--allow-same-user-agents"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                              env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+
+    def ctl(*args):
+        return subprocess.run([sys.executable, "-m", "synapse.cli", "--state-dir", str(state), *args],
+                              capture_output=True, text=True, timeout=10, env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+    try:
+        deadline = time.monotonic() + 10
+        while not (state / "agentd.sock").exists() and time.monotonic() < deadline:
+            assert daemon.poll() is None, daemon.stderr.read()
+            time.sleep(0.02)
+        listed = json.loads(ctl("profiles").stdout)["profiles"]
+        assert {p["id"] for p in listed} == {"default", "reader"} and "executable" not in repr(listed)
+        assert json.loads(ctl("profile-cooldown", "reader", "--seconds", "120").stdout)["cooldown_remaining_seconds"] > 119
+        reader = {p["id"]: p for p in json.loads(ctl("profiles").stdout)["profiles"]}["reader"]
+        assert reader["cooldown_remaining_seconds"] > 100
+        bad = ctl("profile-cooldown", "default", "--seconds", "5")
+        assert bad.returncode == 1 and "422" in bad.stderr
+        assert json.loads(ctl("profile-cooldown", "reader", "--clear").stdout)["cooldown_remaining_seconds"] == 0.0
+        reader = {p["id"]: p for p in json.loads(ctl("profiles").stdout)["profiles"]}["reader"]
+        assert reader["cooldown_remaining_seconds"] == 0.0
+        assert (state / "operator.token").read_text().strip() not in ctl("profiles").stdout
+    finally:
+        daemon.send_signal(signal.SIGTERM)
+        daemon.communicate(timeout=10)
+    import sqlite3
+    db = sqlite3.connect(str(state / "synapse.sqlite"))
+    kinds = [r[0] for r in db.execute("SELECT type FROM events WHERE type LIKE 'profile.cooldown_%' ORDER BY sequence")]
+    assert kinds == ["profile.cooldown_set", "profile.cooldown_cleared"]  # the refused 'default' change left no event

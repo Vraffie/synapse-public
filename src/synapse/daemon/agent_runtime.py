@@ -22,6 +22,7 @@ from collections.abc import Awaitable, Callable
 
 from synapse.daemon.agent_config import ApprovalPolicy
 from synapse.daemon.agent_profiles import REGISTRY_REF_PREFIX, mode_within
+from synapse.daemon.profile_registry import Cooldowns
 from synapse.application.approval_requests import DaemonApprovalRequester
 from synapse.application.budget_policy import BudgetPolicy
 from synapse.domain.contracts import RunId, new_id, validate_id
@@ -65,6 +66,7 @@ class AgentRuntime:
         self.db = connection
         self.profile, self._verify, self._factory, self._max_concurrency = profile, verify, provider_factory, max_concurrency
         self.registry = registry  # ProfileRegistry or None: named profiles resolve here and nowhere else
+        self.cooldowns = Cooldowns()  # operator-set, in memory: a restart forgets them (ADR 016 decision 6)
         self.approval_policy = approval_policy or ApprovalPolicy()
         self.budget_policy = budget_policy  # bound as an immutable copy to each run at start (ADR 020 D2)
         # (run_id, task_id) -> (HEAD sha, tree is clean); blocking, called in a worker thread.
@@ -248,7 +250,10 @@ class AgentRuntime:
             return "profile_unknown"
         if row[0] != "claude" or not str(row[1]).startswith(REGISTRY_REF_PREFIX):
             return "profile_not_registry"  # the built-in agent row or a mock profile never satisfies a named profile
-        return None if row[2] == 1 else "profile_disabled"
+        if row[2] != 1:
+            return "profile_disabled"
+        # An operator cooldown only refuses the task; nothing waits or retries (never an evasion of a limit).
+        return "profile_cooling_down" if self.cooldowns.active(profile_id) else None
 
     def _prompt(self, task_specs):
         def load(task_id: str) -> bytes:

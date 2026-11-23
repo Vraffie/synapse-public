@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from synapse.api.operator_messages import MessageReader, ThreadReader, message_query_router
 from synapse.api.run_queries import RunListReader, RunReader, run_query_router
 from synapse.api.approvals import ApprovalReader, approval_router
+from synapse.api.profile_commands import ClearCooldown, ListProfiles, SetCooldown, profile_router
 from synapse.api.approval_decisions import DecideCommand, approval_decision_router
 from synapse.api.workflow_commands import PublishCommand, RunCommand, workflow_command_router
 from synapse.api.mock_commands import mock_command_router
@@ -37,7 +38,9 @@ def create_app(*, token: str, read_events: EventReader, poll_seconds: float = 0.
                decide_approval: DecideCommand | None = None, audit_denied_decision: Callable | None = None, preauthenticate_decision: Callable | None = None,
                start_agent_run: StartAgent | None = None, read_agent_run: ReadAgent | None = None,
                cancel_agent_run: CancelAgent | None = None, abandon_agent_run: AbandonAgent | None = None,
-               remove_agent_worktree: RemoveWorktree | None = None) -> FastAPI:
+               remove_agent_worktree: RemoveWorktree | None = None,
+               list_profiles: ListProfiles | None = None, set_profile_cooldown: SetCooldown | None = None,
+               clear_profile_cooldown: ClearCooldown | None = None) -> FastAPI:
     """Create an operator-only app for serving on a protected Unix socket.
 
     The daemon must provide a reader that is safe to call on the ASGI event
@@ -102,6 +105,7 @@ def create_app(*, token: str, read_events: EventReader, poll_seconds: float = 0.
     app.include_router(mock_command_router(start_mock, cancel_mock, resume_mock))
     app.include_router(agent_command_router(start_agent_run, read_agent_run, cancel_agent_run, abandon_agent_run,
                                             remove_agent_worktree))
+    app.include_router(profile_router(list_profiles, set_profile_cooldown, clear_profile_cooldown))
     app.include_router(approval_router(read_approvals))
     app.include_router(approval_decision_router(decide_approval, audit_denied_decision, preauthenticate_decision))
     app.include_router(message_query_router(read_threads, read_messages))

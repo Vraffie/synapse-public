@@ -119,6 +119,10 @@ def stubs():
         "decide_approval": lambda *a, **k: _result({"approval_id": "a1", "state": "approved", "state_version": 1}),
         "start_agent_run": lambda *a, **k: _result({"run_id": "r1", "task_id": "t", "state": "running",
                                                     "worktree_path": "w", "repo": "r", "base_ref": "main"}),
+        "list_profiles": lambda: {"profiles": [{"id": "default", "provider": "claude", "enabled": True, "max_concurrency": 2,
+                                                "load": None, "cooldown_remaining_seconds": 0.0, "position": "primary"}]},
+        "set_profile_cooldown": lambda profile_id, seconds: {"id": profile_id, "cooldown_remaining_seconds": float(seconds)},
+        "clear_profile_cooldown": lambda profile_id: {"id": profile_id, "cooldown_remaining_seconds": 0.0},
         "read_agent_run": read_agent, "read_usage": read_usage,
         "cancel_agent_run": lambda *a, **k: _result({"run_id": "r1", "state": "cancellation_requested"}),
         "abandon_agent_run": lambda *a, **k: _result({"run_id": "r1", "state": "failed", "cancelled_tasks": 1}),
@@ -251,6 +255,28 @@ CASES[("/api/v1/approvals/{approval_id}/decision", "post")] = {
     403: ({"decide_approval": raising(ApprovalAccessDenied(SECRET, code="not_permitted", principal="p"))},
           _cmd("", DECISION_BODY, DECISION_HEADERS)),
 }
+COOLDOWN = "/api/v1/profiles/{profile_id}/cooldown"
+COOLDOWN_HEADERS = {**AUTH, "X-Correlation-ID": "corr-1", "Content-Type": "application/json"}
+CASES[("/api/v1/profiles", "get")] = {
+    200: ({}, {}),
+    500: ({"list_profiles": raising(RuntimeError(SECRET))}, {}),
+    503: ({"list_profiles": None}, {}),
+}
+CASES[(COOLDOWN, "post")] = {
+    200: ({}, {"headers": COOLDOWN_HEADERS, "json": {"seconds": 60}}),
+    422: ({"set_profile_cooldown": raising(AgentRunError(422, "unknown profile"))},
+          {"headers": COOLDOWN_HEADERS, "json": {"seconds": 60}}),
+    500: ({"set_profile_cooldown": raising(RuntimeError(SECRET))}, {"headers": COOLDOWN_HEADERS, "json": {"seconds": 60}}),
+    503: ({"set_profile_cooldown": None}, {"headers": COOLDOWN_HEADERS, "json": {"seconds": 60}}),
+    413: ({}, {"headers": COOLDOWN_HEADERS, "content": BIG}),
+    415: ({}, {"headers": {**COOLDOWN_HEADERS, "Content-Type": "text/plain"}, "content": b"x"}),
+}
+CASES[(COOLDOWN, "delete")] = {
+    200: ({}, {"headers": COOLDOWN_HEADERS}),
+    422: ({"clear_profile_cooldown": raising(AgentRunError(422, "unknown profile"))}, {"headers": COOLDOWN_HEADERS}),
+    500: ({"clear_profile_cooldown": raising(RuntimeError(SECRET))}, {"headers": COOLDOWN_HEADERS}),
+    503: ({"clear_profile_cooldown": None}, {"headers": COOLDOWN_HEADERS}),
+}
 # the mock/agent cancel routes also need a non-empty body case for 400 (headers case is covered above)
 
 
@@ -258,7 +284,7 @@ def _url(route, request):
     path, _ = route
     if "alt_path" in request:
         return request["alt_path"]
-    return (path.replace("{run_id}", "r1").replace("{approval_id}", "a1").replace("{thread_id}", "th1"))
+    return (path.replace("{run_id}", "r1").replace("{approval_id}", "a1").replace("{thread_id}", "th1").replace("{profile_id}", "reader"))
 
 
 def fire(route, status):
@@ -354,7 +380,7 @@ ROUTES = sorted(DOC_ROUTES)
 
 
 def _bare(route):
-    path = route[0].replace("{run_id}", "r1").replace("{approval_id}", "a1").replace("{thread_id}", "th1")
+    path = route[0].replace("{run_id}", "r1").replace("{approval_id}", "a1").replace("{thread_id}", "th1").replace("{profile_id}", "reader")
     return route[1].upper(), path
 
 

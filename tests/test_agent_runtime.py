@@ -886,3 +886,26 @@ def test_selection_that_cannot_be_recorded_spawns_nothing(env, monkeypatch):
     asyncio.run(go())
     assert env.spawns() == [] and env.states()[1] == {"work": "failed"}
     assert env.summaries()[0]["detail"] == "profile_selection_not_recorded"
+
+
+def test_cooling_profile_fails_the_task_closed_without_spawning_or_waiting(env):
+    _register_profile(env, "reader", 1)
+    env.runtime.cooldowns.set("reader", 300)
+
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(profile_id="reader"))
+        await finish(env)
+    asyncio.run(go())
+    _refused(env, "profile_cooling_down")
+
+
+def test_cleared_cooldown_lets_the_profile_run_again(env):
+    _register_profile(env, "reader", 1)
+    env.runtime.cooldowns.set("reader", 300)
+    env.runtime.cooldowns.clear("reader")
+
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(profile_id="reader"))
+        await finish(env)
+    asyncio.run(go())
+    assert env.states() == ("succeeded", {"work": "completed"})

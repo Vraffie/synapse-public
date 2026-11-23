@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from synapse.api.agent_commands import AgentRunError
 from synapse.daemon.agent_profiles import DEFAULT_PROFILE_ID, mode_within
 from synapse.daemon.agent_runtime import AgentDisabled, AgentRuntime
-from synapse.daemon.profile_registry import ProfileRegistry, ProfileSpec
+from synapse.daemon.profile_registry import Cooldowns, ProfileRegistry, ProfileSpec
 from synapse.domain.contracts import EventEnvelope, encode_payload
 from synapse.domain.runs import RunChange, RunState
 from synapse.domain.workflow import State, StateChange
@@ -370,6 +370,80 @@ class AgentRunService:
                 raise
         except Exception:
             _LOG.error("Could not cancel queued run %s after a failed agent start", run_id)
+
+    # ------------------------------------------------------------ profiles
+    def _declared(self, profile_id) -> ProfileSpec:
+        """A declared (non-default) registry profile, or a 422; cooldowns apply to nothing else."""
+        spec = None if self.registry is None or not isinstance(profile_id, str) else self.registry.get(profile_id)
+        if spec is None or profile_id == DEFAULT_PROFILE_ID:
+            raise _bad("unknown profile")
+        return spec
+
+    def _load(self, profile_id: str) -> int:
+        """Worker slots a profile occupies now (same rule as ``claim_task``)."""
+        return self.db.execute(
+            "SELECT COUNT(*) FROM ("
+            " SELECT a.profile_id AS p FROM task_attempts a JOIN tasks t ON t.id=a.task_id JOIN runs r ON r.id=t.run_id "
+            " WHERE a.state NOT IN ('completed','failed','cancelled') AND r.state NOT IN ('failed','cancelled','succeeded')"
+            " UNION ALL SELECT t.assigned_profile_id FROM tasks t JOIN runs r ON r.id=t.run_id "
+            " WHERE t.state IN ('assigned','running') AND r.state NOT IN ('failed','cancelled','succeeded') AND NOT EXISTS ("
+            "  SELECT 1 FROM task_attempts a WHERE a.task_id=t.id AND a.state NOT IN ('completed','failed','cancelled'))"
+            ") WHERE p=?", (profile_id,)).fetchone()[0]
+
+    def list_profiles(self) -> dict:
+        """Operator view of the registry: never credentials, executable paths or the base profile's settings."""
+        if self.registry is None:
+            specs, chain = [self.resolve_profile(None)], ()
+        else:
+            specs, chain = list(self.registry.profiles), self.registry.chain
+        out = []
+        for spec in specs:
+            declared = spec.id != DEFAULT_PROFILE_ID
+            position = "primary" if chain and spec.id == chain[0] else "fallback" if spec.id in chain[1:] else None
+            out.append({"id": spec.id, "provider": spec.provider, "enabled": bool(spec.enabled),
+                        "max_concurrency": spec.max_concurrency,
+                        "load": self._load(spec.id) if declared else None,  # the default is capped by the run row
+                        "cooldown_remaining_seconds": round(self.runtime.cooldowns.remaining(spec.id), 3) if declared else 0.0,
+                        "position": position})
+        return {"profiles": out}
+
+    def set_cooldown(self, profile_id, seconds) -> dict:
+        self._declared(profile_id)
+        try:
+            Cooldowns().set(profile_id, seconds)  # range check on a scratch object: nothing is in force yet
+        except ValueError:
+            raise _bad("seconds must be above 0 and at most 86400") from None
+        self._audit_profile("profile.cooldown_set", profile_id, {"seconds": seconds})  # audit first, then the effect
+        self.runtime.cooldowns.set(profile_id, seconds)
+        return {"id": profile_id, "cooldown_remaining_seconds": round(self.runtime.cooldowns.remaining(profile_id), 3)}
+
+    def clear_cooldown(self, profile_id) -> dict:
+        self._declared(profile_id)
+        before = self.runtime.cooldowns.remaining(profile_id)
+        # Clearing is the permissive direction: the audit must succeed first.
+        self._audit_profile("profile.cooldown_cleared", profile_id, {"was_cooling": before > 0})
+        self.runtime.cooldowns.clear(profile_id)
+        return {"id": profile_id, "cooldown_remaining_seconds": 0.0}
+
+    def _audit_profile(self, event_type: str, profile_id: str, payload: dict) -> None:
+        try:
+            event = EventEnvelope.create(aggregate_type="profile", aggregate_id=profile_id, event_type=event_type,
+                                         payload={"profile_id": profile_id, "principal": PRINCIPAL, **payload})
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                self.db.execute("INSERT INTO events(id,aggregate_type,aggregate_id,run_id,type,schema_version,payload_json,occurred_at) "
+                                "VALUES(?,?,?,NULL,?,?,?,?)",
+                                (event.id, event.aggregate_type, profile_id, event.event_type, event.schema_version,
+                                 encode_payload(event.payload), event.occurred_at))
+                self.db.execute("INSERT INTO outbox(event_id) VALUES(?)", (event.id,))
+                self.db.execute("COMMIT")
+            except BaseException:
+                if self.db.in_transaction:
+                    self.db.execute("ROLLBACK")
+                raise
+        except Exception:
+            _LOG.error("Profile change %s for %s was refused: the audit event could not be written", event_type, profile_id)
+            raise AgentRunError(503, "Profile change could not be recorded") from None
 
     # ------------------------------------------------------- worktree removal
     async def remove_worktree(self, run_id: str, force: bool = False) -> dict:
