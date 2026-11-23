@@ -146,3 +146,10 @@ Unless every task names a profile, one run still uses the runtime-wide `max_conc
 
 Codex (stays disabled; W3), fallback selection,
 per-attempt `agent.profile_selected` events and router construction per profile (A7b-2).
+
+## Effective profile in run views
+
+`GET /api/v1/runs/{id}/agent` reports `profile_id` on each task (the profile it was claimed under, `null` before the
+claim) and on its latest `attempt`. `spec.profile` is only what was requested; the two can differ for a task that named
+no profile (it runs under the built-in `agent` profile). Usage per profile is already recorded on
+`usage_observations.profile_id`; the `/usage` view is not changed here.

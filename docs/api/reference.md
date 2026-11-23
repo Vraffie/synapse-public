@@ -2205,6 +2205,7 @@ Success (or idempotent replay of an earlier command).
       "task_id": "string",
       "node_id": "string",
       "state": "string",
+      "profile_id": "string",
       "spec": {},
       "attempt": {},
       "result": {},
