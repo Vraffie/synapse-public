@@ -354,11 +354,11 @@ def _result_problem(result: object) -> str | None:
 
 
 def record(store: CacheStore, request: CacheKeyInputs, result: CacheResult, *,
-           expected_key_sha256: str | None = None) -> RecordOutcome:
+           expected_key_sha256: str) -> RecordOutcome:
     """Store ``result`` under ``request``'s key if allowed; first writer wins. Never raises.
 
     ``expected_key_sha256`` is the key from the ``lookup`` that preceded this attempt. The daemon
-    must pass it: if the request now derives a different key (the head, spec, policy ... moved
+    must pass it (it is a required keyword; omitting it is a TypeError, never a silent skip): if the request now derives a different key (the head, spec, policy ... moved
     while the attempt ran), the result is refused with ``key_changed`` instead of being filed under
     inputs it was not produced from.
     """
@@ -368,11 +368,10 @@ def record(store: CacheStore, request: CacheKeyInputs, result: CacheResult, *,
             return RecordOutcome(RecordStatus.REFUSED, decision.reason)
         if not isinstance(decision, CacheKey):
             return RecordOutcome(RecordStatus.REFUSED, "invalid_input")
-        if expected_key_sha256 is not None:
-            if not _sha(expected_key_sha256):
-                return RecordOutcome(RecordStatus.REFUSED, "invalid_input:expected_key_sha256", decision.sha256)
-            if expected_key_sha256 != decision.sha256:
-                return RecordOutcome(RecordStatus.REFUSED, "key_changed", decision.sha256)
+        if not _sha(expected_key_sha256):
+            return RecordOutcome(RecordStatus.REFUSED, "invalid_input:expected_key_sha256", decision.sha256)
+        if expected_key_sha256 != decision.sha256:
+            return RecordOutcome(RecordStatus.REFUSED, "key_changed", decision.sha256)
         problem = _result_problem(result)
         if problem is not None:
             return RecordOutcome(RecordStatus.REFUSED, problem, decision.sha256)

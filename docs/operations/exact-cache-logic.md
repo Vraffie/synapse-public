@@ -29,10 +29,10 @@ Only `read_only_analysis`, and only when an operator policy marks the task cache
    - When the verifier agrees, the hit has `artifact_hash_checked=True`.
 5. `may_serve(key, CacheHit(...))` must hold. The result is then `outcome=hit` with `hit` (a `CacheHit` carrying `origin_attempt_id`), `result_sha256` and `result_size`.
 
-`record(store, request, result: CacheResult, *, expected_key_sha256=None) -> RecordOutcome`
+`record(store, request, result: CacheResult, *, expected_key_sha256) -> RecordOutcome`
 
 1. If the key derivation bypasses, the result is `refused` with the same reason. Nothing is written.
-2. If `expected_key_sha256` is given and differs from the key the request derives now, the result is `refused` / `key_changed`. A malformed value gives `invalid_input:expected_key_sha256`. **The daemon must pass the `key_sha256` from the `lookup` that preceded the attempt.** If anything in the key moved while the attempt ran (head, spec, policy, settings and so on), the result is then refused rather than filed under inputs it was not produced from. The parameter is optional only so that the port can be exercised without a lookup.
+2. `expected_key_sha256` is a required keyword. If it differs from the key the request derives now, the result is `refused` / `key_changed`. A malformed value gives `invalid_input:expected_key_sha256`. **The daemon must pass the `key_sha256` from the `lookup` that preceded the attempt.** If anything in the key moved while the attempt ran (head, spec, policy, settings and so on), the result is then refused rather than filed under inputs it was not produced from. It is required so that a caller cannot forget it.
 3. The result fields are validated. A bad field gives `refused` / `invalid_result:<field>`, and an artifact over the size bound gives `result_too_large`.
 4. `store_decision` runs. Only a `succeeded` attempt that was not budget-blocked is stored. Otherwise the result is `refused` / `budget_blocked` or `outcome_<x>`.
 5. The entry is built with its digest. If the material or `entry_json()` exceeds its bound, the result is `refused` / `entry_too_large`. The `entry_json()` bound is `MAX_ENTRY_BYTES`, 24 KiB, which is also the storage CHECK value. With the field bounds, it can only be reached if the material bound changes. A test checks that the worst case fits.

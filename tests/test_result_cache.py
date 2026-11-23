@@ -46,12 +46,18 @@ def result(**over) -> CacheResult:
 
 def seeded(**over) -> InMemoryCacheStore:
     store = InMemoryCacheStore()
-    assert record(store, request(**over), result()).status is RecordStatus.STORED
+    assert rec(store, request(**over), result()).status is RecordStatus.STORED
     return store
 
 
 def key_of(**over) -> str:
     return derive_cache_key(request(**over)).sha256
+
+
+def rec(store, req, res):
+    """record() with the key the request derives now, as a lookup before the attempt would give."""
+    key = derive_cache_key(req)
+    return record(store, req, res, expected_key_sha256=getattr(key, "sha256", "0" * 64))
 
 
 def assert_never_authority(decision: CacheDecision) -> None:
@@ -74,7 +80,7 @@ def test_empty_store_misses_then_record_then_hit_returns_reference_only():
     store = InMemoryCacheStore()
     miss = lookup(store, request())
     assert miss.outcome is CacheOutcome.MISS and miss.reason == MissReason.NOT_FOUND and miss.hit is None
-    assert record(store, request(), result()).status is RecordStatus.STORED
+    assert rec(store, request(), result()).status is RecordStatus.STORED
     hit = lookup(store, request())
     assert hit.is_hit and hit.reason is None
     assert hit.key_sha256 == key_of()
@@ -204,7 +210,7 @@ def test_invalidated_entry_misses_and_invalidation_is_one_way():
     assert store.get(key).invalidated_marker == "op:1"
     assert lookup(store, request()).reason == MissReason.INVALIDATED
     # re-recording does not resurrect it: first writer wins
-    assert record(store, request(), result(origin_attempt_id="att-2")).status is RecordStatus.ALREADY_PRESENT
+    assert rec(store, request(), result(origin_attempt_id="att-2")).status is RecordStatus.ALREADY_PRESENT
     assert lookup(store, request()).reason == MissReason.INVALIDATED
 
 
@@ -234,7 +240,7 @@ def test_invalidated_entry_misses_and_invalidation_is_one_way():
 ])
 def test_not_cacheable_requests_bypass_on_lookup_and_are_refused_on_record(change, reason):
     store = InMemoryCacheStore()
-    out = record(store, request(**change), result())
+    out = rec(store, request(**change), result())
     assert out.status is RecordStatus.REFUSED and out.reason == reason
     assert len(store) == 0
     decision = lookup(store, request(**change))
@@ -260,7 +266,7 @@ def test_write_capable_task_never_hits_even_if_an_entry_exists_under_its_would_b
 ])
 def test_only_succeeded_unblocked_results_are_recorded(outcome, blocked, reason):
     store = InMemoryCacheStore()
-    out = record(store, request(), result(outcome=outcome, budget_blocked=blocked))
+    out = rec(store, request(), result(outcome=outcome, budget_blocked=blocked))
     assert out.status is RecordStatus.REFUSED and out.reason == reason and len(store) == 0
 
 
@@ -281,26 +287,26 @@ def test_only_succeeded_unblocked_results_are_recorded(outcome, blocked, reason)
 ])
 def test_invalid_results_are_refused_with_typed_reasons(change, reason):
     store = InMemoryCacheStore()
-    out = record(store, request(), result(**change))
+    out = rec(store, request(), result(**change))
     assert out.status is RecordStatus.REFUSED and out.reason == reason and len(store) == 0
 
 
 def test_result_at_size_bound_is_recorded():
     store = InMemoryCacheStore()
-    assert record(store, request(), result(result_size=rc.MAX_RESULT_BYTES)).status is RecordStatus.STORED
+    assert rec(store, request(), result(result_size=rc.MAX_RESULT_BYTES)).status is RecordStatus.STORED
 
 
 def test_non_result_object_refused():
-    assert record(InMemoryCacheStore(), request(), object()).reason == "invalid_result"
-    assert record(InMemoryCacheStore(), request(), None).reason == "invalid_result"
+    assert rec(InMemoryCacheStore(), request(), object()).reason == "invalid_result"
+    assert rec(InMemoryCacheStore(), request(), None).reason == "invalid_result"
 
 
 # --- first writer wins --------------------------------------------------------------------------
 
 def test_first_writer_wins_and_never_overwrites():
     store = InMemoryCacheStore()
-    assert record(store, request(), result()).status is RecordStatus.STORED
-    second = record(store, request(), result(origin_attempt_id="att-2", result_sha256=H("other")))
+    assert rec(store, request(), result()).status is RecordStatus.STORED
+    second = rec(store, request(), result(origin_attempt_id="att-2", result_sha256=H("other")))
     assert second.status is RecordStatus.ALREADY_PRESENT and second.reason == "first_writer_wins"
     hit = lookup(store, request())
     assert hit.hit.origin_attempt_id == "att-1" and hit.result_sha256 == ARTIFACT
@@ -324,7 +330,7 @@ def test_concurrent_puts_have_exactly_one_winner_and_a_stable_result():
 
         def worker(i: int) -> None:
             barrier.wait()
-            outcomes[i] = record(store, request(), result(origin_attempt_id=f"att-{i}",
+            outcomes[i] = rec(store, request(), result(origin_attempt_id=f"att-{i}",
                                                           result_sha256=H(f"r{i}"))).status
 
         threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
@@ -369,7 +375,7 @@ def test_sequential_order_decides_the_winner_deterministically():
     for order in ([0, 1, 2], [2, 0, 1], [1, 2, 0]):
         store = InMemoryCacheStore()
         for i in order:
-            record(store, request(), result(origin_attempt_id=f"att-{i}"))
+            rec(store, request(), result(origin_attempt_id=f"att-{i}"))
         assert lookup(store, request()).hit.origin_attempt_id == f"att-{order[0]}"
 
 
@@ -405,18 +411,18 @@ def test_store_raising_is_a_miss_or_store_error_never_raised(exc):
     store = RaisingStore(exc)
     decision = lookup(store, request())
     assert decision.outcome is CacheOutcome.MISS and decision.reason == MissReason.STORE_ERROR
-    out = record(store, request(), result())
+    out = rec(store, request(), result())
     assert out.status is RecordStatus.STORE_ERROR and out.reason == MissReason.STORE_ERROR
 
 
 def test_non_store_object_is_a_miss():
     assert lookup(object(), request()).reason == MissReason.STORE_ERROR
-    assert record(object(), request(), result()).status is RecordStatus.STORE_ERROR
+    assert rec(object(), request(), result()).status is RecordStatus.STORE_ERROR
 
 
 @pytest.mark.parametrize("put_result", [None, 1, "yes", 0])
 def test_put_returning_non_bool_is_a_store_error(put_result):
-    out = record(FixedStore(put_result=put_result), request(), result())
+    out = rec(FixedStore(put_result=put_result), request(), result())
     assert out.status is RecordStatus.STORE_ERROR
 
 
@@ -675,14 +681,14 @@ def test_hostile_requests_return_typed_refusals_and_never_raise(req, reason):
     store = seeded()
     decision = lookup(store, req)
     assert decision.outcome is CacheOutcome.BYPASS and decision.reason == reason
-    out = record(store, req, result())
+    out = rec(store, req, result())
     assert out.status is RecordStatus.REFUSED and out.reason == reason
     assert len(store) == 1
 
 
 def test_material_never_contains_settings_values():
     store = InMemoryCacheStore()
-    record(store, request(settings={"note": "SECRET-VALUE-123"}), result())
+    rec(store, request(settings={"note": "SECRET-VALUE-123"}), result())
     (entry,) = store._entries.values()
     assert "SECRET-VALUE-123" not in entry.entry_json()
 
@@ -717,14 +723,14 @@ def test_material_over_its_cap_is_refused_and_never_stored():
     req = request(policy_version=wide, provider=wide, profile_id=wide, cli_version=wide, model=wide,
                   validator_sha256s=[H(str(i)) for i in range(ck.MAX_VALIDATORS)])
     store = InMemoryCacheStore()
-    out = record(store, req, result())
+    out = rec(store, req, result())
     assert out.status is RecordStatus.REFUSED and out.reason == "entry_too_large" and len(store) == 0
 
 
 def test_long_but_bounded_entry_is_stored_and_hits():
     wide = "\U0001F600" * rc.MAX_TEXT
     store = InMemoryCacheStore()
-    out = record(store, request(), result(origin_attempt_id=wide, created_marker=wide, result_size=rc.MAX_RESULT_BYTES))
+    out = rec(store, request(), result(origin_attempt_id=wide, created_marker=wide, result_size=rc.MAX_RESULT_BYTES))
     assert out.status is RecordStatus.STORED
     assert len(store.get(key_of()).entry_json().encode()) <= rc.MAX_ENTRY_BYTES
     assert lookup(store, request()).hit.origin_attempt_id == wide
@@ -768,3 +774,8 @@ def test_module_is_pure_no_storage_or_io():
     assert not any(m.startswith(("synapse.daemon", "synapse.api", "synapse.providers", "synapse.desktop",
                                  "synapse.infrastructure", "synapse.orchestration")) for m in imported)
     assert "open(" not in source
+
+
+def test_record_requires_the_expected_key():
+    with pytest.raises(TypeError):
+        record(InMemoryCacheStore(), request(), result())
