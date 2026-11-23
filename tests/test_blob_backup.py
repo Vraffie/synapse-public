@@ -162,3 +162,50 @@ def test_cli_round_trip_and_errors(env, capsys, tmp_path):
     assert main(["--state-dir", str(state), "blobs-restore", str(out / "b"), "--db-backup", str(db_backup)]) == 0
     assert main(["--state-dir", str(state), "blobs-backup", str(out / "b"), "--db-backup", str(db_backup)]) == 1
     assert "already exists" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("name", ["db?x=1", "db%41", "a b#c", "with%3Fq"])
+def test_odd_backup_file_names_read_the_right_file(env, name):
+    import shutil
+    state, out, db_backup, _ = env
+    # Decoys that the old unescaped URI would have opened instead of the named file.
+    decoy_db = out / "dbA"
+    shutil.copy(db_backup, decoy_db)
+    with closing(open_database(state / "synapse.sqlite")) as db:
+        publish(db, ArtifactBlobStore(state / "artifacts", max_bytes=1 << 20), b"extra", "a-extra")
+    other = out / "other.sqlite"
+    create_backup(state, other, MIGRATIONS)  # one more artifact than db_backup
+    odd = out / name
+    shutil.copy(other, odd)
+    odd.chmod(0o600)
+    for decoy in (out / "db", decoy_db):
+        shutil.copy(db_backup, decoy)
+    info = backup_blobs(state, odd, out / "blobs")
+    assert info.blob_count == 4  # read the odd file (with the extra blob), not the decoy
+    assert verify_blob_backup(out / "blobs", odd) == info
+    # The manifest belongs to `odd`; the decoys hold a different blob set and must be refused.
+    with pytest.raises(BlobBackupError, match="different database backup"):
+        verify_blob_backup(out / "blobs", db_backup)
+    with pytest.raises(BlobBackupError, match="different database backup"):
+        verify_blob_backup(out / "blobs", out / "db")
+
+
+def test_group_or_other_accessible_database_backup_is_refused(env):
+    state, out, db_backup, _ = env
+    assert db_backup.stat().st_mode & 0o077 == 0  # agentctl backup creates 0600 files
+    db_backup.chmod(0o644)
+    with pytest.raises(BlobBackupError, match="no group/other access"):
+        backup_blobs(state, db_backup, out / "blobs")
+
+
+def test_cli_reports_blob_integrity_errors_cleanly(env, monkeypatch, capsys):
+    from synapse.infrastructure.artifact_blobs import ArtifactIntegrityError
+    import synapse.application.blob_backup as bb
+    state, out, db_backup, _ = env
+
+    def boom(*args, **kwargs):
+        raise ArtifactIntegrityError("blob content does not match its address")
+
+    monkeypatch.setattr(bb, "verify_blob_backup", boom)
+    assert main(["--state-dir", str(state), "blobs-verify", str(out / "blobs"), "--db-backup", str(db_backup)]) == 1
+    assert "ArtifactIntegrityError" in capsys.readouterr().err

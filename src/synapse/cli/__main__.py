@@ -246,6 +246,7 @@ def _approver_init(state_dir: Path, *, rotate: bool) -> int:
 
 def _blob_backup_command(args) -> int:
     from synapse.application import blob_backup as bb
+    from synapse.infrastructure.artifact_blobs import ArtifactIntegrityError
     try:
         if args.command == "blobs-backup":
             info = bb.backup_blobs(args.state_dir, args.db_backup, args.dest)
@@ -256,7 +257,7 @@ def _blob_backup_command(args) -> int:
         else:
             info = bb.restore_blobs(args.state_dir, args.dir, args.db_backup)
             print(f"blobs restored: {info.blob_count} blobs, {info.total_bytes} bytes")
-    except (bb.BlobBackupError, OSError, ValueError) as exc:
+    except (bb.BlobBackupError, ArtifactIntegrityError, OSError, ValueError) as exc:
         print(f"agentctl: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     return 0

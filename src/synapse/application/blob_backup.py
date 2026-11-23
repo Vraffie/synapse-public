@@ -26,6 +26,7 @@ import re
 import shutil
 import sqlite3
 import stat
+from urllib.parse import quote
 
 from synapse.infrastructure.artifact_blobs import ArtifactBlobStore
 
@@ -47,9 +48,9 @@ class BlobBackupInfo:
 def _regular_private_file(path: Path, what: str) -> int:
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     info = os.fstat(fd)
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
         os.close(fd)
-        raise BlobBackupError(f"{what} must be a regular, user-owned file")
+        raise BlobBackupError(f"{what} must be a regular, user-owned file with no group/other access (mode 0600)")
     return fd
 
 
@@ -66,14 +67,17 @@ def _references(db_backup: Path) -> dict[str, int]:
     """Return ``{sha256: byte_size}`` for every artifact the database backup references."""
     fd = _regular_private_file(db_backup, "database backup")
     os.close(fd)
-    uri = f"file:{db_backup.resolve()}?mode=ro&immutable=1"
-    connection = sqlite3.connect(uri, uri=True)
+    # Percent-encode the path: a raw '?' or '%' in a file name would otherwise be parsed as URI syntax.
+    uri = f"file:{quote(str(db_backup.resolve()), safe='/')}?mode=ro&immutable=1"
+    connection = None
     try:
+        connection = sqlite3.connect(uri, uri=True)
         rows = connection.execute("SELECT sha256, byte_size FROM artifacts").fetchall()
     except sqlite3.Error as exc:
         raise BlobBackupError(f"cannot read artifacts from the database backup: {exc}") from exc
     finally:
-        connection.close()
+        if connection is not None:
+            connection.close()
     refs: dict[str, int] = {}
     for sha, size in rows:
         if not isinstance(sha, str) or not _SHA256.fullmatch(sha) or type(size) is not int or size < 0:

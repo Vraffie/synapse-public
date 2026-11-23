@@ -5,8 +5,10 @@
 #
 #   scripts/upgrade-rehearsal.sh STATE_DIR [WORK_DIR]
 #
-# WORK_DIR must not exist (default: a new mktemp -d). It keeps the verified backup,
-# which is also your rollback point; the scratch copy is removed on success.
+# WORK_DIR must not exist; default: a new directory under
+# ${XDG_STATE_HOME:-$HOME/.local/state}/synapse/ (never /tmp, which is a tmpfs on Arch and
+# would lose the rollback point at reboot). It keeps the verified backup, which is also your
+# rollback point; the scratch copy is removed on success.
 # Run it with the NEW code installed (the code whose migrations you want to rehearse).
 set -euo pipefail
 
@@ -18,9 +20,11 @@ umask 077
 if [ $# -ge 2 ]; then
   work=$2
   [ ! -e "$work" ] || { echo "work directory already exists: $work" >&2; exit 2; }
-  mkdir -m 0700 "$work"
+  mkdir -m 0700 -- "$work"
 else
-  work=$(mktemp -d)
+  base=${XDG_STATE_HOME:-${HOME:?set HOME, XDG_STATE_HOME or pass WORK_DIR}/.local/state}/synapse
+  mkdir -p -m 0700 -- "$base"
+  work=$(mktemp -d -- "$base/upgrade-rehearsal.XXXXXX")
 fi
 
 ctl() { "$AGENTCTL" "$@"; }
@@ -33,7 +37,7 @@ ctl --state-dir "$state" blobs-verify "$work/blobs" --db-backup "$work/db.sqlite
 
 echo "== 2/4 restore into a scratch state directory"
 scratch="$work/scratch"
-mkdir -m 0700 "$scratch" "$scratch/artifacts"
+mkdir -m 0700 -- "$scratch" "$scratch/artifacts"
 ctl --state-dir "$scratch" restore "$work/db.sqlite"
 ctl --state-dir "$scratch" blobs-restore "$work/blobs" --db-backup "$work/db.sqlite"
 
