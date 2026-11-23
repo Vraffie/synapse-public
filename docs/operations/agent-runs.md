@@ -93,6 +93,27 @@ branch are force-removed (idempotent; skipped if the run already started) and th
 cancelled with its task, so no queued or running run remains. The cancelled run is a visible audit
 trace (runs cannot be deleted); a retry with the same key creates a fresh run.
 
+### Running a task on Codex
+
+Codex runs only for a task (or a request) that **names** an enabled `codex` profile declared in `--agent-config`
+([agent profiles](agent-profiles.md#codex-profiles)); it is never the default and never a fallback. Name it with
+`"profile"` on the task (or on the request, for every task):
+
+```json
+{"repo": "/srv/repo", "base_ref": "main", "timeout_seconds": 600, "tasks": [
+  {"id": "review", "prompt": "...", "allowed_tools": ["Read", "Grep"], "permission_mode": "plan", "profile": "codex-edit"},
+  {"id": "fix", "prompt": "...", "allowed_tools": ["Read", "Edit"], "permission_mode": "acceptEdits",
+   "profile": "codex-edit", "depends_on": ["review"]}
+]}
+```
+
+`plan` runs Codex with `-s read-only`; `acceptEdits` with `Edit`/`Write` runs it with `-s workspace-write` (no
+`/tmp`/`$TMPDIR` writes, `network_access=false` requested). The request is refused with 422 when a Codex task lists any
+tool outside `Read`, `Glob`, `Grep`, `Edit`, `Write` (for example any `Bash(...)`), uses `dontAsk` or `manual`, asks for
+`Edit`/`Write` with `plan`, or names a disabled or unknown profile. The tool list does **not** restrict what Codex does
+inside its sandbox (it can run shell commands there); it only selects the sandbox. Same-user trust applies as for
+Claude: the agent runs as the daemon's user and can read that user's files.
+
 ## `GET /api/v1/runs/{run_id}/agent`
 
 Read-only; 404 for an unknown or non-agent run. Top level: `run_id`, `run_state`,

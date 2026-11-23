@@ -1,7 +1,8 @@
 """Validated multi-profile registry, pure profile selection and rate-limit cooldowns (ADR 015, B3).
 
-This module is data and decisions only. Nothing here starts a process, opens a database or is wired
-into the runtime yet: the engine still runs the single operator profile from ``agent_config``.
+This module is data and decisions only. Nothing here starts a process or opens a database. The daemon
+builds its registry with ``agent_profiles`` (``--agent-config``); a ``codex`` profile is never the primary
+or a fallback (validated here), so it runs only for a task that names it (ADR 016).
 
 A registry holds up to :data:`MAX_PROFILES` profiles (``claude`` or ``codex``), a ``primary`` and an
 ordered ``fallback`` list. Credentials are never part of the registry. The legacy single-profile file
@@ -142,10 +143,16 @@ def validate_registry(registry: ProfileRegistry) -> ProfileRegistry:
     fallback = registry.fallback
     if len(set(fallback)) != len(fallback) or registry.primary in fallback:
         raise RegistryError("fallback must not repeat a profile or contain the primary")
+    # No cross-provider fallback until the Codex gates pass (ADR 016 decisions 5 and 9): a codex profile runs
+    # only when a task names it, never as the default or as a fallback. One rule to lift later.
+    if registry.get(registry.primary).provider == "codex":
+        raise RegistryError("a codex profile cannot be the primary (it runs only when a task names it)")
     for pid in fallback:
         spec = registry.get(pid)
         if spec is None:
             raise RegistryError("fallback names an unknown profile")
+        if spec.provider == "codex":
+            raise RegistryError("a codex profile cannot be a fallback (no cross-provider fallback)")
         if not spec.enabled:
             raise RegistryError("fallback profiles must be enabled")
     for spec in registry.profiles:

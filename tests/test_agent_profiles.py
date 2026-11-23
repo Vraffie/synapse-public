@@ -56,9 +56,9 @@ def test_loads_default_plus_declared(env):
 
 
 @pytest.mark.parametrize("bad,text", [
-    (entry(provider="codex"), "disabled until W3"),
-    (entry(provider="gemini"), "provider must be 'claude'"),
-    (entry(executable="/bin/sh"), "unknown key"),
+    (entry(provider="codex"), "codex profile is missing executable"),
+    (entry(provider="gemini"), "provider must be 'claude' or 'codex'"),
+    (entry(executable="/bin/sh"), "'executable' is refused"),
     (entry(api_key="sk-x"), "credentials do not belong"),
     (entry(id="default"), "reserved"),
     (entry(id="synapse.builtin.x"), "reserved"),
@@ -209,14 +209,15 @@ def run_daemon(state, *args):
                           capture_output=True, text=True, timeout=60, env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
 
 
-def test_daemon_requires_base_config_and_rejects_codex(env):
+def test_daemon_requires_base_config_and_rejects_an_invalid_codex_entry(env):
     tmp, state, _ = env
     r = run_daemon(state, "--agent-config", str(write(tmp, [entry()])))
     assert r.returncode != 0 and "--claude-cli-config" in r.stderr
-    codex = write(tmp, [entry(provider="codex")])
+    # A codex entry that cannot be mapped onto a codex sandbox (Bash pattern) stops the daemon before any state.
+    codex = write(tmp, [entry(provider="codex", executable="/bin/sh", allowed_tools=["Bash(git status)"])])
     r = run_daemon(state, "--claude-cli-config", str(tmp / "base.json"), "--agent-config", str(codex),
                    "--allow-same-user-agents")
-    assert r.returncode != 0 and "disabled until W3" in r.stderr
+    assert r.returncode != 0 and "subset of Edit, Glob, Grep, Read, Write" in r.stderr
 
 
 def _tasks(*tasks, **over):

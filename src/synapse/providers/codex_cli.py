@@ -1,4 +1,4 @@
-"""Codex CLI provider adapter (disabled by default, not wired into the daemon).
+"""Codex CLI provider adapter (disabled by default; runs only for a task that names a Codex profile).
 
 Runs `codex exec --json` as a supervised subprocess in a caller-supplied git worktree.
 Same-user, single trust domain, like the Claude adapter: the child runs as the daemon's OS
@@ -107,6 +107,40 @@ class CodexOutcome(StrEnum):
     TIMED_OUT = "timed_out"
     CANCELLED = "cancelled"
     UNKNOWN = "unknown"  # process outcome not established: never retry blindly
+
+
+# Task eligibility for a Codex profile (ADR 016 decision 4). A Synapse task carries Claude-shaped
+# `allowed_tools` and `permission_mode`; Codex has no tool allowlist, so they only select a sandbox
+# class. Tools the sandbox cannot express (any `Bash(...)` pattern, WebFetch, ...) make the task
+# ineligible rather than being silently widened, and the Claude-only modes `dontAsk` and `manual`
+# have no Codex equivalent.
+CODEX_TASK_TOOLS = frozenset({"Read", "Glob", "Grep", "Edit", "Write"})
+_WRITE_TOOLS = frozenset({"Edit", "Write"})
+_MODE_SANDBOX = {"plan": "read-only", "acceptEdits": "workspace-write"}
+
+
+class CodexIneligible(ValueError):
+    """The task's tools or permission mode cannot be mapped onto a Codex sandbox."""
+
+
+def sandbox_for_task(allowed_tools, permission_mode) -> str:
+    """The Codex sandbox for a task, or CodexIneligible. Fixed table, nothing configurable.
+
+    ``plan`` -> ``read-only``; ``acceptEdits`` -> ``workspace-write`` when Edit or Write is
+    requested, else ``read-only``. ``Edit``/``Write`` with ``plan`` is refused (it would either
+    silently drop the write or widen ``plan``).
+    """
+    if permission_mode not in _MODE_SANDBOX:
+        # Fixed text (it reaches API errors, which never echo input).
+        raise CodexIneligible("permission_mode is not supported on a codex profile (only plan and acceptEdits)")
+    if (isinstance(allowed_tools, (str, bytes)) or not all(isinstance(t, str) for t in allowed_tools)
+            or not set(allowed_tools) <= CODEX_TASK_TOOLS):
+        raise CodexIneligible("allowed_tools on a codex profile must be a subset of %s"
+                              % ", ".join(sorted(CODEX_TASK_TOOLS)))
+    writes = bool(set(allowed_tools) & _WRITE_TOOLS)
+    if writes and permission_mode == "plan":
+        raise CodexIneligible("Edit/Write need permission_mode acceptEdits on a codex profile")
+    return "workspace-write" if writes else "read-only"
 
 
 def parse_cli_version(output: str) -> str | None:

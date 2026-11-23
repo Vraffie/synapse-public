@@ -1,6 +1,10 @@
 # ADR 016: Wiring the profile registry, usage ledger and Codex adapter into agent runs
 
-Status: proposed (design only; no source changes). Date: 2026-11-20. Follows ADR 015 (`docs/adr/015-m4b-parallel-agents-and-profiles.md`, PR #85).
+Status: accepted in part. W0 (finished runs release capacity) and W1 are implemented; decision 4 (Codex router
+wiring, sandbox mapping, eligibility, recovery set) and the codex part of decision 5 (never primary/fallback, no
+fallback after a spawn refusal or `unknown`) are implemented and tested with fake executables only (2026-11-23). Not
+done: automatic fallback/`allow_fallback`, the decision 9 gates (no independent review of the wiring and no real
+`SYNAPSE_REAL_CODEX=1` run through the daemon yet), a probe API surface. Date: 2026-11-20. Follows ADR 015 (`docs/adr/015-m4b-parallel-agents-and-profiles.md`, PR #85).
 
 This ADR decides how the open M4-B pieces are connected. It was written against `origin/main` plus the **unmerged**
 PRs it names; every statement about those PRs describes their heads at the time of writing and must be re-checked
@@ -297,6 +301,9 @@ Then the wiring, in this order (each is a reviewable PR):
   Exit: fake-executable tests for mapping, eligibility 422s and a mixed Claude+Codex DAG; opt-in real run
   (`SYNAPSE_REAL_CODEX=1`) of a mixed DAG through `scripts/demo_agent.py` with the `/tmp` regression included.
   Do not merge W3 without the independent review in gate 1.
+  *Status 2026-11-23:* code and fake-executable exit tests (mapping, eligibility 422s, mixed Claude+Codex DAG,
+  recovery, journal, probe) are in review (`tests/test_codex_agent_runs.py`); the opt-in real mixed-DAG run and the
+  gate 1 review are **not** done.
 - **W4, surfaces**: desktop profile panel/selector, run-view profile column, docs (`agent-runs.md`,
   `profile-registry.md`, new `agent-profiles.md`).
 - **W5, later**: automatic cooldown detectors from captured fixtures (decision 6), Codex usage fields, lifting the

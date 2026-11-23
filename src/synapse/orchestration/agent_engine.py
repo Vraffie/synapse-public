@@ -40,6 +40,7 @@ from synapse.persistence.artifact_store import publish_artifact
 from synapse.persistence.mock_execution_store import record_verification, set_attempt
 from synapse.persistence.run_store import write_run_transition
 from synapse.providers.claude_cli import ClaudeCliProfile, ClaudeCliProvider
+from synapse.providers.codex_cli import CodexCliProfile, sandbox_for_task
 from synapse.providers.contracts import ExecutionRequest, ProviderAdapter, ProviderEvent, UsageObservation
 
 _LOG = logging.getLogger(__name__)
@@ -73,19 +74,23 @@ async def process_outcome_verifier(task_id: str, candidate: bytes) -> bool:
 
 
 class AgentProviderRouter:
-    """ProviderAdapter that picks a ``ClaudeCliProvider`` per task spec.
+    """ProviderAdapter that picks a ``ClaudeCliProvider`` or ``CodexCliProvider`` per task spec (ADR 016 decision 4).
 
-    Tool allowlist and permission mode are profile-level in the adapter, so one
-    provider is built (and cached) for each distinct narrowed combination via
-    ``dataclasses.replace`` on the operator profile, which re-runs its validation.
+    Providers are cached by ``(profile_id, narrowed key)``. For Claude, tool allowlist and permission mode are
+    profile-level in the adapter, so the operator profile is narrowed with ``dataclasses.replace`` (which re-runs
+    its validation). For Codex there is no tool allowlist: the task's tools and mode select the sandbox through the
+    fixed table in ``codex_cli.sandbox_for_task``; anything it cannot map refuses the start (no process).
     """
 
     def __init__(self, profile: ClaudeCliProfile, specs: Mapping[str, Mapping[str, Any]],
                  factory: Callable[[ClaudeCliProfile], ProviderAdapter] = ClaudeCliProvider,
-                 profile_resolver: Callable[[str], ClaudeCliProfile] | None = None):
-        # profile_resolver: registry profile id -> the ClaudeCliProfile to spawn with (never invents one).
+                 profile_resolver: Callable[[str], ClaudeCliProfile | CodexCliProfile] | None = None,
+                 codex_factory: Callable[[CodexCliProfile], ProviderAdapter] | None = None):
+        # profile_resolver: registry profile id -> the Claude or Codex profile to spawn with (never invents one).
+        # codex_factory: None means a Codex profile is refused at start (fail closed, never a Claude fallback).
         self._profile, self._specs, self._factory = profile, specs, factory
         self._resolver = profile_resolver
+        self._codex_factory = codex_factory
         self._providers: dict[tuple, ProviderAdapter] = {}
         self._owner: dict[str, ProviderAdapter] = {}
         self.handles: dict[str, str] = {}
@@ -97,6 +102,20 @@ class AgentProviderRouter:
     async def capabilities(self, profile_id):
         return await next(iter(self._providers.values())).capabilities(profile_id)
 
+    def _build(self, named: str | None, tools: tuple[str, ...], mode: str) -> ProviderAdapter:
+        if named is None:
+            return self._factory(replace(self._profile, allowed_tools=tools, permission_mode=mode))
+        if self._resolver is None:
+            raise ValueError("no resolver for a named profile")  # fail closed: never the default
+        base = self._resolver(named)
+        if isinstance(base, CodexCliProfile):
+            if self._codex_factory is None:
+                raise ValueError("codex provider is not available")
+            return self._codex_factory(replace(base, sandbox=sandbox_for_task(tools, mode), extra_args=()))
+        if not isinstance(base, ClaudeCliProfile):
+            raise TypeError("profile resolver returned an unsupported profile")
+        return self._factory(replace(base, allowed_tools=tools, permission_mode=mode))
+
     async def start(self, request: ExecutionRequest) -> str:
         spec = self._specs[request.task_id]
         named = spec.get("profile_id")
@@ -104,13 +123,7 @@ class AgentProviderRouter:
         try:
             provider = self._providers.get(key)
             if provider is None:
-                base = self._profile
-                if named is not None:
-                    if self._resolver is None:
-                        raise ValueError("no resolver for a named profile")  # fail closed: never the default
-                    base = self._resolver(named)
-                provider = self._providers[key] = self._factory(
-                    replace(base, allowed_tools=key[1], permission_mode=key[2]))
+                provider = self._providers[key] = self._build(*key)
             handle = await provider.start(request)
         except BaseException:
             self.start_failed.add(request.task_id)  # provider.start never spawns: known no process

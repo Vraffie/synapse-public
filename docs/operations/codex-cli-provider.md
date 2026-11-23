@@ -1,9 +1,32 @@
-# Codex CLI provider adapter (disabled by default, not wired)
+# Codex CLI provider adapter (disabled by default; runs only for tasks that name a Codex profile)
 
 `synapse.providers.codex_cli.CodexCliProvider` runs `codex exec --json` as a supervised subprocess in a
 caller-supplied git worktree. It implements the `ProviderAdapter` protocol and mirrors the hardening of the
-[Claude adapter](claude-cli-provider.md). It is **not** wired into the engine, the API, `agent_config` or
-`AgentRuntime`; wiring (profile registry, routing) is separate work (ADR 015, B3).
+[Claude adapter](claude-cli-provider.md). Since ADR 016 decision 4 it is wired into agent runs through a `codex`
+entry in `--agent-config` ([agent profiles](agent-profiles.md#codex-profiles)): `AgentProviderRouter` builds a
+`CodexCliProvider` for a task that **names** an enabled Codex profile, and nothing else. Codex is never the default
+profile or a fallback (registry validation refuses both), there is no Claude<->Codex fallback, and a spawn refusal or
+an `unknown` outcome is never retried on another profile. No real Codex run has been made through the daemon path
+(see Still unverified).
+
+## How agent runs use it
+
+| task field | Codex |
+| --- | --- |
+| `permission_mode` `plan` | `-s read-only` |
+| `permission_mode` `acceptEdits` | `-s workspace-write` (plus the fixed tightening below) when `Edit` or `Write` is requested, else `read-only` |
+| `permission_mode` `dontAsk`, `manual` | refused: 422 at validation, `codex_ineligible` at spawn |
+| `allowed_tools` | must be a subset of `Read`, `Glob`, `Grep`, `Edit`, `Write`; anything else (any `Bash(...)`) is refused. It selects the sandbox only and is **not a tool restriction**: inside the sandbox the agent can run any shell command |
+| `Edit`/`Write` with `plan` | refused |
+
+The router builds `CodexCliProfile(executable=<registry entry>, state_dir=<daemon state dir>, enabled=True,
+sandbox=<derived>, extra_args=(), max_timeout_seconds=<entry>)`: no `credentials_file` (the default lookup below
+applies), no model (`agent.profile_selected` records `model: null`; the `--model=` allowlist entry is not used by the
+daemon), and the daemon's spawn journal, exactly like Claude spawns. Providers are cached per
+`(profile_id, allowed_tools, permission_mode)`. Recovery reconciles Codex attempts like Claude ones
+(`recover_mock_run(provider_kind={"claude","codex"})`). `AgentRuntime.probe_profile(id)` runs only `codex --version`
+(no agent, no worktree, no credential copy) and returns `healthy`, `unverified_version` or `unavailable`; it is advisory
+and has no API surface yet.
 
 ## Profile
 
@@ -30,9 +53,9 @@ cap; cancel and timeout send TERM to the group, then KILL after the grace period
 
 Given a `spawn_journal` (ADR 023), the adapter journals each spawn exactly like the Claude adapter: intent before
 `Popen` (if it cannot be written, nothing is spawned), pid, start ticks and boot id right after, removed once reaped
-unless the stop status was `unknown`. Entries carry no prompt, argv, path or credential. Because the adapter is not
-wired into the daemon, no daemon run passes a journal to it today; the behaviour is covered by
-`tests/test_codex_spawn_journal.py`.
+unless the stop status was `unknown`. Entries carry no prompt, argv, path or credential. The daemon passes its journal to
+every Codex provider it builds; covered by `tests/test_codex_spawn_journal.py` and, through the engine,
+`tests/test_codex_agent_runs.py`.
 
 Event mapping (schema observed on 0.170.0, see Verified): `item.completed` of an `agent_message` -> `output`;
 `item.started` of any non-message item -> `tool_use` with **the item type only** (for example
@@ -118,7 +141,10 @@ no events; stderr is separate from the JSONL on stdout (the adapter discards std
   signals (none were observed), and cost.
 - Behaviour with a trusted project (the repo-config observation above is for an untrusted/fresh scratch setup),
   and resource-limit behaviour under `memory_limit_bytes`.
-- Engine integration: not wired, so no approval-gate, worktree, scheduling or desktop behaviour is claimed.
+- Engine integration is covered **only with the fake executable** (`tests/test_codex_agent_runs.py`: lifecycle, sandbox
+  derivation, ineligible tools/modes, disabled profile, spawn refusal without fallback, unknown outcome, recovery,
+  journal, probe). No real `codex` was run through the daemon, so a real daemon run (and ADR 016 gate 1, the
+  independent review, and the opt-in `SYNAPSE_REAL_CODEX=1` run through the engine) is still outstanding.
 
 ## Repo-config refusal list (security review F3)
 

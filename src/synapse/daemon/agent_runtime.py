@@ -1,4 +1,4 @@
-"""Daemon-owned execution of tasks with a REAL provider (Claude Code CLI).
+"""Daemon-owned execution of tasks with a REAL provider (Claude Code CLI; Codex CLI only for tasks naming a codex profile).
 
 Runtime-level only: no HTTP or CLI surface calls this yet. It is a sibling of
 ``MockRuntime`` and shares its machinery (claim, attempts, approval gates,
@@ -46,6 +46,8 @@ from synapse.persistence.mock_recovery import recover_mock_run
 from synapse.persistence.run_store import write_run_transition
 from synapse.persistence.state_store import StateConflict
 from synapse.providers.claude_cli import ClaudeCliProfile, ClaudeCliProvider
+from synapse.providers.codex_cli import CodexCliProfile, CodexCliProvider, CodexIneligible, sandbox_for_task
+from synapse.providers.contracts import ProviderHealth
 
 _LOG = logging.getLogger(__name__)
 
@@ -61,7 +63,7 @@ class AgentRuntime:
                  approval_policy: ApprovalPolicy | None = None,
                  worktree_check: Callable[[str, str, str], tuple[str, bool]] | None = None,
                  budget_policy: BudgetPolicy | None = None, registry=None,
-                 spawn_journal: SpawnJournal | None = None):
+                 spawn_journal: SpawnJournal | None = None, codex_provider_factory=CodexCliProvider):
         if profile is not None and not isinstance(profile, ClaudeCliProfile):
             raise TypeError("profile must be a ClaudeCliProfile")
         if type(max_concurrency) is not int or not 1 <= max_concurrency <= 6:
@@ -72,6 +74,9 @@ class AgentRuntime:
         self.fence_report: FenceReport | None = None  # result of the startup fence, None until it ran
         # With a journal every real spawn is recorded durably so a restart can prove or enforce that none survives.
         self._factory = provider_factory if spawn_journal is None else functools.partial(provider_factory, spawn_journal=spawn_journal)
+        # Same journal for Codex spawns (ADR 023): a restart fences a surviving codex process group like a claude one.
+        self._codex_factory = (codex_provider_factory if spawn_journal is None
+                               else functools.partial(codex_provider_factory, spawn_journal=spawn_journal))
         self.registry = registry  # ProfileRegistry or None: named profiles resolve here and nowhere else
         self.cooldowns = Cooldowns()  # operator-set, in memory: a restart forgets them (ADR 016 decision 6)
         self.approval_policy = approval_policy or ApprovalPolicy()
@@ -219,15 +224,39 @@ class AgentRuntime:
                  for t, s in task_specs.items() if s["approval_step"] is not None}
         return task_specs, gates
 
-    def _resolve_profile(self, profile_id: str) -> ClaudeCliProfile:
-        """The operator profile with the registry profile's executable; raises for anything not registered.
+    def _resolve_profile(self, profile_id: str) -> ClaudeCliProfile | CodexCliProfile:
+        """The profile to spawn a named registry profile with; raises for anything not registered or disabled.
 
-        Credentials, state dir and sandbox settings stay the operator's (the registry does not model them).
+        Claude: the operator profile with the registry profile's executable (credentials, state dir and sandbox
+        settings stay the operator's). Codex: a ``CodexCliProfile`` with the registry executable and the daemon's
+        state dir (so the startup credential sweep covers its scratch dirs), no credentials_file (the adapter copies
+        ``$CODEX_HOME/auth.json`` or ``~/.codex/auth.json`` per run), no extra_args/model, and the read-only sandbox
+        until the router derives the task's sandbox.
         """
         spec = None if self.registry is None else self.registry.get(profile_id)
-        if spec is None or not spec.enabled or spec.provider != "claude" or self.profile is None:
+        if spec is None or not spec.enabled or self.profile is None:
+            raise ValueError("profile is not available")
+        if spec.provider == "codex":
+            return CodexCliProfile(executable=spec.executable, state_dir=self.profile.state_dir, enabled=True,
+                                   max_timeout_seconds=spec.max_timeout_seconds)
+        if spec.provider != "claude":
             raise ValueError("profile is not available")
         return replace(self.profile, executable=spec.executable)
+
+    async def probe_profile(self, profile_id: str) -> ProviderHealth:
+        """Advisory health of a registry profile; never starts an agent (Codex runs only ``<exe> --version``).
+
+        Codex: ``healthy`` only for a verified CLI version, ``unverified_version`` for any other parseable one,
+        ``unavailable`` when disabled, missing or unparseable. Unknown ids raise ValueError.
+        """
+        spec = None if self.registry is None else self.registry.get(profile_id)
+        if spec is None:
+            raise ValueError("unknown profile")
+        if not spec.enabled or self.profile is None:
+            return ProviderHealth(profile_id, "unavailable")
+        profile = self._resolve_profile(profile_id)
+        factory = self._codex_factory if isinstance(profile, CodexCliProfile) else self._factory
+        return await factory(profile).probe(profile_id)
 
     def _profile_limits_problem(self, spec: dict) -> str | None:
         """Spawn-time recheck that a queued task still fits its named profile as the registry now declares it.
@@ -241,6 +270,11 @@ class AgentRuntime:
         declared = None if self.registry is None else self.registry.get(named)
         if declared is None:
             return "profile_unknown"
+        if declared.provider == "codex":
+            try:
+                sandbox_for_task(spec.get("allowed_tools", ()), spec.get("permission_mode"))
+            except CodexIneligible:
+                return "codex_ineligible"  # a recorded spec the codex sandbox cannot express never spawns
         if not set(spec.get("allowed_tools", ())) <= set(declared.allowed_tools):
             return "profile_narrowed"
         if not mode_within(spec.get("permission_mode"), declared.permission_mode):
@@ -255,8 +289,11 @@ class AgentRuntime:
         row = self.db.execute("SELECT provider,config_ref,enabled FROM profiles WHERE id=?", (profile_id,)).fetchone()
         if row is None:
             return "profile_unknown"
-        if row[0] != "claude" or not str(row[1]).startswith(REGISTRY_REF_PREFIX):
+        if row[0] not in ("claude", "codex") or not str(row[1]).startswith(REGISTRY_REF_PREFIX):
             return "profile_not_registry"  # the built-in agent row or a mock profile never satisfies a named profile
+        declared = None if self.registry is None else self.registry.get(profile_id)
+        if declared is not None and declared.provider != row[0]:
+            return "profile_provider_mismatch"  # never spawn one provider under another provider's row
         if row[2] != 1:
             return "profile_disabled"
         # An operator cooldown only refuses the task; nothing waits or retries (never an evasion of a limit).
@@ -289,7 +326,8 @@ class AgentRuntime:
     async def _run(self, run_id: str):
         try:
             task_specs, gates = self._plan(run_id)
-            router = AgentProviderRouter(self.profile, task_specs, self._factory, self._resolve_profile)
+            router = AgentProviderRouter(self.profile, task_specs, self._factory, self._resolve_profile,
+                                         codex_factory=self._codex_factory)
             engine = AgentWorkflowEngine(
                 self.db, router, self.blobs, task_specs, self._prompt(task_specs), verify=self._verify,
                 max_concurrency=self._max_concurrency,
@@ -330,7 +368,11 @@ class AgentRuntime:
         # become unknown, nothing is resumed, and an operator ends the run. The startup fence (ADR 023) kills
         # surviving process groups and records what it could not prove in the agent.worker_fence event; its
         # result informs the operator, it does not make anything resumable.
-        recover_mock_run(self.db, run_id=run_id, principal="agent-recovery", no_workers_survive=True, provider_kind="claude")
+        # Both real providers: a task of an agent run is claimed under the built-in claude row or a registry claude or
+        # codex row (ADR 016 decision 4). Always both, so a codex attempt is reconciled even after its profile left
+        # the registry; nothing else is relaxed (mock rows and unknown profiles still refuse the whole recovery).
+        recover_mock_run(self.db, run_id=run_id, principal="agent-recovery", no_workers_survive=True,
+                         provider_kind=frozenset({"claude", "codex"}))
 
     def _recover_run(self, run_id: str):
         if not at.is_agent_run(self.db, run_id):
