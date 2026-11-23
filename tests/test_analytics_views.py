@@ -12,7 +12,8 @@ from synapse.persistence.attempt_store import reserve_attempt
 from synapse.persistence.delivery_store import claim_deliveries, finish_delivery
 from synapse.persistence.message_store import send_message
 from synapse.persistence.mock_execution_store import set_attempt
-from synapse.persistence.run_list import InvalidCursor
+from synapse.persistence.paging import InvalidPageCursor, encode_page_cursor, page_scope
+from synapse.persistence.run_list import encode_cursor
 from synapse.persistence.run_snapshot import RunNotFound
 from test_message_store import db  # noqa: F401  (migrated fixture with run 'run', agents, thread)
 
@@ -210,11 +211,22 @@ def test_task_pagination_is_keyset_bounded_and_totals_cover_whole_run(populated,
         with pytest.raises(ValueError):
             path(populated, "run", limit=bad)
     for cursor in ("!!", "e30"):
-        with pytest.raises(InvalidCursor):
+        with pytest.raises(InvalidPageCursor):
             path(populated, "run", cursor=cursor)
-    foreign = av.encode_cursor("run", "t1")  # a run-list cursor is not a task cursor
-    with pytest.raises(InvalidCursor):
-        path(populated, "run", cursor=foreign)
+    for foreign in (encode_cursor("run", "t1"),  # a run-list cursor is not a task cursor
+                    encode_cursor("task", "t1"),  # nor is the old unscoped format
+                    encode_page_cursor(page_scope("usage", "run"), "t1"),  # another route's cursor
+                    encode_page_cursor(page_scope("analytics", "other"), "t1")):  # another run's cursor
+        with pytest.raises(InvalidPageCursor):
+            path(populated, "run", cursor=foreign)
+
+
+@pytest.mark.parametrize("path", [read_run_analytics, replay_run_analytics])
+def test_cursor_is_bound_to_its_run(populated, path):
+    cursor = path(populated, "run", limit=1).next_cursor
+    assert cursor
+    with pytest.raises(InvalidPageCursor):
+        path(populated, "other", cursor=cursor)  # not silently applied to another run's tasks
 
 
 @pytest.mark.parametrize("path,cap", [(read_run_analytics, "MAX_ATTEMPTS"), (replay_run_analytics, "MAX_EVENTS")])

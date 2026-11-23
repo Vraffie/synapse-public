@@ -14,6 +14,8 @@ from jsonschema import Draft202012Validator
 from synapse.api.agent_commands import AgentRunError
 from synapse.api.app import create_app
 from synapse.api.openapi_contracts import RESPONSES
+from synapse.application.analytics_views import (USAGE_FIELDS, Kind, MessageAnalytics, ProfileAnalytics, Quantity,
+                                                 RunAnalytics, TaskAnalytics)
 from synapse.application.approval_service import ApprovalAccessDenied
 from synapse.persistence.idempotency import CommandResult, IdempotencyConflict
 from synapse.persistence.paging import InvalidPageCursor
@@ -113,7 +115,25 @@ def stubs():
                 "totals": {f: None for f in fields},
                 "coverage": {f: {"known": 0, "attempts": 1} for f in fields}, "next_cursor": next_cursor}
 
+    def read_analytics(run_id, limit, cursor):
+        if run_id == "missing":
+            raise RunNotFound()
+        if cursor == "bad":
+            raise InvalidCursor()
+        one = Quantity(Kind.MEASURED, 1, "count", "daemon_record", 1, 1, False)
+        none = Quantity(Kind.UNKNOWN, None, "tokens", "provider_reported", 0, 1, False)
+        usage = dict.fromkeys(USAGE_FIELDS, none)
+        msgs = MessageAnalytics(*(one,) * 6)
+        return RunAnalytics(
+            run_id=run_id, source="tables", attempts=one, retries=Quantity(Kind.MEASURED, 0, "count", "daemon_record", 0, 0, False),
+            outcome_mix={"succeeded": one}, usage=usage, attempts_with_any_usage=0,
+            estimated={"m": {"est_tokens": Quantity(Kind.ESTIMATED, 5, "est_tokens", "m", 1, 1, False)}},
+            messages=msgs, tasks=(TaskAnalytics("t1", one, one, {"succeeded": one}, usage),), next_cursor=None,
+            per_profile={"p": ProfileAnalytics(one, usage)}, per_profile_truncated=False, not_reproducible=(),
+            replay_ignored_events=None, ignored_estimate_events=0).to_dict()
+
     return {
+        "read_analytics": read_analytics,
         "read_events": lambda after, limit: _page(events, after, limit, "sequence"),
         "read_run": read_run, "read_tasks": read_tasks, "read_usage": read_usage, "read_runs": read_runs,
         "read_approvals": lambda after, limit: [a for a in approvals if a["id"] > after][:limit],
@@ -238,6 +258,7 @@ def _get_cases(path, reader, missing_arg):
 CASES[("/api/v1/runs/{run_id}", "get")] = _get_cases("/api/v1/runs/r1", "read_run", "run")
 CASES[("/api/v1/runs/{run_id}/tasks", "get")] = _get_cases("/api/v1/runs/r1/tasks", "read_tasks", "run")
 CASES[("/api/v1/runs/{run_id}/usage", "get")] = _get_cases("/api/v1/runs/r1/usage", "read_usage", "run")
+CASES[("/api/v1/runs/{run_id}/analytics", "get")] = _get_cases("/api/v1/runs/r1/analytics", "read_analytics", "run")
 CASES[("/api/v1/runs/{run_id}/threads", "get")] = _get_cases("/api/v1/runs/r1/threads", "read_threads", "run")
 CASES[("/api/v1/runs/{run_id}/threads/{thread_id}/messages", "get")] = _get_cases(
     "/api/v1/runs/r1/threads/th1/messages", "read_messages", "thread")

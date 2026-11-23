@@ -22,6 +22,7 @@ Generated from the contracts in `src/synapse/api/openapi_contracts.py`; regenera
 - Runs: `POST /api/v1/runs/{run_id}/agent-abandon`
 - Runs: `POST /api/v1/runs/{run_id}/agent-worktree-commit`
 - Runs: `POST /api/v1/runs/{run_id}/agent-worktree-remove`
+- Runs: `GET /api/v1/runs/{run_id}/analytics`
 - Runs: `POST /api/v1/runs/{run_id}/mock-cancel`
 - Runs: `POST /api/v1/runs/{run_id}/mock-resume`
 - Runs: `POST /api/v1/runs/{run_id}/mock-start`
@@ -1005,6 +1006,397 @@ Missing or invalid operator bearer token.
 #### 409
 
 Conflict: stale state version, or the idempotency key was reused with a different request.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 422
+
+Validation error: a parameter or body field is outside its documented bounds.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 500
+
+Internal error (the body never contains traces or file paths).
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 503
+
+A dependency is temporarily unavailable; retry later.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+### `GET /api/v1/runs/{run_id}/analytics`
+
+Get Analytics.
+
+**Auth:** operator bearer token (`Authorization: Bearer <token>`).
+
+**Parameters**
+
+| Name | In | Required | Constraints |
+| --- | --- | --- | --- |
+| `run_id` | path | yes | string, minLength=1, maxLength=256 |
+| `cursor` | query | no | string, minLength=1, maxLength=1024 or null |
+| `limit` | query | no | integer, min=1, max=200, default=50 |
+
+**Responses**
+
+#### 200
+
+Success (or idempotent replay of an earlier command).
+
+```json
+{
+  "run_id": "string",
+  "source": "string",
+  "attempts": {
+    "kind": "measured",
+    "value": 1,
+    "unit": "string",
+    "basis": "string",
+    "known": 1,
+    "of": 1,
+    "lower_bound": false
+  },
+  "retries": {
+    "kind": "measured",
+    "value": 1,
+    "unit": "string",
+    "basis": "string",
+    "known": 1,
+    "of": 1,
+    "lower_bound": false
+  },
+  "outcome_mix": {
+    "key": {
+      "kind": "measured",
+      "value": 1,
+      "unit": "string",
+      "basis": "string",
+      "known": 1,
+      "of": 1,
+      "lower_bound": false
+    }
+  },
+  "usage": {
+    "input_tokens": {
+      "kind": "measured",
+      "value": 1,
+      "unit": "string",
+      "basis": "string",
+      "known": 1,
+      "of": 1,
+      "lower_bound": false
+    },
+    "output_tokens": {
+      "kind": "measured",
+      "value": 1,
+      "unit": "string",
+      "basis": "string",
+      "known": 1,
+      "of": 1,
+      "lower_bound": false
+    },
+    "cache_read_tokens": {
+      "kind": "measured",
+      "value": 1,
+      "unit": "string",
+      "basis": "string",
+      "known": 1,
+      "of": 1,
+      "lower_bound": false
+    },
+    "cache_write_tokens": {
+      "kind": "measured",
+      "value": 1,
+      "unit": "string",
+      "basis": "string",
+      "known": 1,
+      "of": 1,
+      "lower_bound": false
+    },
+    "cost_usd": {
+      "kind": "measured",
+      "value": 1,
+      "unit": "string",
+      "basis": "string",
+      "known": 1,
+      "of": 1,
+      "lower_bound": false
+    }
+  },
+  "attempts_with_any_usage": 1,
+  "estimated": {
+    "key": {
+      "key": {
+        "kind": "measured",
+        "value": 1,
+        "unit": "string",
+        "basis": "string",
+        "known": 1,
+        "of": 1,
+        "lower_bound": false
+      }
+    }
+  },
+  "messages": {
+    "sent": {
+      "kind": "measured",
+      "value": 1,
+      "unit": "string",
+      "basis": "string",
+      "known": 1,
+      "of": 1,
+      "lower_bound": false
+    },
+    "deliveries_created": {
+      "kind": "measured",
+      "value": 1,
+      "unit": "string",
+      "basis": "string",
+      "known": 1,
+      "of": 1,
+      "lower_bound": false
+    },
+    "claimed": {
+      "kind": "measured",
+      "value": 1,
+      "unit": "string",
+      "basis": "string",
+      "known": 1,
+      "of": 1,
+      "lower_bound": false
+    },
+    "redeliveries": {
+      "kind": "measured",
+      "value": 1,
+      "unit": "string",
+      "basis": "string",
+      "known": 1,
+      "of": 1,
+      "lower_bound": false
+    },
+    "acknowledged": {
+      "kind": "measured",
+      "value": 1,
+      "unit": "string",
+      "basis": "string",
+      "known": 1,
+      "of": 1,
+      "lower_bound": false
+    },
+    "dead_lettered": {
+      "kind": "measured",
+      "value": 1,
+      "unit": "string",
+      "basis": "string",
+      "known": 1,
+      "of": 1,
+      "lower_bound": false
+    }
+  },
+  "tasks": [
+    {
+      "task_id": "string",
+      "attempts": {
+        "kind": "measured",
+        "value": 1,
+        "unit": "string",
+        "basis": "string",
+        "known": 1,
+        "of": 1,
+        "lower_bound": false
+      },
+      "retries": {
+        "kind": "measured",
+        "value": 1,
+        "unit": "string",
+        "basis": "string",
+        "known": 1,
+        "of": 1,
+        "lower_bound": false
+      },
+      "outcome_mix": {
+        "key": {
+          "kind": "measured",
+          "value": 1,
+          "unit": "string",
+          "basis": "string",
+          "known": 1,
+          "of": 1,
+          "lower_bound": false
+        }
+      },
+      "usage": {
+        "input_tokens": {
+          "kind": "measured",
+          "value": 1,
+          "unit": "string",
+          "basis": "string",
+          "known": 1,
+          "of": 1,
+          "lower_bound": false
+        },
+        "output_tokens": {
+          "kind": "measured",
+          "value": 1,
+          "unit": "string",
+          "basis": "string",
+          "known": 1,
+          "of": 1,
+          "lower_bound": false
+        },
+        "cache_read_tokens": {
+          "kind": "measured",
+          "value": 1,
+          "unit": "string",
+          "basis": "string",
+          "known": 1,
+          "of": 1,
+          "lower_bound": false
+        },
+        "cache_write_tokens": {
+          "kind": "measured",
+          "value": 1,
+          "unit": "string",
+          "basis": "string",
+          "known": 1,
+          "of": 1,
+          "lower_bound": false
+        },
+        "cost_usd": {
+          "kind": "measured",
+          "value": 1,
+          "unit": "string",
+          "basis": "string",
+          "known": 1,
+          "of": 1,
+          "lower_bound": false
+        }
+      }
+    }
+  ],
+  "next_cursor": "string",
+  "per_profile": {
+    "key": {
+      "attempts": {
+        "kind": "measured",
+        "value": 1,
+        "unit": "string",
+        "basis": "string",
+        "known": 1,
+        "of": 1,
+        "lower_bound": false
+      },
+      "usage": {
+        "input_tokens": {
+          "kind": "measured",
+          "value": 1,
+          "unit": "string",
+          "basis": "string",
+          "known": 1,
+          "of": 1,
+          "lower_bound": false
+        },
+        "output_tokens": {
+          "kind": "measured",
+          "value": 1,
+          "unit": "string",
+          "basis": "string",
+          "known": 1,
+          "of": 1,
+          "lower_bound": false
+        },
+        "cache_read_tokens": {
+          "kind": "measured",
+          "value": 1,
+          "unit": "string",
+          "basis": "string",
+          "known": 1,
+          "of": 1,
+          "lower_bound": false
+        },
+        "cache_write_tokens": {
+          "kind": "measured",
+          "value": 1,
+          "unit": "string",
+          "basis": "string",
+          "known": 1,
+          "of": 1,
+          "lower_bound": false
+        },
+        "cost_usd": {
+          "kind": "measured",
+          "value": 1,
+          "unit": "string",
+          "basis": "string",
+          "known": 1,
+          "of": 1,
+          "lower_bound": false
+        }
+      }
+    }
+  },
+  "per_profile_truncated": false,
+  "not_reproducible": [
+    "string"
+  ],
+  "replay_ignored_events": 1,
+  "ignored_estimate_events": 1
+}
+```
+
+#### 401
+
+Missing or invalid operator bearer token.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 404
+
+The addressed run, thread or approval does not exist.
 
 ```json
 {

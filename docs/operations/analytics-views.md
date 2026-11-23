@@ -1,7 +1,7 @@
-# Analytics views (M5.7, slice 1: library)
+# Analytics views (M5.7, slices 1-2: library, API route and CLI)
 
 `synapse.application.analytics_views` is a read-only read model for one run: attempts, retries, outcome mix, messages
-and token/cost totals. This slice is library only; there is no API route, CLI or desktop view yet. Authorization is the
+and token/cost totals. Slice 2 exposes it through `GET /api/v1/runs/{run_id}/analytics` and `agentctl analytics` (below); there is no desktop view yet. Authorization is the
 caller's job, as for `usage_query.py`.
 
 ## The three kinds
@@ -35,7 +35,7 @@ them). The `value` is unchanged; only the claim of exactness is withdrawn. Cost 
 Run level: `attempts`, `retries` (attempts beyond the first per task), `outcome_mix` (final attempt state),
 `usage` (five ledger fields), `attempts_with_any_usage` (distinct attempts with at least one non-unknown usage field), `estimated`, and `messages`: `sent`, `deliveries_created`,
 `claimed` ("delivered": leased to a recipient at least once), `redeliveries` (claims beyond the first), `acknowledged`,
-`dead_lettered`. Per task (paged): attempts, retries, outcome mix, usage. Per profile (tables only): attempts and usage.
+`dead_lettered`. Per task (paged): attempts, retries, outcome mix, usage. Only tasks with at least one attempt are listed (a task that never ran has no attempt rows, and the event-replay path cannot know of it either, so both paths agree); run-level totals are unaffected. Per profile (tables only): attempts and usage.
 
 `attempts_with_any_usage` is NOT the same as `attempts_with_usage` in `usage_query.py`: that one counts attempts having
 any observation row, including a row whose five fields are all NULL. This one counts attempts where at least one field is
@@ -76,8 +76,19 @@ keyset-paged by task id (`limit` 1-200, default 50, opaque cursor, `InvalidCurso
 the whole run, not the page. Hard caps (`MAX_ATTEMPTS` 20 000, `MAX_OBSERVATIONS` 100 000, `MAX_EVENTS` 200 000) raise
 `AnalyticsTooLarge` rather than truncating a total; per profile is capped at 200 with `per_profile_truncated`.
 
+## API route and CLI
+
+`GET /api/v1/runs/{run_id}/analytics?limit=N&cursor=C` (operator Bearer token) returns `RunAnalytics.to_dict()` from the
+authoritative tables, unchanged: every number is `{kind, value, unit, basis, known, of, lower_bound}` with `kind` one of
+`measured`, `estimated`, `unknown`. Estimates stay in `estimated` and are never merged into `usage`; an unknown value is
+`null`, never `0`. Run-level totals cover the whole run; only `tasks` is paged: `limit` 1-200 (default 50) and `cursor`
+(the previous `next_cursor`, `null` on the last page; it is bound to the run and route, so a cursor from another run is a 422). Errors: 404 unknown run, 503 reader not wired, 422 blank run ID,
+`limit` out of range or an invalid cursor, 422 with the fixed message "Run too large for analytics" when the run exceeds a hard cap (`AnalyticsTooLarge`).
+`agentctl analytics RUN_ID [--limit N] [--cursor C]` prints the response JSON on stdout; when more tasks exist the next
+`--cursor` value is printed on stderr with control characters removed. The event-replay path is library only.
+
 ## Not covered
 
-No API, CLI or desktop surface; no cross-run or per-profile-over-time aggregation; no tokens-per-verified-task metric
+No desktop surface; no cross-run or per-profile-over-time aggregation; no tokens-per-verified-task metric
 (needs `verification_results` joins); no estimate producers; no quota (stays unknown, ADR 017 D1); no cache-hit or
 manifest analytics; time-based filtering.

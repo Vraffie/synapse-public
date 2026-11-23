@@ -44,6 +44,7 @@ from synapse.persistence.migrations import default_migrations_dir
 from synapse.persistence.operator_messages import read_threads, read_messages
 from synapse.persistence.run_list import read_run_list
 from synapse.persistence.run_snapshot import read_run_snapshot, read_run_tasks
+from synapse.application.analytics_views import read_run_analytics
 from synapse.persistence.usage_query import read_run_usage
 from synapse.persistence.approval_query import read_approvals
 from synapse.persistence.approval_expiry import run_expiry_sweeps
@@ -339,6 +340,7 @@ def run(state_dir: Path, migrations: Path, *, enable_mock_mcp_ipc: bool = False,
                 read_run=lambda run_id: read_run_snapshot(connection, run_id),
                 read_tasks=lambda run_id, limit, cursor: read_run_tasks(connection, run_id, limit=limit, cursor=cursor),
                 read_usage=lambda run_id, limit, cursor: read_run_usage(connection, run_id, limit=limit, cursor=cursor),
+                read_analytics=lambda run_id, limit, cursor: read_run_analytics(connection, run_id, limit=limit, cursor=cursor).to_dict(),
                 read_runs=lambda state, limit, cursor: read_run_list(connection, state=state, limit=limit, cursor=cursor),
                 read_approvals=lambda after, limit: read_approvals(connection, after=after, limit=limit, read_blob=agent_runtime.blobs.read),
                 decide_approval=lambda token, approval_id, *, key, correlation, **fields: approval_service.decide(
