@@ -136,3 +136,89 @@ def test_malformed_entries_are_unverified_and_never_signal(journal, content):
 def test_interrupted_temp_files_are_cleaned_up(journal):
     (journal._dir / "k.json.tmp").write_text("{")
     assert journal.fence_all() == FenceReport(0, 0, 0) and not list(journal._dir.glob("*.tmp"))
+
+
+# ----------------------------------------------------------------------- security review findings
+def orphan_group(same_session=True):
+    """A leader that leaves a child behind in its group and is then reaped: the leader pid is gone, members remain."""
+    setup = "import os;os.setsid()" if same_session else "import os;os.setpgrp()"
+    code = (setup + ";import subprocess,sys;subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);"
+            "print(os.getpid(),flush=True)")
+    p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    pid = int(p.stdout.readline())
+    ticks = _stat(pid)[4]
+    p.wait(timeout=5)
+    time.sleep(0.2)
+    return pid, ticks
+
+
+def test_orphans_of_a_gone_leader_with_our_session_are_killed(journal, reap):
+    pid, ticks = orphan_group(same_session=True)
+    members = sj._group_members(pid)
+    assert members
+    journal.record("k", ProcessIdentity(pid, ticks, _boot_id(), os.getpid(), 1))
+    assert journal.fence_all() == FenceReport(0, 1, 0)
+    assert all(gone(m) for m in members)
+
+
+def test_a_group_whose_leader_is_gone_but_is_not_ours_is_reported_never_killed(journal):
+    pid, ticks = orphan_group(same_session=False)  # members keep the pytest session: not our spawn pattern
+    members = sj._group_members(pid)
+    try:
+        journal.record("k", ProcessIdentity(pid, ticks, _boot_id(), os.getpid(), 1))
+        report = journal.fence_all()
+        assert report.killed == 0 and report.unverified == 1
+        assert not any(gone(m, timeout=0.2) for m in members)
+    finally:
+        for m in members:
+            os.kill(m, signal.SIGKILL)
+
+
+def test_unverified_stays_unverified_on_every_restart_until_the_operator_clears_it(journal):
+    journal.begin("k")
+    assert journal.fence_all() == FenceReport(0, 0, 1)
+    assert journal.fence_all() == FenceReport(0, 0, 1)  # the second startup does not forget it
+    (journal._dir / "k.unverified").unlink()
+    assert journal.fence_all() == FenceReport(0, 0, 0)
+
+
+def test_entries_over_the_cap_are_reported_not_skipped(journal, monkeypatch):
+    monkeypatch.setattr(sj, "_MAX_ENTRIES", 3)
+    for i in range(5):
+        journal.record("d%d" % i, ProcessIdentity(2 ** 22 + 100 + i, 1, "other-boot", os.getpid(), 1))
+    report = journal.fence_all()
+    assert report.verified_dead == 3 and report.unverified == 2 and not report.all_clear
+    assert len(journal.pending()) == 2  # left in place, so the next startup sees them
+
+
+def test_fifo_symlink_and_device_entries_neither_hang_nor_follow(journal, tmp_path):
+    os.mkfifo(journal._dir / "fifo.json")
+    os.symlink("/dev/zero", journal._dir / "zero.json")
+    target = tmp_path / "secret"
+    target.write_text('{"v":1,"state":"running","pid":2,"start_ticks":1,"boot_id":"b"}')
+    os.symlink(target, journal._dir / "link.json")
+    assert journal.fence_all() == FenceReport(0, 0, 3)
+    assert target.exists()
+
+
+def test_the_fence_never_signals_the_daemons_own_group_or_session(journal, monkeypatch):
+    def forbidden(*a):
+        raise AssertionError("killpg must not be called")
+    monkeypatch.setattr(sj.os, "killpg", forbidden)
+    for key, pid in (("me", os.getpid()), ("grp", os.getpgrp()), ("sess", os.getsid(0))):
+        try:
+            ticks = _stat(pid)[4]
+        except (OSError, ValueError):
+            continue
+        journal.record(key, ProcessIdentity(pid, ticks, _boot_id(), os.getpid(), 1))
+    report = journal.fence_all()
+    assert report.killed == 0 and report.unverified == len(list(journal._dir.glob("*.unverified"))) > 0
+
+
+def test_a_planted_symlink_in_place_of_the_temp_file_is_not_followed(journal, tmp_path):
+    victim = tmp_path / "victim"
+    victim.write_text("keep")
+    os.symlink(victim, journal._dir / "k.json.tmp")
+    journal.begin("k")
+    assert victim.read_text() == "keep" and (journal._dir / "k.json").is_file()

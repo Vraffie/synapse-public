@@ -12,7 +12,14 @@ recovery marks its attempt unknown. This journal closes that for every spawn the
 * ``fence_all`` runs at daemon startup, under the ownership lock, before any recovery: for every leftover entry it
   proves the original process is gone (other boot, no such pid, pid reused, or only zombies) or kills its whole
   process group and checks nothing is left. Anything it cannot prove is reported ``unverified`` and the file is
-  kept as ``*.unverified`` for the operator.
+  kept as ``*.unverified``, which counts as unverified at EVERY startup until the operator deletes it.
+
+Limits (stated, not hidden): this is a PROCESS-GROUP fence. A descendant that left the group (``setsid`` /
+``setpgid``, or a detached helper) is not found, so ``all_clear`` means "no member of the recorded group survives",
+not "no descendant survives". Sandbox runs are additionally tied to the daemon by ``--die-with-parent`` and a PID
+namespace; a cgroup or subreaper would be needed for a full guarantee (future work, ADR 023). Journal files are
+attacker-writable when the agent runs unsandboxed as the same uid, so the fence refuses to signal the daemon's own
+group or session, and an ambiguous group is reported instead of killed.
 
 Linux only (``/proc``); local single machine. Files are 0600 in a 0700 directory, written atomically with fsync,
 and contain only ids, pid, start ticks and boot id: never a prompt, path or credential.
@@ -22,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +39,7 @@ from synapse.infrastructure.mock_process_identity import ProcessIdentity, _boot_
 _KEY_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
 _MAX_ENTRIES = 1000
 _MAX_FILE_BYTES = 4096
+_FENCE_BUDGET_SECONDS = 60.0  # total time the fence may spend waiting for killed groups
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,7 +72,8 @@ class SpawnJournal:
     def _write(self, key: str, body: dict) -> None:
         final = self._path(key)
         tmp = final.with_name(final.name + ".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        tmp.unlink(missing_ok=True)  # removes a planted symlink itself, never its target
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         try:
             with os.fdopen(fd, "w") as fh:
                 json.dump(body, fh)
@@ -95,10 +105,17 @@ class SpawnJournal:
 
     # ------------------------------------------------------------------ startup side
     def fence_all(self, *, kill_wait_seconds: float = 5.0) -> FenceReport:
-        """Prove or enforce that no process from a previous daemon survives. Call under the ownership lock."""
-        dead = killed = unverified = 0
-        for path in sorted(self._dir.glob("*.json"))[:_MAX_ENTRIES]:
-            verdict = self._fence_one(path, kill_wait_seconds)
+        """Prove or enforce that no member of a previous daemon's agent groups survives (see Limits above).
+
+        Call under the ownership lock. Entries over the cap and ``*.unverified`` files left by earlier startups
+        are counted as unverified every time, so an unresolved doubt never silently disappears.
+        """
+        dead = killed = 0
+        unverified = len(list(self._dir.glob("*.unverified")))  # still unresolved from an earlier startup
+        budget = time.monotonic() + _FENCE_BUDGET_SECONDS
+        entries = sorted(self._dir.glob("*.json"))
+        for path in entries[:_MAX_ENTRIES]:
+            verdict = self._fence_one(path, min(kill_wait_seconds, max(0.0, budget - time.monotonic())))
             if verdict == "dead":
                 dead += 1
                 path.unlink(missing_ok=True)
@@ -111,31 +128,50 @@ class SpawnJournal:
                     os.replace(path, path.with_suffix(".unverified"))
                 except OSError:
                     pass
+        unverified += max(0, len(entries) - _MAX_ENTRIES)  # never fenced: left in place, reported
         for stray in self._dir.glob("*.tmp"):
             stray.unlink(missing_ok=True)  # an interrupted write never completed: no pid was recorded in it
         return FenceReport(dead, killed, unverified)
 
-    def _fence_one(self, path: Path, wait: float) -> str:
+    @staticmethod
+    def _read_entry(path: Path) -> dict | None:
+        """Bounded read of a regular file only: never follows a symlink, never blocks on a FIFO or device."""
         try:
-            if path.stat().st_size > _MAX_FILE_BYTES:
-                return "unverified"
-            body = json.loads(path.read_text())
-            if not isinstance(body, dict) or body.get("v") != 1:
-                return "unverified"
-            if body.get("state") == "starting":
-                return "unverified"  # a spawn may have happened with no pid recorded: cannot be proven dead
-            pid, ticks, boot = body.get("pid"), body.get("start_ticks"), body.get("boot_id")
-            if type(pid) is not int or type(ticks) is not int or pid <= 1 or ticks <= 0 or not isinstance(boot, str):
-                return "unverified"
-        except (OSError, ValueError):
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        except OSError:
+            return None
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            raw = os.read(fd, _MAX_FILE_BYTES + 1)
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
+        if len(raw) > _MAX_FILE_BYTES:
+            return None
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            return None
+        return body if isinstance(body, dict) and body.get("v") == 1 else None
+
+    def _fence_one(self, path: Path, wait: float) -> str:
+        body = self._read_entry(path)
+        if body is None or body.get("state") == "starting":
+            return "unverified"  # malformed, or a spawn that may have happened with no pid recorded
+        pid, ticks, boot = body.get("pid"), body.get("start_ticks"), body.get("boot_id")
+        if type(pid) is not int or type(ticks) is not int or pid <= 1 or ticks <= 0 or not isinstance(boot, str):
             return "unverified"
+        if pid in (os.getpid(), os.getpgrp(), os.getsid(0)):
+            return "unverified"  # a forged or stale entry pointing at the daemon's own group or session
         try:
             if boot != _boot_id():
                 return "dead"  # a reboot ended every process of the previous boot
             try:
                 state, _, group, session, start = _stat(pid)
             except FileNotFoundError:
-                return "dead" if not _group_members(pid) else self._kill_group(pid, wait)
+                return self._orphans_of_gone_leader(pid, ticks, wait)
             if start != ticks:
                 # The pid belongs to someone else now. If a live group still carries that id we cannot tell the
                 # old agent's members from the new owner's: never signal it, report it.
@@ -148,8 +184,26 @@ class SpawnJournal:
         except (OSError, ValueError, IndexError):
             return "unverified"
 
+    def _orphans_of_gone_leader(self, pgid: int, recorded_ticks: int, wait: float) -> str:
+        """The recorded leader is gone. Members left in that group are ours only if they look like our children:
+        same session id (we spawn with start_new_session) and started no earlier than the recorded leader. Anything
+        else is ambiguous (the id may belong to an unrelated group after pid wrap): report, never kill."""
+        members = _group_members(pgid)
+        if not members:
+            return "dead"
+        for member in members:
+            try:
+                _, _, _, session, start = _stat(member)
+            except (OSError, ValueError, IndexError):
+                return "unverified"
+            if session != pgid or start < recorded_ticks:
+                return "unverified"
+        return self._kill_group(pgid, wait)
+
     def _kill_group(self, pgid: int, wait: float) -> str:
         """SIGKILL the group that the recorded leader led, then check no live member remains."""
+        if wait <= 0:
+            return "unverified"  # the fence's time budget is spent: do not start something it cannot verify
         try:
             os.killpg(pgid, signal.SIGKILL)
         except ProcessLookupError:

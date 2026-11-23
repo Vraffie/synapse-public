@@ -326,8 +326,10 @@ class AgentRuntime:
             _LOG.exception("Agent recovery failed for run %s", run_id)
 
     def _reconcile(self, run_id: str):
-        # No worker of a previous process is known to survive here, but a detached
-        # child CAN outlive the daemon: in-flight attempts become unknown, never retried.
+        # A detached child CAN outlive the daemon, so recovery never trusts that nothing runs: in-flight attempts
+        # become unknown, nothing is resumed, and an operator ends the run. The startup fence (ADR 023) kills
+        # surviving process groups and records what it could not prove in the agent.worker_fence event; its
+        # result informs the operator, it does not make anything resumable.
         recover_mock_run(self.db, run_id=run_id, principal="agent-recovery", no_workers_survive=True, provider_kind="claude")
 
     def _recover_run(self, run_id: str):

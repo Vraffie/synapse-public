@@ -73,6 +73,10 @@ The agent-runs API uses it for the per-run worktree.
 - One lock per repo (in-process `threading.Lock` plus `flock` on a file in
   `root_dir`) serializes create/remove.
 
+## Commit
+
+`WorktreeManager.commit` stages everything in a task's worktree and commits it onto the task's own branch with the same hardened host git as the other operations (hooks, filters, attributes and config guard). It refuses a nested repository (gitlink), any `.gitmodules` change and more than 1000 changed files, judged on the staged index; any refusal resets the index. The operator-facing action is `agent-worktree-commit` (see [agent runs](agent-runs.md#getting-the-edits-out-agent-worktree-commit)).
+
 ## Provider compatibility
 
 `git worktree add` writes a `.git` *file* (`gitdir: ...`), not a directory.

@@ -39,7 +39,7 @@ Items from the earlier list that are no longer true: stale `agentd.sock` blocks 
 - Secure agent session provisioning and worker isolation; live MCP/fallback communication.
 - Real-worker process fencing and automatic reconciliation; mock resume is fixed-fixture only and must not be generalised to subprocess or provider effects.
 - Genuinely independent reviewer; stronger distinct-human identity.
-- Wiring of the Codex adapter and profile registry, budget and routing policy, output reducer and usage analytics (M4 remainder, M5; the adapter, registry, policy modules and usage ledger are merged but not wired or only partly wired), multi-repo plugin (M6), deployment and release gates (M7).
+- Wiring of the Codex adapter and profile registry, budget and routing policy, output reducer (wired since #1) and usage analytics (M4 remainder, M5; the adapter, registry, policy modules and usage ledger are merged but not wired or only partly wired), multi-repo plugin (M6), deployment and release gates (M7).
 - No live provider is enabled by default and no deployment has occurred.
 
 ## Session 2026-11-23 (A, `claude-personal`)
@@ -55,3 +55,10 @@ PR numbers elsewhere in this file (#1-#162) refer to the earlier private history
 - Verified on this machine: `bwrap` is installed (`/usr/bin/bwrap`), unprivileged user namespaces work, and the 79 sandbox/bwrap tests run and pass (1 skipped: the opt-in real Codex test). This answers part of ADR 019 open question 7; the polkit, `systemd-run`, uvicorn peer-credential and `python-fido2` items remain unverified.
 - Known limits that remain true: the `--agent-config` registry gives every profile the base executable, credentials and `state_dir`, so profiles do not isolate accounts; `per_profile` budgets keyed to the built-in id do not cover tasks naming a registry profile; operator and approver tokens are same-user files (F2), agents still need `--allow-same-user-agents`; the cooldown routes use the shared operator token.
 - Session B started and opened #1-#3, #5, #7. A's independent reviews found blocking issues in #1 and #2 (posted on the PRs); neither is merged. Merging #8 was impossible because the `block main` ruleset requires CI checks that docs-only PRs never run, so these status files travel with the `profile_id` change instead.
+
+## Session 2026-11-23, later (A)
+
+- Merged: #1 (M5.3 wiring), #2 (M7.3 ops), #3 (M5.4 manifest record), #7/#15/#19/#21 (M7.4 coverage), #11-#14 (profile_id in run views, F10 counters, peer credentials, same-user gate), #18 (log why a sandboxed spawn failed, sandbox vs native Claude install path), #20 (`agent-worktree-commit`), #22 (`scripts/synapse_up.py`). Full suite on `main` after #22: 2867 passed, 22 skipped.
+- First real, non-mock runs: a sandboxed read-only Claude run and a sandboxed edit run (fixed a bug in a throwaway repo; the edit was committed to its own branch with `agent-worktree-commit`, owner `main` untouched). Findings from the live runs: the sandbox refuses the native install path (`~/.local/share`), now documented and handled by `synapse_up.py`; the daemon refuses a worktree root inside the state dir.
+- Independent security reviews found and fixed: #20 (a `.gitmodules` `ignore = all` hid a gitlink; truncated listings skipped the check) and the spawn journal (leader-gone group kill without identity check, forgotten unverified entries, silent entry cap, FIFO hang, no self-protection).
+- In flight: spawn journal / startup worker fence (ADR 023, branch `a/spawn-journal`; process-group only, see the ADR limits), desktop "Commit changes..." (branch `a/desktop-commit`), B's #5, #16, #17, #23.

@@ -137,6 +137,19 @@ cancellation, an `unknown` attempt is **not** discarded: such a run goes to
 attempt `unknown`, blocks its task and moves the run to `recovering` via the
 shared `recover_mock_run(provider_kind="claude")`. Nothing is re-spawned.
 
+### Startup worker fence (ADR 023)
+
+Every real spawn is journaled under `<state>/spawn-journal` (intent before `Popen`, pid, start ticks and boot id right
+after, removed once reaped unless the stop status was `unknown`). Before recovery, startup fences each leftover entry:
+provably dead (other boot, no such pid and empty group, zombies only) or its whole process group is killed and checked
+empty. Anything it cannot prove (begin-only entry, malformed file, reused pid with a live group, a group that will not
+die) is `unverified` and is never signalled when ambiguous. Recovery then proceeds as above.
+
+Each run with an unresolved attempt gets an `agent.worker_fence` event with `verified_dead`, `killed`, `unverified`
+and `all_clear` (true when `unverified` is 0). The counts are global, not per run. `unverified` entries are kept as
+`*.unverified` in the journal directory for inspection and are safe to delete once you have checked for stray
+processes. Linux `/proc` only; with the sandbox off an agent can edit these files, so this is a crash safety net.
+
 ## Design notes and caveats
 
 - Exclusion: an agent run owns a `mock_run_config` row (profile
