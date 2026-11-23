@@ -103,9 +103,13 @@ def read_config(path: Path) -> dict:
 def merge_repos(existing: list, new: list[Path]) -> tuple[list[str], list[str]]:
     """(merged allowlist, paths actually added). Refuses a new repo nested in (or containing) another one:
     the daemon refuses nested allowlist entries at start."""
-    repos = [r for r in existing if isinstance(r, str)]
+    repos: list[str] = []
+    for r in existing:  # normalised so "/a/b/" and "/a/b" are one entry
+        if isinstance(r, str) and os.path.normpath(r) not in repos:
+            repos.append(os.path.normpath(r))
     added: list[str] = []
     for repo in new:
+        repo = Path(os.path.realpath(repo))
         s = str(repo)
         if s in repos:
             continue
@@ -134,7 +138,14 @@ def write_config(path: Path, executable: Path, repo, tools: tuple[str, ...], wor
     with os.fdopen(fd, "w") as fh:
         os.fchmod(fh.fileno(), 0o600)
         json.dump(cfg, fh, indent=1)
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, path)
+    dirfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dirfd)
+    finally:
+        os.close(dirfd)
     return cfg
 
 
@@ -237,9 +248,8 @@ def chosen_repos(args) -> list[Path]:
         return [check_repo(Path(args.repo))]
     if args.repo or not args.repo_names:
         raise UpError("with --workspace, name the repositories with --repo NAME (see `workspace FOLDER`)")
-    try:
-        scan = ws.discover_repos(_folder(args.workspace))
-        picked = ws.select_repos(scan, args.repo_names)
+    try:  # walks names only; git queries run on the chosen repositories alone
+        picked = ws.pick_repos(_folder(args.workspace), args.repo_names)
     except ValueError as exc:
         raise UpError(str(exc)) from exc
     for info in picked:

@@ -3,6 +3,7 @@
 Every repository here is a real `git init` in tmp_path; nothing outside tmp_path is scanned.
 """
 import os
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -345,5 +346,126 @@ def test_scan_time_limit_marks_truncated(tmp_path):
     make_repo(root / "a")
     make_repo(root / "b")
     res = scan(root, deadline_seconds=0)
-    assert res.repos == () and res.truncated
-    assert {s.reason for s in res.skipped} == {"not inspected: scan time limit reached"}
+    assert res.truncated and [r.rel for r in res.repos] == ["a", "b"]
+    assert {r.reason for r in res.repos} == {"not inspected: scan time limit reached"}
+    assert not any(r.usable for r in res.repos)
+
+
+def plant_commondir(repo: str, marker) -> None:
+    """Same repro as tests/test_worktrees.py: commondir points at a dir with a filter + info/attributes."""
+    common = Path(repo).parent / "evil-common"
+    shutil.copytree(Path(repo) / ".git", common)
+    for key in ("filter.x.clean", "filter.x.smudge"):
+        git(repo, "config", "--file", str(common / "config"), key, "touch '%s'; cat" % marker)
+    (common / "info").mkdir(exist_ok=True)
+    (common / "info" / "attributes").write_text("* filter=x\n")
+    (Path(repo) / ".git" / "commondir").write_text(str(common) + "\n")
+    future = (Path(repo) / "a.txt").stat().st_mtime + 100
+    os.utime(Path(repo) / "a.txt", (future, future))
+
+
+def test_commondir_fixture_is_really_hostile_without_hardening(tmp_path):
+    marker = tmp_path / "marker"
+    repo = make_repo(tmp_path / "ws" / "redirected")
+    (repo / "a.txt").write_text("hi\n")
+    git(repo, "add", "a.txt")
+    git(repo, "commit", "-q", "-m", "a")
+    plant_commondir(str(repo), marker)
+    subprocess.run(["git", "status"], cwd=repo, env=GIT_ENV, capture_output=True)
+    assert marker.exists()
+
+
+def test_commondir_redirect_is_unusable_and_no_filter_runs(tmp_path, monkeypatch):
+    marker = tmp_path / "marker"
+    root = tmp_path / "ws"
+    repo = make_repo(root / "redirected")
+    (repo / "a.txt").write_text("hi\n")
+    git(repo, "add", "a.txt")
+    git(repo, "commit", "-q", "-m", "a")
+    plant_commondir(str(repo.resolve()), marker)
+    info = by_rel(scan(root))["redirected"]
+    assert not marker.exists() and not info.usable and "commondir" in info.reason
+    # Even past the early refusal, the config guard itself refuses it before any git status.
+    with pytest.raises(ws.WorktreeError, match="commondir"):
+        ws.refuse_unsafe_repo_config(str(repo.resolve()))
+    assert not marker.exists()
+
+
+def test_refused_repo_gets_no_git_query_at_all(tmp_path, monkeypatch):
+    root = tmp_path / "ws"
+    repo = make_repo(root / "evil")
+    git(repo, "config", "core.sshCommand", "evil")
+    calls = []
+    real = ws._git
+    monkeypatch.setattr(ws, "_git", lambda *a, **k: calls.append(a[1]) or real(*a, **k))
+    info = ws.inspect_repo(str(repo.resolve()))
+    assert not info.usable and "sshcommand" in info.reason and calls == []
+    assert info.branch is None and info.head is None
+
+
+def test_filter_via_info_attributes_is_refused(tmp_path):
+    marker = tmp_path / "marker"
+    repo = make_repo(tmp_path / "ws" / "filt")
+    (repo / "a.txt").write_text("hi\n")
+    git(repo, "add", "a.txt")
+    git(repo, "commit", "-q", "-m", "a")
+    git(repo, "config", "filter.x.clean", "touch '%s'; cat" % marker)
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "attributes").write_text("* filter=x\n")
+    info = ws.inspect_repo(str(repo.resolve()))
+    assert not info.usable and "filter.x.clean" in info.reason and not marker.exists()
+    git(repo, "config", "--unset", "filter.x.clean")
+    info = ws.inspect_repo(str(repo.resolve()))
+    assert not info.usable and "info/attributes" in info.reason and not marker.exists()
+
+
+def test_dot_git_symlink_is_refused(tmp_path):
+    real = make_repo(tmp_path / "real")
+    linked = tmp_path / "ws" / "linked"
+    linked.mkdir(parents=True)
+    (linked / ".git").symlink_to(real / ".git")
+    info = by_rel(scan(tmp_path / "ws"))["linked"]
+    assert not info.usable and info.reason == ".git is a symlink" and info.head is None
+
+
+def test_not_owned_by_current_user_is_refused(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path / "ws" / "theirs")
+    monkeypatch.setattr(os, "getuid", lambda: os.stat(repo).st_uid + 1)
+    info = ws.inspect_repo(str(repo.resolve()))
+    assert not info.usable and info.reason == "not owned by the current user" and info.head is None
+
+
+def _gitdir_state(repo: Path) -> dict:
+    return {str(p): (p.stat().st_mtime_ns, p.stat().st_size)
+            for p in (repo / ".git").rglob("*") if p.is_file()}
+
+
+def test_status_writes_nothing_into_the_repository(tmp_path):
+    """GIT_OPTIONAL_LOCKS=0: a stat-dirty tracked file and an untracked file must not make our
+    `status` refresh the index (or write anything else) in the operator's repository."""
+    repo = make_repo(tmp_path / "ws" / "quiet")
+    (repo / "a.txt").write_text("hi\n")
+    git(repo, "add", "a.txt")
+    git(repo, "commit", "-q", "-m", "a")
+    future = (repo / "a.txt").stat().st_mtime + 100
+    os.utime(repo / "a.txt", (future, future))  # stat-dirty, content unchanged
+    (repo / "untracked.txt").write_text("u")
+    before = _gitdir_state(repo)
+    info = ws.inspect_repo(str(repo.resolve()))
+    assert info.usable and info.dirty_count == 1  # only the untracked file: a.txt content is unchanged
+    assert _gitdir_state(repo) == before
+    subprocess.run(["git", "status"], cwd=repo, env=GIT_ENV, capture_output=True, check=True)
+    assert _gitdir_state(repo) != before  # control: plain git status does refresh the index
+
+
+def test_pick_repos_inspects_only_the_chosen(tmp_path, monkeypatch):
+    root = tmp_path / "ws"
+    make_repo(root / "chosen")
+    make_repo(root / "other")
+    seen = []
+    real = ws.inspect_repo
+    monkeypatch.setattr(ws, "inspect_repo", lambda p, **k: seen.append(os.path.basename(p)) or real(p, **k))
+    assert [r.rel for r in ws.pick_repos(str(root.resolve()), ["chosen"])] == ["chosen"]
+    assert seen == ["chosen"]
+    with pytest.raises(ValueError, match="outside"):
+        ws.pick_repos(str(root.resolve()), ["../x"])

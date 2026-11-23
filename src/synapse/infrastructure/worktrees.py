@@ -115,6 +115,9 @@ def _git_env() -> dict[str, str]:
     return env
 
 
+# Every call also starts with the global option ``--no-lazy-fetch`` (same effect as GIT_NO_LAZY_FETCH,
+# see ``git help git``). A git too old to know it rejects the option, so every call then fails closed
+# instead of silently allowing a lazy fetch.
 _HARDEN = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
            "-c", "core.pager=cat", "-c", "gc.auto=0", "-c", "protocol.ext.allow=never",
            "-c", "core.attributesFile=/dev/null", "-c", "diff.external=",
@@ -142,7 +145,7 @@ def _git(cwd: str, args: Iterable[str], *, max_bytes: int = DEFAULT_MAX_BYTES,
     wall-clock deadline enforced by reader threads; on expiry the entire process group dies."""
     args = list(args)
     deadline = time.monotonic() + (_GIT_TIMEOUT if timeout is None else timeout)
-    argv = ["git", *_HARDEN, *args]
+    argv = ["git", "--no-lazy-fetch", *_HARDEN, *args]
     try:
         proc = subprocess.Popen(argv, cwd=cwd, env=_git_env(), shell=False,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -234,10 +237,16 @@ def refuse_unsafe_repo_config(repo: str, cwd: str | None = None) -> None:
     """Refuse repo state that makes git run repo-chosen programs. Re-run before every git call
     that touches a work tree (linked worktrees share this config with the agent's shell).
     Shared with ``synapse.application.workspace`` so discovery applies the identical rule."""
-    # Read the repository's own config file by path (no discovery walk-up, no includes); a listing
-    # that does not fit the cap is refused rather than checked partially.
-    _, out, truncated = _git(cwd or repo, ["config", "--file", os.path.join(repo, ".git", "config"),
-                                           "--list", "-z"], max_bytes=1 << 20)
+    dotgit = os.path.join(repo, ".git")
+    # .git/commondir makes git take config, info/attributes, objects and refs from ANOTHER directory,
+    # so every check below would look at the wrong files. Refused outright (fail closed).
+    if os.path.lexists(os.path.join(dotgit, "commondir")):
+        raise WorktreeError("repository .git/commondir is not allowed")
+    # The effective repository config as git itself resolves it for this git dir (explicit --git-dir:
+    # no discovery walk-up; --local lists without following includes, which are refused below). A
+    # listing that does not fit the cap is refused rather than checked partially.
+    _, out, truncated = _git(cwd or repo, [f"--git-dir={dotgit}", "config", "--local", "--list", "-z"],
+                             max_bytes=1 << 20)
     if truncated:
         raise WorktreeError("repository config is too large to check")
     for entry in out.split("\x00"):
@@ -291,6 +300,8 @@ class WorktreeManager:
         dotgit = os.path.join(repo, ".git")
         if os.path.islink(dotgit) or not os.path.isdir(dotgit):
             raise ValueError("repo must contain a real .git directory")
+        if os.path.lexists(os.path.join(dotgit, "commondir")):
+            raise ValueError("repo .git/commondir is not allowed")
         return repo
 
     # --- paths ------------------------------------------------------------

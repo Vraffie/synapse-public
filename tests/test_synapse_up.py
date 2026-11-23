@@ -216,3 +216,11 @@ def test_config_write_never_follows_a_planted_tmp_symlink(tmp_path):
     (tmp_path / "agent.json.tmp").symlink_to(victim)
     up.write_config(tmp_path / "agent.json", tmp_path / "claude", Path("/r/one"), ("Read",), tmp_path / "wt")
     assert victim.read_text() == "keep" and json.loads((tmp_path / "agent.json").read_text())["sandbox"] is True
+
+
+def test_merge_normalises_paths_so_trailing_slash_is_not_a_second_entry(tmp_path):
+    cfg = tmp_path / "agent.json"
+    cfg.write_text(json.dumps({"sandbox": True, "repos": ["/r/one/", "/r/one"]}))
+    out = up.write_config(cfg, tmp_path / "claude", Path("/r/one"), ("Read",), tmp_path / "wt")
+    assert out["repos"] == ["/r/one"]
+    assert up.merge_repos(["/r/one"], [Path("/r/one/")]) == (["/r/one"], [])

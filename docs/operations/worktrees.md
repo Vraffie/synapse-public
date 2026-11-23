@@ -45,8 +45,9 @@ The agent-runs API uses it for the per-run worktree.
   what is checked out.
 - git is run with an argv list (no shell), a scrubbed environment (`PATH`,
   `HOME=/nonexistent`, no system/global config, no prompts), its own process
-  group, `GIT_NO_LAZY_FETCH=1` (a partial clone never fetches, which would run
-  `remote.*.uploadpack`), and `-c core.hooksPath=/dev/null -c core.fsmonitor=false
+  group, `GIT_NO_LAZY_FETCH=1` and the global option `--no-lazy-fetch` (a partial
+  clone never fetches, which would run `remote.*.uploadpack`; a git too old to know
+  the option rejects it, so calls fail closed), and `-c core.hooksPath=/dev/null -c core.fsmonitor=false
   -c core.pager=cat -c core.attributesFile=/dev/null -c diff.external=`.
   Diffs use `--no-ext-diff --no-textconv`.
 - Unsafe repository state is refused with a clear `WorktreeError`, and the check is
@@ -60,8 +61,11 @@ The agent-runs API uses it for the per-run worktree.
   `remote.*.uploadpack|receivepack|vcs|proxy`, `core.alternateRefsCommand`,
   `uploadpack.*`, `http.*proxy`, `extensions.worktreeConfig`, any `config.worktree`
   file, a non-comment `info/attributes` file in the repository's git directory, and a
-  `.git/config` too large (over 1 MiB listed) to check completely. The check reads
-  `.git/config` by path (`git config --file`), so it never walks up to another repo.
+  `.git/config` too large (over 1 MiB listed) to check completely, and any
+  `.git/commondir` (it makes git take config, `info/attributes`, objects and refs
+  from another directory; also refused when the allowlist is loaded). The check lists
+  the effective config with an explicit `--git-dir=<repo>/.git config --local`, so it
+  never walks up to another repo.
 - Work-tree git additionally runs with `--attr-source=<empty tree>`, so the tree's
   `.gitattributes` cannot enable a filter or diff driver even if a config plant
   slips in between the check and the call.

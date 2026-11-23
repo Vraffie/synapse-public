@@ -525,3 +525,43 @@ def test_commit_path_cap_counts_files_not_folded_directories_and_fails_closed_on
     with pytest.raises(WorktreeError, match="too many"):
         mgr.commit("run1", "task1", "x")
     _assert_nothing_committed(mgr, p, head)
+
+
+def plant_commondir(repo: str, marker) -> None:
+    """Security review repro: .git/commondir points git at another dir whose config defines a filter
+    and whose info/attributes applies it, while <repo>/.git/config itself stays clean."""
+    import shutil
+    common = os.path.join(os.path.dirname(repo), "evil-common")
+    shutil.copytree(os.path.join(repo, ".git"), common)
+    cmd = "touch '%s'; cat" % marker
+    run_git(repo, "config", "--file", os.path.join(common, "config"), "filter.x.clean", cmd)
+    run_git(repo, "config", "--file", os.path.join(common, "config"), "filter.x.smudge", cmd)
+    os.makedirs(os.path.join(common, "info"), exist_ok=True)
+    with open(os.path.join(common, "info", "attributes"), "w") as fh:
+        fh.write("* filter=x\n")
+    with open(os.path.join(repo, ".git", "commondir"), "w") as fh:
+        fh.write(common + "\n")
+    future = os.stat(os.path.join(repo, "a.txt")).st_mtime + 100
+    os.utime(os.path.join(repo, "a.txt"), (future, future))  # stat-dirty: status re-hashes via the filter
+
+
+def test_commondir_fixture_is_really_hostile_without_hardening(repo, tmp_path):
+    marker = tmp_path / "marker"
+    plant_commondir(repo, marker)
+    subprocess.run(["git", "status"], cwd=repo, env=ENV, capture_output=True)
+    assert marker.exists()
+
+
+def test_commondir_redirect_is_refused_and_no_filter_runs(mgr, repo, tmp_path):
+    marker = tmp_path / "marker"
+    plant_commondir(repo, marker)  # planted after the daemon started
+    with pytest.raises((ValueError, WorktreeError), match="commondir"):
+        mgr.check_base(repo, "main")
+    with pytest.raises((ValueError, WorktreeError), match="commondir"):
+        mgr.create("run1", "task1", repo, "main")
+    with pytest.raises(WorktreeError, match="commondir"):  # the config guard refuses it on its own too
+        mgr._refuse_dangerous_config(repo)
+    with pytest.raises(ValueError, match="commondir"):
+        WorktreeManager([repo], str((tmp_path / "wt2").resolve()))
+    assert not marker.exists()
+    assert not os.path.exists(os.path.join(mgr._root, "run1", "task1"))

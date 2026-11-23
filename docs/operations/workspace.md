@@ -22,6 +22,12 @@ duplicates, no repo nested in another registered one, at most 32). The daemon re
 restart it (`down`, then `up`) to pick up new repos. Nothing in the daemon API, the desktop or an agent run can
 discover or add repositories: discovery is a local operator tool only.
 
+`up --workspace` walks the folder by names only and runs git queries only on the repositories you named
+(not on every repo in the folder). The table you looked at and what is registered can differ if a repository
+changed in between (a new commit, new config): registration re-inspects the named repos, and the daemon checks
+every allowlisted repo again at start and before every run (`WorktreeManager`), so a repo that became unsafe
+is refused then.
+
 ## What is discovered
 
 - The folder itself, if it is a repository, is reported as one repository (`.`) and nothing else.
@@ -43,6 +49,7 @@ Not usable, with the reason shown:
 | bare repository | no working tree |
 | `.git` is a file (linked worktree or submodule) | register the main repository instead |
 | `.git` is a symlink, or not owned by you | the daemon's allowlist rules refuse these |
+| `.git/commondir` exists | git would take config, `info/attributes`, objects and refs from another directory, past every check; refused by the daemon too |
 | git query failed or timed out | reported, never retried silently |
 
 ## Bounds and what is NOT read
@@ -52,24 +59,35 @@ Not usable, with the reason shown:
   are listed as *skipped*; symlinks to files are ignored.
 - Hidden directories (`.git`, `.venv`, `.cache`, ...) and `node_modules`, `__pycache__`, `site-packages`,
   `venv` are not descended into.
-- At most `max_entries` (2000) directory entries and `max_repos` (64) repositories, and an overall time limit (300 s)
-  for the git queries; when a bound is hit the scan says so (`truncated`), and `depth_limited` says some folders below `max_depth` were not looked into.
+- At most `max_entries` (2000) directory entries and `max_repos` (64) repositories. All git queries share an
+  overall time limit (`deadline_seconds`, 300 s): each metadata/status call is cut to the time that is left,
+  and repositories not reached are listed as not usable ("scan time limit reached"). The one exception is the
+  unsafe-config check, which keeps the runner's own 60 s timeout, so the scan can overrun the limit by at most
+  that one call. When any bound is hit the scan says so (`truncated`), and `depth_limited` says some folders
+  below `max_depth` were not looked into.
   An unreadable directory is listed as skipped and the walk continues.
 - The input folder must be an existing, absolute, resolved directory without control characters (the CLI
   expands `~` and resolves it first). Names with control characters are skipped; names printed in the table
   are escaped if not printable.
 
-Inside each found repository only read-only git queries run (`config --local --list`, `symbolic-ref`,
+Inside each found repository only read-only git queries run (`git --git-dir=<repo>/.git config --local --list -z`, `symbolic-ref`,
 `rev-parse`, `for-each-ref`, `rev-list --count`, `status --porcelain`). Repository contents and config are
 untrusted input: every call goes through the hardened runner in `synapse.infrastructure.worktrees`
 (`-c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.pager=cat -c protocol.ext.allow=never
 -c diff.external= ...`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `HOME=/nonexistent`,
-`GIT_TERMINAL_PROMPT=0`, `GIT_OPTIONAL_LOCKS=0` so `status` does not rewrite the index, `GIT_NO_LAZY_FETCH=1`
-so a partial clone never fetches missing objects (which would run `remote.<name>.uploadpack`), argv lists without a
+`GIT_TERMINAL_PROMPT=0`, `GIT_OPTIONAL_LOCKS=0` so `status` does not rewrite the index (tested: a stat-dirty
+file and an untracked file leave every file under `.git` unchanged), `GIT_NO_LAZY_FETCH=1` plus the global
+option `--no-lazy-fetch` so a partial clone never fetches missing objects (which would run
+`remote.<name>.uploadpack`). That guarantee relies on git knowing the option: a git too old for it rejects
+`--no-lazy-fetch`, so every query fails and the repo is reported unusable rather than inspected unprotected
+(tested with git 2.56.1; the exact first release is not stated here because it could not be verified from the
+git docs installed on this machine). Further: argv lists without a
 shell, a wall-clock timeout per call and an output cap). `--git-dir`/`--work-tree` are passed explicitly so git
 never walks up into a parent repository, and `status` uses attributes from the empty tree and
-`--ignore-submodules=all`. The unsafe-config check runs first and reads `.git/config` by path (no discovery, no includes); for a refused repository `git status` (the only
-query that could reach filters) is never run. The config check also reads `.git/info/attributes` (as
+`--ignore-submodules=all`. A `.git/commondir` is refused before any git call. The unsafe-config check runs
+next and lists the effective repository config with an explicit `--git-dir` (no discovery walk-up, includes
+not followed but refused); for a refused repository **no further git call runs at all** (no metadata query,
+no `status`), so the table shows only the reason. The config check also reads `.git/info/attributes` (as
 `WorktreeManager` does); no other file is read by Synapse itself.
 
 ## Uncommitted changes are not visible to agents

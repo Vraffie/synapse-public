@@ -147,15 +147,22 @@ def _repo_marker(path: str) -> str | None:
 
 
 def _query(path: str, args: Iterable[str], *, timeout: float = _QUERY_TIMEOUT,
-           max_bytes: int = 64 * 1024) -> tuple[int, str, bool]:
+           max_bytes: int = 64 * 1024, stop_at: float | None = None) -> tuple[int, str, bool]:
     """One read-only git query against the repository at PATH. The git dir and work tree are passed
-    explicitly so git never walks up into a parent repository."""
+    explicitly so git never walks up into a parent repository. STOP_AT (time.monotonic) bounds the
+    whole scan: the call never runs past it."""
+    if stop_at is not None:
+        remaining = stop_at - time.monotonic()
+        if remaining <= 0:
+            raise WorktreeError("scan time limit reached")
+        timeout = min(timeout, remaining)
     return _git(path, [f"--git-dir={os.path.join(path, '.git')}", f"--work-tree={path}", *args],
                 check=False, timeout=timeout, max_bytes=max_bytes)
 
 
-def inspect_repo(path: str | os.PathLike[str]) -> RepoInfo:
-    """Describe one repository. Raises ValueError for bad input or a folder that is not a repository."""
+def inspect_repo(path: str | os.PathLike[str], *, stop_at: float | None = None) -> RepoInfo:
+    """Describe one repository. Raises ValueError for bad input or a folder that is not a repository.
+    STOP_AT (a time.monotonic value) is an overall deadline checked before and bounding every git call."""
     path = check_folder(path, "repository path")
     name = os.path.basename(path) or path
     marker = _repo_marker(path)
@@ -169,30 +176,36 @@ def inspect_repo(path: str | os.PathLike[str]) -> RepoInfo:
                        reason=".git is a file (linked worktree or submodule): register its main repository")
     if marker == "bare":
         return replace(base, kind="bare", reason="bare repository (no working tree)")
+    if os.path.lexists(os.path.join(path, ".git", "commondir")):
+        # git would read config, attributes, objects and refs from another directory.
+        return replace(base, kind="unsafe-gitdir", reason="unsafe: .git/commondir redirects the repository")
     for p in (path, os.path.join(path, ".git")):
         if os.lstat(p).st_uid != os.getuid():
             return replace(base, reason="not owned by the current user")
     info = replace(base, shallow=os.path.lexists(os.path.join(path, ".git", "shallow")))
-    try:
-        return _inspect_gitdir(info)
-    except WorktreeError as exc:  # git timed out or could not be executed
-        return replace(info, reason=f"git query failed: {exc}")
-
-
-def _inspect_gitdir(info: RepoInfo) -> RepoInfo:
-    path = info.path
-    unsafe = ""
+    if stop_at is not None and time.monotonic() >= stop_at:
+        return replace(info, reason="not inspected: scan time limit reached")
     try:
         refuse_unsafe_repo_config(path)
     except WorktreeError as exc:
-        unsafe = str(exc)
-    rc, out, _ = _query(path, ["symbolic-ref", "-q", "--short", "HEAD"])
+        # No further git call of any kind against a repository the daemon would refuse.
+        return replace(info, reason=f"unsafe config: {exc}")
+    try:
+        return _inspect_gitdir(info, stop_at)
+    except WorktreeError as exc:  # git timed out, could not be executed, or the scan ran out of time
+        return replace(info, reason=f"git query failed: {exc}")
+
+
+def _inspect_gitdir(info: RepoInfo, stop_at: float | None) -> RepoInfo:
+    path = info.path
+    rc, out, _ = _query(path, ["symbolic-ref", "-q", "--short", "HEAD"], stop_at=stop_at)
     branch = out.strip() if rc == 0 and out.strip() else None
     detached = rc == 1
-    rc, out, _ = _query(path, ["rev-parse", "--verify", "-q", "--end-of-options", "HEAD^{commit}"])
+    rc, out, _ = _query(path, ["rev-parse", "--verify", "-q", "--end-of-options", "HEAD^{commit}"],
+                        stop_at=stop_at)
     head = out.strip() if rc == 0 and out.strip() else None
     rc, out, _ = _query(path, ["for-each-ref", f"--count={MAX_BRANCHES + 1}",
-                               "--format=%(refname:strip=2)", "refs/heads/"])
+                               "--format=%(refname:strip=2)", "refs/heads/"], stop_at=stop_at)
     names = [n for n in out.split("\n") if n] if rc == 0 else []
     truncated_branches = len(names) > MAX_BRANCHES
     names = sorted(names[:MAX_BRANCHES])
@@ -200,17 +213,15 @@ def _inspect_gitdir(info: RepoInfo) -> RepoInfo:
         names = [branch, *[n for n in names if n != branch]][:MAX_BRANCHES]
     count = None
     if head:
-        rc, out, _ = _query(path, ["rev-list", "--count", f"--max-count={COMMIT_COUNT_CAP + 1}", head])
+        rc, out, _ = _query(path, ["rev-list", "--count", f"--max-count={COMMIT_COUNT_CAP + 1}", head],
+                            stop_at=stop_at)
         count = int(out.strip()) if rc == 0 and out.strip().isdigit() else None
     info = replace(info, branch=branch, detached=detached, head=head, branches=tuple(names),
                    branches_truncated=truncated_branches, commit_count=count)
-    if unsafe:
-        # Never run a work-tree query (status could invoke filters) against a repo the daemon would refuse.
-        return replace(info, reason=f"unsafe config: {unsafe}")
     rc, out, out_truncated = _query(
         path, [f"--attr-source={_EMPTY_TREE}", "status", "--porcelain=v1", "-z", "--no-renames",
                "--ignore-submodules=all", "--untracked-files=normal"],
-        timeout=_STATUS_TIMEOUT, max_bytes=_STATUS_MAX_BYTES)
+        timeout=_STATUS_TIMEOUT, max_bytes=_STATUS_MAX_BYTES, stop_at=stop_at)
     if rc == 0 or out_truncated:
         entries = sum(1 for e in out.split("\x00") if e)
         info = replace(info, dirty_count=min(entries, DIRTY_COUNT_CAP),
@@ -222,16 +233,25 @@ def _inspect_gitdir(info: RepoInfo) -> RepoInfo:
     return replace(info, usable=True)
 
 
-def discover_repos(folder: str | os.PathLike[str], *, max_depth: int = 2, max_entries: int = 2000,
-                   max_repos: int = 64, deadline_seconds: float = 300.0) -> WorkspaceScan:
-    """Find the repositories under FOLDER (see the module docstring for what is and is not touched)."""
+@dataclass(frozen=True, slots=True)
+class _Walk:
+    root: str
+    root_is_repo: bool
+    candidates: tuple[str, ...]
+    skipped: tuple[Skipped, ...]
+    entries_seen: int
+    truncated: bool
+    depth_limited: bool
+    ignored_dirs: int
+
+
+def _walk(folder: str | os.PathLike[str], max_depth: int, max_entries: int, max_repos: int) -> _Walk:
+    """The names-only part of discovery: no git call, no file opened."""
     root = check_folder(folder)
     if max_depth < 1 or max_entries < 1 or max_repos < 1:
         raise ValueError("max_depth, max_entries and max_repos must be >= 1")
     if _repo_marker(root) is not None:
-        info = replace(inspect_repo(root), rel=".")
-        return WorkspaceScan(root=root, root_is_repo=True, repos=(info,), skipped=(), entries_seen=0,
-                             truncated=False, depth_limited=False, ignored_dirs=0)
+        return _Walk(root, True, (root,), (), 0, False, False, 0)
     candidates: list[str] = []
     skipped: list[Skipped] = []
     seen = 0
@@ -283,20 +303,49 @@ def discover_repos(folder: str | os.PathLike[str], *, max_depth: int = 2, max_en
             else:
                 depth_limited = True
         stack.extend((d, depth + 1) for d in reversed(subdirs))
-    repos: list[RepoInfo] = []
+    return _Walk(root, False, tuple(sorted(candidates)), tuple(skipped), seen, truncated, depth_limited, ignored)
+
+
+def _scan(walk: _Walk, wanted, deadline_seconds: float) -> WorkspaceScan:
     stop_at = time.monotonic() + deadline_seconds
-    for c in sorted(candidates):
-        if time.monotonic() >= stop_at:  # overall bound: each repo's queries are bounded on their own too
-            skipped.append(Skipped(c, "not inspected: scan time limit reached"))
-            truncated = True
+    repos: list[RepoInfo] = []
+    skipped = list(walk.skipped)
+    truncated = walk.truncated
+    for c in walk.candidates:
+        rel = "." if walk.root_is_repo else os.path.relpath(c, walk.root)
+        if not wanted(rel, c):
             continue
         try:
-            repos.append(replace(inspect_repo(c), rel=os.path.relpath(c, root)))
+            info = replace(inspect_repo(c, stop_at=stop_at), rel=rel)
         except ValueError as exc:
             skipped.append(Skipped(c, str(exc)))
-    return WorkspaceScan(root=root, root_is_repo=False, repos=tuple(repos), skipped=tuple(skipped),
-                         entries_seen=seen, truncated=truncated, depth_limited=depth_limited,
-                         ignored_dirs=ignored)
+            continue
+        truncated = truncated or info.reason.endswith("scan time limit reached")
+        repos.append(info)
+    return WorkspaceScan(root=walk.root, root_is_repo=walk.root_is_repo, repos=tuple(repos),
+                         skipped=tuple(skipped), entries_seen=walk.entries_seen, truncated=truncated,
+                         depth_limited=walk.depth_limited, ignored_dirs=walk.ignored_dirs)
+
+
+def discover_repos(folder: str | os.PathLike[str], *, max_depth: int = 2, max_entries: int = 2000,
+                   max_repos: int = 64, deadline_seconds: float = 300.0) -> WorkspaceScan:
+    """Find and inspect the repositories under FOLDER (see the module docstring for what is touched).
+    DEADLINE_SECONDS bounds all git queries together: every call is cut to the remaining time, except the
+    unsafe-config check, which keeps its own 60 s timeout; repositories not reached are reported."""
+    return _scan(_walk(folder, max_depth, max_entries, max_repos), lambda rel, path: True, deadline_seconds)
+
+
+def pick_repos(folder: str | os.PathLike[str], names: Iterable[str], *, max_depth: int = 2,
+               max_entries: int = 2000, max_repos: int = 64, deadline_seconds: float = 300.0) -> list[RepoInfo]:
+    """Registration path: walk FOLDER by names only, run git queries ONLY on the repositories named, then
+    apply ``select_repos`` (refuses unknown, outside-the-folder and unusable entries)."""
+    names = list(names)
+    walk = _walk(folder, max_depth, max_entries, max_repos)
+    keys = set()
+    for raw in names:
+        if isinstance(raw, str) and raw and not has_control_chars(raw):
+            keys.add(os.path.normpath(raw))
+    return select_repos(_scan(walk, lambda rel, path: rel in keys or path in keys, deadline_seconds), names)
 
 
 def _symlink_reason(path: str) -> str | None:
