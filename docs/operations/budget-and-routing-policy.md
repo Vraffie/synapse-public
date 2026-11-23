@@ -1,8 +1,9 @@
-# Budget and routing policy (pure modules; budget wired at claim time, routing not wired)
+# Budget and routing policy (pure modules; budget wired at claim time, routing wired as a dry-run log)
 
 Two small, pure modules for M5.2 (budgets) and M5.5 (routing). Neither touches the database, the
-clock, a provider or the engine; a later change wires them in. Nothing in the running system calls
-them today.
+clock, a provider or the engine. The budget check is wired at claim time (ADR 020); routing is wired
+only as a **dry-run log** (see [Routing dry-run log](#routing-dry-run-log)): nothing acts on a routing
+decision.
 
 - `synapse.application.budget_policy`
 - `synapse.application.routing_policy`
@@ -100,6 +101,11 @@ claim (retry next tick) while any attempt in it is unresolved. A denial leaves n
 `ready -> blocked`, and writes a `budget.exceeded` event and a `budget.denied` audit row with reason
 `budget_exceeded` or `usage_unknown`. Nothing is downgraded or retried.
 
+That is the mock engine's behaviour. The agent engine (real-provider runs) fails a task refused for a breach
+(`budget_exceeded`) instead of blocking it, blocks with `budget_check_failed` when the budget cannot be read,
+records usage in the attempt's terminal transaction, and logs the policy version per attempt: see
+`budget-enforcement.md`.
+
 Approval-gated steps are checked twice, because an approved step is a real provider run:
 
 - **At park**: `ApprovalGateCoordinator.park` passes the same check into its claim. A denial rolls the park
@@ -123,7 +129,8 @@ Approval-gated steps are checked twice, because an approved step is a real provi
 
 ## Not implemented
 
-- Wiring (beyond the claim-time budget check above): nothing rechecks at spawn, and nothing routes a task. The
+- Wiring (beyond the claim-time budget check above): nothing rechecks at spawn (see `budget-enforcement.md`
+  for why the agent engine does not need to), and nothing routes a task. The
   intended points are the scheduler's claim step (budget) and spawn-time profile/model choice (routing).
 - Persisting policies or decisions (no table, no event), operator config for them, an API or CLI.
 - Mid-run enforcement: a provider reports usage only when it ends, so a running attempt is bounded by
@@ -131,3 +138,39 @@ Approval-gated steps are checked twice, because an approved step is a real provi
 - Per-model pricing sources; `estimate_savings` only uses a table the caller supplies.
 - An LLM judge, intentionally. A judge call costs tokens, needs its own budget and is hard to test;
   revisit only if dry-run logs show these rules are not enough.
+
+## Routing dry-run log
+
+**On by default.** `AgentWorkflowEngine(routing_dry_run=RoutingDryRunConfig())` is the default, so every attempt does one extra
+write transaction (`BEGIN IMMEDIATE`: one `optimization_decisions` row, one event, one outbox row) just before the spawn.
+Pass `routing_dry_run=None` to turn it off (tested: nothing is written). A failure of the log is logged and never
+affects the attempt.
+
+`synapse.application.routing_dry_run` (M5.5 wiring). `AgentWorkflowEngine` calls it once per attempt, just
+before the provider is started, and records what `decide` would pick. **It never applies anything**: `dry_run`
+is fixed to True, the record says `applied: false`, and the engine's profile, model and tools are unchanged.
+Pass `routing_dry_run=None` to the engine to turn the log off; a failure to log is logged and never affects
+the run.
+
+Each attempt gets one `optimization_decisions` row (`decision_json`: kind `routing`, policy version, the
+sanitised inputs and their hash, tier, baseline tier, confidence, rules fired, protected flag, estimate) and
+one `optimization.decision_recorded` event with the same decision (no prompt text, tool inputs or paths;
+only counts, hashes and rule names) in the same transaction. No migration: both tables exist since 0001.
+
+- **What the engine knows.** From the task spec: prompt size and whether an approval gate exists. Role, task
+  kind and file count are not in the spec, so they are recorded as unknown (`null`) and no size/kind rule can
+  fire. The review flag is unknown too, so every attempt is `protected` and the log can show upgrades but not
+  downgrades until those signals exist. Reviews and gated steps are never downgraded in any case.
+- **Retry number.** `attempt_no - 1`, minus one more for a gated task, whose first attempt is the approval wait.
+- **Cost difference is an ESTIMATE.** It uses `estimate_savings` with operator-supplied `pricing` and
+  `expected_input_tokens` / `expected_output_tokens` (`RoutingDryRunConfig`). Without them, or without a valid
+  price for the baseline or chosen tier, `estimate.status` is `unknown` and `estimated_usd` is `null`, never 0.
+  An unchanged tier is an estimated `0.0`. The estimate is stored only in the decision row, labelled, and never
+  in `usage_observations` or the event payload (only its status), so it cannot be added to measured usage.
+- **Config.** `RoutingDryRunConfig(policy_version, allowed_tiers, min_downgrade_confidence,
+  min_upgrade_confidence, pricing, expected_input_tokens, expected_output_tokens)`, validated strictly. The daemon
+  does not pass one yet, so the engine uses the defaults (all tiers, no prices, estimate unknown); supplying an
+  operator config means a small change in `daemon/agent_runtime.py`.
+- **Not done.** No LLM judge (only with data), no applying a decision, no `token_estimates` table or API view
+  (needs a migration, M5.7), and the data needed to judge the rules (kind, role, review flag per task) is not in
+  the spec yet.

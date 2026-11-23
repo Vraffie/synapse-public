@@ -67,6 +67,21 @@ def _load_token(state_dir: Path) -> str:
         os.close(directory)
 
 
+def _follow_fetch(state_dir: Path):
+    """``events --follow`` fetcher. A missing state dir or operator token is a configuration error, not a daemon
+    that is down: it raises FollowError (never retried), so only the socket itself is a transient failure."""
+    from synapse.cli.follow import FollowError
+
+    def fetch(endpoint: str) -> object:
+        try:
+            _load_token(state_dir)
+        except (OSError, ValueError) as exc:
+            raise FollowError(f"cannot use state directory {state_dir}: "
+                              f"{getattr(exc, 'strerror', None) or exc}") from None
+        return _request(state_dir, endpoint)
+    return fetch
+
+
 def _request(state_dir: Path, endpoint: str, *, body: bytes | None = None,
              idempotency_key: str | None = None, correlation_id: str | None = None,
              approver_token: str | None = None, plain_method: str | None = None) -> object:
@@ -135,6 +150,12 @@ def _read_workflow(path: Path, *, kind: str = "workflow") -> bytes:
 def _command_header(value: str) -> str:
     if _COMMAND_HEADER.fullmatch(value) is None:
         raise argparse.ArgumentTypeError("must be 1–256 printable non-space ASCII characters")
+    return value
+
+
+def _page_cursor(value: str) -> str:
+    if not 1 <= len(value) <= 1024:
+        raise argparse.ArgumentTypeError("must be 1-1024 characters (the previous next_cursor)")
     return value
 
 
@@ -474,12 +495,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state-dir", type=Path, required=True, help="private daemon state directory")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("health", help="show daemon health")
-    events = commands.add_parser("events", help="replay one page of events")
-    events.add_argument("--after", type=_integer(0, _MAX_SEQUENCE), default=0)
+    events = commands.add_parser("events", help="replay one page of events (--follow to tail them)")
+    events.add_argument("--after", type=_integer(0, _MAX_SEQUENCE), default=None)
     events.add_argument("--limit", type=_integer(1, 1000), default=100)
+    events.add_argument("--follow", action="store_true",
+                        help="keep reading, print one JSON event per line, resume from a saved cursor")
+    events.add_argument("--cursor-file", type=Path, default=None, help="cursor file (default: STATE_DIR/events.cursor)")
+    events.add_argument("--interval", type=float, default=1.0, help="seconds between polls when idle (--follow)")
+    events.add_argument("--stop-when-idle", action="store_true", help="with --follow: exit once caught up")
     for command in ("run", "tasks", "usage"):
-        query = commands.add_parser(command, help=f"show run {command} details")
+        query = commands.add_parser(command, help=f"show run {command} details" + (
+            "" if command == "run" else " (one page; follow next_cursor with --cursor)"))
         query.add_argument("run_id", help="run identifier")
+        if command != "run":
+            query.add_argument("--limit", type=_integer(1, 500), default=200)
+            query.add_argument("--cursor", type=_page_cursor, help="opaque next_cursor from the previous page")
     threads = commands.add_parser("threads", help="list one page of run threads")
     threads.add_argument("run_id", help="run identifier")
     messages = commands.add_parser("messages", help="list one page of thread messages")
@@ -566,7 +596,8 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("run ID must be a nonempty path segment up to 256 characters")
         endpoint = "/api/v1/runs/" + quote(args.run_id, safe="")
         if args.command in ("tasks", "usage"):
-            endpoint += "/" + args.command
+            endpoint += "/" + args.command + "?" + urlencode(
+                {"limit": args.limit, **({"cursor": args.cursor} if args.cursor is not None else {})})
         elif args.command in ("mock-start", "mock-cancel", "mock-resume"):
             endpoint += "/" + args.command
         elif args.command in ("threads", "messages"):
@@ -593,7 +624,18 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("approval cursor must be at most 256 characters")
         endpoint = "/api/v1/approvals?" + urlencode({"after": args.after, "limit": args.limit})
     elif args.command == "events":
-        endpoint = "/api/v1/events?" + urlencode({"after": args.after, "limit": args.limit})
+        if args.follow:
+            from synapse.cli.follow import CURSOR_NAME, follow_events
+            if not 0.05 <= args.interval <= 60:
+                parser.error("--interval must be between 0.05 and 60 seconds")
+            default_cursor = args.state_dir / CURSOR_NAME
+            cursor_file = args.cursor_file or default_cursor
+            return follow_events(_follow_fetch(args.state_dir), cursor_file=cursor_file,
+                                 # only a file other than the default one may be rewound by --after
+                                 cursor_file_explicit=cursor_file.resolve() != default_cursor.resolve(),
+                                 after=args.after,
+                                 limit=args.limit, interval=args.interval, stop_when_idle=args.stop_when_idle)
+        endpoint = "/api/v1/events?" + urlencode({"after": args.after or 0, "limit": args.limit})
     else:
         endpoint = "/api/v1/system/health"
     try:
@@ -638,6 +680,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"agentctl: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     print(json.dumps(result, ensure_ascii=False))
+    if args.command in ("tasks", "usage") and isinstance(result, dict) and result.get("next_cursor") is not None:
+        # stdout stays one JSON document; the hint that more pages exist goes to stderr so it is never missed.
+        cursor = result["next_cursor"]
+        shown = cursor if isinstance(cursor, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,1024}", cursor) else "(invalid)"
+        print(f"agentctl: more {args.command} exist; next page: --cursor {shown}", file=sys.stderr)
     return 0
 
 

@@ -10,9 +10,7 @@ pkgrel=1
 pkgdesc='Local-first multi-agent orchestration daemon, operator CLI and desktop shell'
 arch=(any)
 url='https://github.com/Vraffie/synapse-public'
-# No software license has been selected yet (README, "Status and licensing"). This package is for
-# local use only; do not redistribute until a license is chosen.
-license=(LicenseRef-unlicensed)
+license=(MIT)
 depends=(python python-fastapi python-pydantic uvicorn python-websockets)
 makedepends=(python-build python-installer python-setuptools python-wheel)
 # python-mcp is deliberately NOT listed: pyproject pins mcp>=1.20,<2 (extras "mcp"/"test"), Arch ships mcp 2.x and the MCP gateway

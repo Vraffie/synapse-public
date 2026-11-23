@@ -5,7 +5,9 @@ not independently measured**, and **unknown is never stored or shown as zero**.
 
 ## What is recorded
 
-For every real agent attempt whose provider result carried usable usage, the engine writes, in one transaction:
+For every real agent attempt whose provider result carried usable usage, the engine writes, in the same
+transaction that records the attempt's terminal state (under a savepoint, so a failed usage write is logged and
+rolled back alone; see `budget-enforcement.md` for why the budget check needs this):
 
 - an `agent.usage_observed` event (payload: `task_id`, `input_tokens`, `output_tokens`, `cache_read_tokens`,
   `cache_write_tokens`, `cost_usd`, `source`), plus its outbox row, and
@@ -37,8 +39,11 @@ should not be presented as spend. Quota is not recorded (it stays unknown; no re
 
 ## Reading it
 
-`GET /api/v1/runs/{run_id}/usage` (operator Bearer) or `agentctl usage RUN`; 404 for an unknown run. One SQLite
-read snapshot:
+`GET /api/v1/runs/{run_id}/usage` (operator Bearer) or `agentctl usage RUN [--limit N] [--cursor C]`; 404 for an
+unknown run. One SQLite read snapshot per request. `observations` is one page (`limit` 1-500, default 200, ordered
+by `(observed_at, id)`; follow `next_cursor` until it is null), while `totals`, `coverage`, `attempts_total` and
+`attempts_with_usage` are computed over the whole run on every page, so they do not change from page to page unless
+new usage is recorded in between:
 
 ```json
 {"run_id": "...", "attempts_total": 3, "attempts_with_usage": 2,
@@ -49,11 +54,12 @@ read snapshot:
             "cost_usd": 0.0131914},
  "coverage": {"input_tokens": {"known": 2, "attempts": 3}, "output_tokens": {"known": 2, "attempts": 3},
               "cache_read_tokens": {"known": 1, "attempts": 3}, "cache_write_tokens": {"known": 1, "attempts": 3},
-              "cost_usd": {"known": 1, "attempts": 3}}}
+              "cost_usd": {"known": 1, "attempts": 3}},
+ "next_cursor": null}
 ```
 
 - A field an observation did not report is `null` in that observation.
-- A total sums only the known values; if no observation knows a field, that total is `null`, not `0`.
+- A total sums only the known values; if no observation knows a field, that total is `null`, not `0`. Token totals are exact integers (no 64-bit overflow, summed in Python rather than SQLite `SUM()`); the cost total is `math.fsum` of the known costs, correctly rounded and independent of row order or SQLite version.
 - **Coverage is per field.** `coverage.<field>.known` is the number of attempts that reported that field and
   `coverage.<field>.attempts` the run's attempt count (attempts that crashed, ended `unknown` or carried no usage
   count in `attempts` and contribute nothing). A total is a **lower bound exactly when `known < attempts`** for

@@ -196,7 +196,10 @@ def test_estimate_is_unknown_not_zero_without_valid_prices():
                     {"fast": {"input_per_mtok": float("nan"), "output_per_mtok": 1}, "balanced": PRICES["balanced"]}, None):
         assert estimate_savings(d, pricing, expected_input_tokens=10, expected_output_tokens=10).estimated_usd is None
     same = route()
-    assert estimate_savings(same, {}, expected_input_tokens=1, expected_output_tokens=1).estimated_usd == 0.0
+    # An unchanged tier is a zero saving only when the baseline price is known; otherwise it is unknown.
+    for pricing in ({}, None, {"balanced": {"input_per_mtok": "x", "output_per_mtok": 1}}):
+        assert estimate_savings(same, pricing, expected_input_tokens=1, expected_output_tokens=1).estimated_usd is None
+    assert estimate_savings(same, PRICES, expected_input_tokens=1, expected_output_tokens=1).estimated_usd == 0.0
 
 
 @pytest.mark.parametrize("bad", [-1, True, 1.5, "1"])

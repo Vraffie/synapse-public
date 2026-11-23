@@ -221,7 +221,8 @@ def estimate_savings(decision: RoutingDecision, pricing: Mapping[str, Any], *, e
             raise ValueError(f"{what} must be a non-negative integer")
     basis = {"expected_input_tokens": expected_input_tokens, "expected_output_tokens": expected_output_tokens}
     if decision.tier == decision.baseline_tier:
-        return SavingsEstimate(ESTIMATE_LABEL, decision.baseline_tier, decision.tier, 0.0, basis)
+        known = _price(pricing, decision.baseline_tier) is not None  # no price means unknown, not a measured zero
+        return SavingsEstimate(ESTIMATE_LABEL, decision.baseline_tier, decision.tier, 0.0 if known else None, basis)
     base, chosen = _price(pricing, decision.baseline_tier), _price(pricing, decision.tier)
     if base is None or chosen is None:
         return SavingsEstimate(ESTIMATE_LABEL, decision.baseline_tier, decision.tier, None, basis)

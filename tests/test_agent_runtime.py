@@ -1152,3 +1152,100 @@ def test_a_worktree_head_is_lowercased_and_an_invalid_one_becomes_unknown_not_a_
     assert _manifest_head("A" * 40) == "a" * 40 and _manifest_head("ab12" * 10) == "ab12" * 10
     for bad in ("g" * 40, "a" * 39, "a" * 41, "", None, 7, "A" * 39 + "Z"):
         assert _manifest_head(bad) is None
+
+
+def test_attempt_logs_a_dry_run_routing_decision_without_changing_the_run(env):
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(prompt="ok"))
+        await finish(env)
+    asyncio.run(go())
+    assert env.states() == ("succeeded", {"work": "completed"}) and env.spawns() == ["ok"]
+    ((doc,),) = env.db.execute("SELECT decision_json FROM optimization_decisions").fetchall()
+    record = json.loads(doc)
+    assert record["dry_run"] is True and record["applied"] is False
+    assert record["inputs"]["is_review"] is None and record["decision"]["protected"] is True  # unknown review flag
+    assert record["decision"]["downgraded_from"] is None and record["inputs"]["has_approval_gate"] is False
+    assert env.db.execute("SELECT count(*) FROM events WHERE type='optimization.decision_recorded'").fetchone()[0] == 1
+
+
+def test_routing_log_failure_or_disabled_does_not_affect_the_attempt(env, monkeypatch):
+    import synapse.orchestration.agent_engine as ae
+    def boom(*a, **k):
+        raise RuntimeError("no")
+    monkeypatch.setattr(ae, "record_routing", boom)
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(prompt="ok"))
+        await finish(env)
+    asyncio.run(go())
+    assert env.states() == ("succeeded", {"work": "completed"})
+    assert env.db.execute("SELECT count(*) FROM optimization_decisions").fetchone()[0] == 0
+
+
+def test_routing_log_failure_after_the_event_insert_rolls_the_whole_write_back(env):
+    # The failure is real SQL inside the same transaction: the event and outbox rows are already
+    # inserted when the decision insert aborts, so only a rollback leaves nothing behind.
+    env.db.execute("CREATE TEMP TRIGGER fail_decision BEFORE INSERT ON optimization_decisions "
+                   "BEGIN SELECT RAISE(ABORT, 'decision insert failed'); END")
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(prompt="ok"))
+        await finish(env)
+    asyncio.run(go())
+    assert env.states() == ("succeeded", {"work": "completed"}) and env.spawns() == ["ok"]
+    assert env.db.execute("SELECT count(*) FROM events WHERE type='optimization.decision_recorded'").fetchone()[0] == 0
+    assert env.db.execute("SELECT count(*) FROM outbox o JOIN events e ON e.id=o.event_id WHERE e.type='optimization.decision_recorded'").fetchone()[0] == 0
+    assert env.db.execute("SELECT count(*) FROM optimization_decisions").fetchone()[0] == 0
+    assert not env.db.in_transaction
+
+
+def test_audit_logs_are_written_after_the_provider_has_run_not_before_the_spawn(env, monkeypatch):
+    import synapse.orchestration.agent_engine as ae
+    seen = {}
+    for name in ("_record_manifest", "_record_routing"):
+        def wrap(self, *a, _orig=getattr(ae.AgentWorkflowEngine, name), _name=name, **k):
+            seen[_name] = env.spawns()  # the fake CLI logs its mode when it starts
+            return _orig(self, *a, **k)
+        monkeypatch.setattr(ae.AgentWorkflowEngine, name, wrap)
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(prompt="ok"))
+        await finish(env)
+    asyncio.run(go())
+    assert seen == {"_record_manifest": ["ok"], "_record_routing": ["ok"]}
+    assert env.states() == ("succeeded", {"work": "completed"})
+    assert env.db.execute("SELECT count(*) FROM context_manifests").fetchone()[0] == 1
+    assert env.db.execute("SELECT count(*) FROM optimization_decisions").fetchone()[0] == 1
+
+
+def test_audit_log_writes_give_up_quickly_when_the_database_is_write_locked(env):
+    import sqlite3
+    import time
+    from synapse.application.routing_dry_run import RoutingDryRunConfig
+    from synapse.orchestration.agent_engine import AgentWorkflowEngine
+    engine = object.__new__(AgentWorkflowEngine)
+    engine.db, engine._routing_dry_run = env.db, RoutingDryRunConfig()
+    spec = {"prompt_artifact_id": "a", "prompt_sha256": "0" * 64, "prompt_bytes": 1}
+    other = sqlite3.connect(env.path, isolation_level=None)
+    other.execute("BEGIN IMMEDIATE")
+    try:
+        t0 = time.monotonic()
+        engine._record_manifest(env.run_id, "t", "att", spec)
+        engine._record_routing(env.run_id, "t", "att", spec, 1)
+        elapsed = time.monotonic() - t0
+    finally:
+        other.execute("ROLLBACK")
+        other.close()
+    assert elapsed < 1.0, elapsed  # was 2 x busy_timeout (5 s each) before
+    assert env.db.execute("PRAGMA busy_timeout").fetchone()[0] == 5000 and not env.db.in_transaction
+    assert env.db.execute("SELECT count(*) FROM optimization_decisions").fetchone()[0] == 0
+
+
+def test_routing_dry_run_none_disables_the_log_and_writes_nothing(env, monkeypatch):
+    import functools
+    import synapse.daemon.agent_runtime as ar
+    monkeypatch.setattr(ar, "AgentWorkflowEngine", functools.partial(ar.AgentWorkflowEngine, routing_dry_run=None))
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(prompt="ok"))
+        await finish(env)
+    asyncio.run(go())
+    assert env.states() == ("succeeded", {"work": "completed"}) and env.spawns() == ["ok"]
+    assert env.db.execute("SELECT count(*) FROM optimization_decisions").fetchone()[0] == 0
+    assert env.db.execute("SELECT count(*) FROM events WHERE type='optimization.decision_recorded'").fetchone()[0] == 0

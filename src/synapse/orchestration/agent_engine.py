@@ -14,11 +14,16 @@ differences, all deliberately conservative:
   of it (every unique failure kept, see ``application.output_reducer``) plus
   tool names only, stored as a second artifact; usage is recorded as an event.
   Reduction affects only what is forwarded; the outcome and the verifier never
-  depend on it, so mandatory checks cannot be reduced away.
+  depend on it, so mandatory checks cannot be reduced away;
+* with an operator budget policy bound to the run, a budget breach before
+  scheduling fails the task with the distinct reason ``budget_exceeded`` and is
+  never retried; unknown usage or an unreadable budget blocks it instead
+  (``orchestration.budget_enforcement``, docs/operations/budget-enforcement.md).
 """
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 import hashlib
@@ -32,14 +37,17 @@ from synapse.application.context_manifest import ManifestEntry, build_manifest, 
 from synapse.domain.contracts import EventEnvelope, encode_payload, new_id
 from synapse.domain.runs import RunChange, RunState
 from synapse.application.output_reducer import reduce_output
+from synapse.application.routing_dry_run import RoutingDryRunConfig, record_routing, routing_record
+from synapse.application.routing_policy import RoutingInput
 from synapse.domain.workflow import State
 from synapse.infrastructure.artifact_blobs import ArtifactBlobStore
 from synapse.orchestration.mock_engine import MockWorkflowEngine, _RunInterrupted
-from synapse.persistence.budget_binding import check_claim_budget
+from synapse.orchestration.budget_enforcement import agent_budget_check, bound_policy_identity, write_budget_refusal
 from synapse.persistence.agent_tasks import spec_hash
 from synapse.persistence.artifact_store import publish_artifact
 from synapse.persistence.mock_execution_store import record_verification, set_attempt
 from synapse.persistence.run_store import write_run_transition
+from synapse.persistence.state_store import StateConflict
 from synapse.providers.claude_cli import ClaudeCliProfile, ClaudeCliProvider
 from synapse.providers.codex_cli import VERIFIED_CLI_VERSIONS, CodexCliProfile, sandbox_for_task
 from synapse.providers.contracts import ExecutionRequest, ProviderAdapter, ProviderEvent, UsageObservation
@@ -55,6 +63,7 @@ MAX_SUMMARY_JSON_BYTES = 48 * 1024
 _CLIP_MARKER = "\n[clipped: output continues in the raw artifact]\n"
 MAX_TOOL_NAMES = 100
 _PROVIDER_OUTPUT_CAP = 4 * 1024 * 1024
+_LOG_LOCK_WAIT_MS = 100  # audit-only writes (manifest, routing dry run) wait this long for the write lock
 RAW_OUTPUT_KIND = "agent_raw_output"
 _ATTEMPT_STATE = {"succeeded": "completed", "failed": "failed", "timed_out": "failed",
                   "cancelled": "cancelled", "unknown": "unknown"}
@@ -223,7 +232,10 @@ class AgentWorkflowEngine(MockWorkflowEngine):
     _profile_provider = "claude"
     _profile_limits_check = None  # set per instance; None keeps the pre-limits behaviour
     _principal = "agent-engine"
-    _budget_check = staticmethod(check_claim_budget)  # unbudgeted unless the run has a bound policy (ADR 020)
+    # Unbudgeted unless the run has a bound policy (ADR 020); fails closed if the budget cannot be read. A breach
+    # (budget_exceeded) fails the task; usage_unknown / budget_check_failed block it. See budget_enforcement.
+    _budget_check = staticmethod(agent_budget_check)
+    _budget_block_writer = staticmethod(write_budget_refusal)
 
     def __init__(self, connection: sqlite3.Connection, router: AgentProviderRouter,
                  blobs: ArtifactBlobStore, specs: Mapping[str, Mapping[str, Any]],
@@ -233,7 +245,8 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                  worktree_check: Callable[[str, str, str], tuple[str, bool]] | None = None,
                  profile_check: Callable[[str], str | None] | None = None,
                  profile_limits_check: Callable[[Mapping[str, Any]], str | None] | None = None,
-                 raw_blobs: ArtifactBlobStore | None = None):
+                 raw_blobs: ArtifactBlobStore | None = None,
+                 routing_dry_run: RoutingDryRunConfig | None = RoutingDryRunConfig()):
         # max_attempts=2: a gated task spends one attempt on the approval wait.
         super().__init__(connection, router, blobs, verify, verifier_id=verifier_id,
                          max_concurrency=max_concurrency, max_attempts=2, approval_requester=approval_requester)
@@ -243,6 +256,7 @@ class AgentWorkflowEngine(MockWorkflowEngine):
         # spec -> refusal reason or None: the recorded tools, mode and timeout must still fit the named profile
         self._profile_limits_check = profile_limits_check
         # Raw provider output may exceed the summary blob bound; same directory, larger limit.
+        self._routing_dry_run = routing_dry_run  # None disables the log; it never changes what runs
         self.raw_blobs = raw_blobs if raw_blobs is not None else blobs.with_max_bytes(_PROVIDER_OUTPUT_CAP)
 
     def _profile_for(self, run_id: str, task_id: str, default_profile_id: str) -> str:
@@ -317,6 +331,18 @@ class AgentWorkflowEngine(MockWorkflowEngine):
     def _retryable(self, attempt_count: int) -> bool:
         return False
 
+    def _block_for_budget(self, run_id: str, task_id: str, version: int, profile_id: str, denied) -> None:
+        """A budget refusal at claim or park: a breach fails the READY task, other reasons block it; nothing is
+        retried (``budget_enforcement.write_budget_refusal``). A lost race leaves it READY for the next pass."""
+        try:
+            with self._transaction():
+                self._check_running(run_id)
+                self._budget_block_writer(self.db, principal=self._principal, run_id=run_id, task_id=task_id,
+                                          version=version, before=State.READY, profile_id=profile_id, denied=denied,
+                                          max_running=self.max_concurrency)
+        except StateConflict:
+            pass
+
     async def run(self, run_id: str, profile_id: str, scenarios, approval_steps=None) -> str:
         outcome = await super().run(run_id, profile_id, scenarios, approval_steps)
         if outcome == "blocked" and not self._halt and self._finish_stranded(run_id):
@@ -363,21 +389,27 @@ class AgentWorkflowEngine(MockWorkflowEngine):
         return True
 
     def _usage_event(self, run_id: str, task_id: str, attempt_id: str, usage: UsageObservation, profile_id: str) -> None:
-        """Record provider-reported usage: the event and the append-only ledger row commit together.
+        """Record provider-reported usage inside the caller's transaction, the one that makes the attempt terminal.
 
+        The event and the append-only ledger row commit together with the terminal attempt state, so a budget
+        check never sees a finished attempt whose usage is still on its way (it would read as unknown). The write
+        runs under a savepoint: if it fails it is logged and rolled back alone, never the attempt's outcome.
         Nothing is recorded when the provider reported nothing usable (unknown is never stored as 0).
         ``confidence='reported'``: provider-reported, not independently measured.
         """
+        if not self.db.in_transaction:
+            raise RuntimeError("usage is recorded in the attempt's terminal transaction")
         known = (usage.input_tokens, usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens, usage.cost_usd)
         if all(v is None for v in known):
             return
-        event = EventEnvelope.create(aggregate_type="task_attempt", aggregate_id=attempt_id,
-            event_type="agent.usage_observed",
-            payload={"task_id": task_id, "input_tokens": usage.input_tokens,
-                     "output_tokens": usage.output_tokens, "cache_read_tokens": usage.cache_read_tokens,
-                     "cache_write_tokens": usage.cache_write_tokens, "cost_usd": usage.cost_usd,
-                     "source": usage.source})
-        with self._transaction():
+        self.db.execute("SAVEPOINT usage_record")
+        try:
+            event = EventEnvelope.create(aggregate_type="task_attempt", aggregate_id=attempt_id,
+                event_type="agent.usage_observed",
+                payload={"task_id": task_id, "input_tokens": usage.input_tokens,
+                         "output_tokens": usage.output_tokens, "cache_read_tokens": usage.cache_read_tokens,
+                         "cache_write_tokens": usage.cache_write_tokens, "cost_usd": usage.cost_usd,
+                         "source": usage.source})
             self.db.execute("INSERT INTO events(id,aggregate_type,aggregate_id,run_id,type,schema_version,payload_json,occurred_at) VALUES(?,?,?,?,?,?,?,?)",
                             (event.id, event.aggregate_type, attempt_id, run_id, event.event_type, event.schema_version,
                              encode_payload(event.payload), event.occurred_at))
@@ -388,6 +420,12 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                             (new_id(), attempt_id, profile_id, usage.source, usage.input_tokens, usage.output_tokens,
                              usage.cache_read_tokens, usage.cache_write_tokens, usage.cost_usd, "reported",
                              event.occurred_at, event.id))
+        except Exception:
+            self.db.execute("ROLLBACK TO SAVEPOINT usage_record")
+            self.db.execute("RELEASE SAVEPOINT usage_record")
+            _LOG.exception("Could not record usage for task %s", task_id)
+            return
+        self.db.execute("RELEASE SAVEPOINT usage_record")
 
     def _publish_summary(self, run_id: str, task_id: str, attempt_id: str, summary: dict) -> tuple[str, dict]:
         artifact_id = new_id()
@@ -427,6 +465,18 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                 "reduction": {"rules": list(reduced.rules_applied), "dropped_lines": reduced.dropped_lines,
                               "kept_failures": len(reduced.kept_failures), "over_budget": reduced.over_budget}}
 
+    @contextlib.contextmanager
+    def _best_effort_transaction(self):
+        """A transaction for audit-only writes: waits at most ``_LOG_LOCK_WAIT_MS`` for the write lock,
+        so a busy database costs a lost log row, not seconds of a blocked event loop."""
+        previous = self.db.execute("PRAGMA busy_timeout").fetchone()[0]
+        self.db.execute(f"PRAGMA busy_timeout={_LOG_LOCK_WAIT_MS}")
+        try:
+            with self._transaction():
+                yield
+        finally:
+            self.db.execute(f"PRAGMA busy_timeout={int(previous)}")
+
     def _record_manifest(self, run_id: str, task_id: str, attempt_id: str, spec: Mapping[str, Any]) -> None:
         """Record (never act on) the daemon-owned context for this attempt (ADR 017 D5, record only).
 
@@ -439,10 +489,51 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                        ManifestEntry("artifact", str(spec["prompt_artifact_id"]), spec["prompt_sha256"], spec.get("prompt_bytes"))]
             manifest = build_manifest(task_id, repo_head=_manifest_head(head),
                                       worktree_clean=None, entries=entries)
-            with self._transaction():
+            with self._best_effort_transaction():
                 record_manifest(self.db, run_id=run_id, attempt_id=attempt_id, manifest=manifest)
         except Exception:
             _LOG.exception("Could not record the context manifest for task %s", task_id)
+
+    def _record_routing(self, run_id: str, task_id: str, attempt_id: str, spec: Mapping[str, Any], attempt_no: int) -> None:
+        """Log what the routing rules would pick for this attempt (M5.5, dry run; nothing is applied).
+
+        Unknown signals stay unknown: the spec carries no role, task kind or file count, so
+        ``is_review`` is unknown and the attempt counts as protected (it can never be downgraded).
+        A gated task spends its first attempt on the approval wait, so that attempt is not a retry.
+        A failure is logged and never affects the run.
+        """
+        if self._routing_dry_run is None:
+            return
+        try:
+            gated = spec.get("approval_step") is not None
+            record = routing_record(self._routing_dry_run, RoutingInput(
+                prompt_bytes=spec.get("prompt_bytes"), has_approval_gate=gated,
+                retry_no=max(0, attempt_no - 1 - (1 if gated else 0))))
+            with self._best_effort_transaction():
+                record_routing(self.db, run_id=run_id, attempt_id=attempt_id, record=record)
+        except Exception:
+            _LOG.exception("Could not record the routing dry run for task %s", task_id)
+
+    def _record_budget(self, run_id: str, task_id: str, attempt_id: str) -> None:
+        """Record which bound budget policy version this spawned attempt ran under (M5.2, record only).
+
+        Nothing is written for an unbudgeted run. The decision itself was taken (fail closed) at claim time;
+        a failure here is logged and never affects the run.
+        """
+        try:
+            identity = bound_policy_identity(self.db, run_id)
+            if identity is None:
+                return
+            event = EventEnvelope.create(
+                aggregate_type="task_attempt", aggregate_id=attempt_id, event_type="budget.policy_applied",
+                payload={"task_id": task_id, "policy_version": identity[0], "policy_sha256": identity[1]})
+            with self._best_effort_transaction():
+                self.db.execute("INSERT INTO events(id,aggregate_type,aggregate_id,run_id,type,schema_version,payload_json,occurred_at) VALUES(?,?,?,?,?,?,?,?)",
+                                (event.id, event.aggregate_type, attempt_id, run_id, event.event_type, event.schema_version,
+                                 encode_payload(event.payload), event.occurred_at))
+                self.db.execute("INSERT INTO outbox(event_id) VALUES(?)", (event.id,))
+        except Exception:
+            _LOG.exception("Could not record the budget policy version for task %s", task_id)
 
     async def _execute(self, run_id: str, task_id: str, attempt_id: str, profile_id: str, scenario: str,
                        version: int, attempt_no: int) -> None:
@@ -495,7 +586,6 @@ class AgentWorkflowEngine(MockWorkflowEngine):
             if problem is not None:
                 terminal = ProviderEvent("failed", problem)  # refused before any spawn
             else:
-                self._record_manifest(run_id, task_id, attempt_id, spec)
                 request = ExecutionRequest(profile_id, task_id, {
                     "prompt": self._prompts(task_id).decode("utf-8"), "worktree": spec["worktree"],
                     "timeout_seconds": spec["timeout_seconds"], "max_output_bytes": _PROVIDER_OUTPUT_CAP})
@@ -508,6 +598,12 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                             task_id, "start_rejected"))
                     else:
                         raise
+                finally:
+                    # Audit logs never delay a spawn: written after the provider returns, from spec facts
+                    # fixed before the run, under a short lock wait (see _best_effort_transaction).
+                    self._record_manifest(run_id, task_id, attempt_id, spec)
+                    self._record_routing(run_id, task_id, attempt_id, spec, attempt_no)
+                    self._record_budget(run_id, task_id, attempt_id)
             if terminal is None:
                 terminal = ProviderEvent("unknown", "no_terminal_event")
             outcome, detail = terminal.kind, terminal.text
@@ -522,12 +618,16 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                 with self._transaction():
                     self._check_running(run_id)
                     set_attempt(self.db, attempt_id=attempt_id, before="running", after="unknown", run_id=run_id, task_id=task_id)
+                    if usage is not None:
+                        self._usage_event(run_id, task_id, attempt_id, usage, profile_id)
                     self._change(task_id, State.RUNNING, State.BLOCKED, version)
             else:
                 target = {"succeeded": State.VERIFYING, "cancelled": State.CANCELLED}.get(outcome, State.FAILED)
                 with self._transaction():
                     self._check_running(run_id)
                     set_attempt(self.db, attempt_id=attempt_id, before="running", after=_ATTEMPT_STATE[outcome], run_id=run_id, task_id=task_id)
+                    if usage is not None:
+                        self._usage_event(run_id, task_id, attempt_id, usage, profile_id)
                     self._change(task_id, State.RUNNING, target, version)
             try:
                 reduction = await self._store_raw_and_reduce(run_id, task_id, attempt_id, bytes(raw), raw_capped)
@@ -545,11 +645,6 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                        "tool_names": tools, "tool_use_count": tool_count,
                        "usage": None if usage is None else {"input_tokens": usage.input_tokens,
                                                             "output_tokens": usage.output_tokens, "source": usage.source}}
-            try:
-                if usage is not None:
-                    self._usage_event(run_id, task_id, attempt_id, usage, profile_id)
-            except Exception:
-                _LOG.exception("Could not record usage for task %s", task_id)
             if outcome != "succeeded":
                 try:
                     self._publish_summary(run_id, task_id, attempt_id, summary)

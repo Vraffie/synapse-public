@@ -68,7 +68,8 @@ RESPONSES = {
     ("/api/v1/events", "get"): (200, _page("events", EVENT)),
     ("/api/v1/runs", "get"): (200, _object({"runs": {"type": "array", "items": RUN_SUMMARY}, "next_cursor": _nullable()})),
     ("/api/v1/runs/{run_id}", "get"): (200, _object({"run": RUN, "mock_config": {"anyOf": [{"type": "null"}, _object({"fixture": STRING, "profile_id": STRING, "provider": _nullable()})]}, "tasks": {"type": "array", "items": TASK}, "dependencies": {"type": "array", "items": DEPENDENCY}, "last_sequence": INTEGER})),
-    ("/api/v1/runs/{run_id}/tasks", "get"): (200, _page("tasks", TASK_DETAIL)),
+    ("/api/v1/runs/{run_id}/tasks", "get"): (200, _object({"tasks": {"type": "array", "items": TASK_DETAIL},
+                                                           "next_cursor": _nullable()})),
     ("/api/v1/runs/{run_id}/usage", "get"): (200, _object({
         "run_id": STRING, "attempts_total": INTEGER, "attempts_with_usage": INTEGER,
         "observations": {"type": "array", "items": _object({
@@ -80,7 +81,8 @@ RESPONSES = {
                            "cache_read_tokens": _nullable("integer"), "cache_write_tokens": _nullable("integer"),
                            "cost_usd": _nullable("number")}),
         "coverage": _object({f: _object({"known": INTEGER, "attempts": INTEGER}) for f in (
-            "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "cost_usd")})})),
+            "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "cost_usd")}),
+        "next_cursor": _nullable()})),
     ("/api/v1/runs/{run_id}/threads", "get"): (200, _page("threads", THREAD)),
     ("/api/v1/runs/{run_id}/threads/{thread_id}/messages", "get"): (200, _page("messages", MESSAGE)),
     ("/api/v1/approvals", "get"): (200, _page("approvals", APPROVAL)),

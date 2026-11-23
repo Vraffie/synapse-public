@@ -55,7 +55,7 @@ def test_snapshot_without_tasks_or_config(conn):
     assert snap["tasks"] == [] and snap["dependencies"] == []
     assert snap["mock_config"] is None
     assert snap["last_sequence"] == 0
-    assert read_run_tasks(conn, "run") == {"tasks": []}
+    assert read_run_tasks(conn, "run") == {"tasks": [], "next_cursor": None}
 
 
 def test_snapshot_only_includes_requested_run_and_orders_tasks(conn):

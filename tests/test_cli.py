@@ -104,7 +104,7 @@ def test_invalid_cursor_rejected_before_connecting(state, arguments):
     assert error.value.code == 2
 
 
-@pytest.mark.parametrize("command,expected", [("run", b"/api/v1/runs/run%20one"), ("tasks", b"/api/v1/runs/run%20one/tasks")])
+@pytest.mark.parametrize("command,expected", [("run", b"/api/v1/runs/run%20one"), ("tasks", b"/api/v1/runs/run%20one/tasks?limit=200")])
 def test_run_queries_encode_path(state, capsys, command, expected):
     with daemon(state, b'{}') as received:
         assert main(["--state-dir", str(state), command, "run one"]) == 0
