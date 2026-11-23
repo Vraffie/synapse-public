@@ -224,6 +224,35 @@ def args_name(args: Iterable[str]) -> str:
     return "?"
 
 
+def refuse_unsafe_repo_config(repo: str, cwd: str | None = None) -> None:
+    """Refuse repo state that makes git run repo-chosen programs. Re-run before every git call
+    that touches a work tree (linked worktrees share this config with the agent's shell).
+    Shared with ``synapse.application.workspace`` so discovery applies the identical rule."""
+    _, out, _ = _git(cwd or repo, ["config", "--local", "--list", "-z"], max_bytes=1 << 20)
+    for entry in out.split("\x00"):
+        key, _, value = entry.partition("\n")
+        key = key.lower()
+        if _DANGEROUS_CONFIG.match(key):
+            raise WorktreeError(f"repository config {key!r} is not allowed")
+        if key == "core.fsmonitor" and value.strip().lower() not in ("false", "0", "no", "off"):
+            raise WorktreeError("repository config 'core.fsmonitor' is not allowed")
+        if key.startswith("alias.") and value.lstrip().startswith("!"):
+            raise WorktreeError(f"repository config {key!r} is not allowed")
+    if os.path.lexists(os.path.join(repo, ".git", "config.worktree")):
+        raise WorktreeError("repository config.worktree is not allowed")
+    info = os.path.join(repo, ".git", "info", "attributes")
+    if os.path.lexists(info):
+        try:
+            if os.path.islink(info):
+                raise WorktreeError("repository info/attributes is not allowed")
+            with open(info, "rb") as fh:
+                lines = fh.read(1 << 20).decode("utf-8", "replace").splitlines()
+        except OSError as exc:
+            raise WorktreeError("repository info/attributes is not readable") from exc
+        if any(ln.strip() and not ln.lstrip().startswith("#") for ln in lines):
+            raise WorktreeError("repository info/attributes is not allowed")
+
+
 class WorktreeManager:
     def __init__(self, repo_allowlist: Iterable[str], root_dir: str) -> None:
         repos = list(repo_allowlist)
@@ -303,31 +332,7 @@ class WorktreeManager:
         return repo
 
     def _refuse_dangerous_config(self, repo: str, cwd: str | None = None) -> None:
-        """Refuse repo state that makes git run repo-chosen programs. Re-run before every git call
-        that touches a work tree (linked worktrees share this config with the agent's shell)."""
-        _, out, _ = _git(cwd or repo, ["config", "--local", "--list", "-z"], max_bytes=1 << 20)
-        for entry in out.split("\x00"):
-            key, _, value = entry.partition("\n")
-            key = key.lower()
-            if _DANGEROUS_CONFIG.match(key):
-                raise WorktreeError(f"repository config {key!r} is not allowed")
-            if key == "core.fsmonitor" and value.strip().lower() not in ("false", "0", "no", "off"):
-                raise WorktreeError("repository config 'core.fsmonitor' is not allowed")
-            if key.startswith("alias.") and value.lstrip().startswith("!"):
-                raise WorktreeError(f"repository config {key!r} is not allowed")
-        if os.path.lexists(os.path.join(repo, ".git", "config.worktree")):
-            raise WorktreeError("repository config.worktree is not allowed")
-        info = os.path.join(repo, ".git", "info", "attributes")
-        if os.path.lexists(info):
-            try:
-                if os.path.islink(info):
-                    raise WorktreeError("repository info/attributes is not allowed")
-                with open(info, "rb") as fh:
-                    lines = fh.read(1 << 20).decode("utf-8", "replace").splitlines()
-            except OSError as exc:
-                raise WorktreeError("repository info/attributes is not readable") from exc
-            if any(ln.strip() and not ln.lstrip().startswith("#") for ln in lines):
-                raise WorktreeError("repository info/attributes is not allowed")
+        refuse_unsafe_repo_config(repo, cwd)
 
     def _tree_git(self, repo: str, path: str, args: Iterable[str], *, max_bytes: int = DEFAULT_MAX_BYTES,
                   check: bool = True) -> tuple[int, str, bool]:
