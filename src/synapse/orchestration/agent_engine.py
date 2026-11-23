@@ -119,6 +119,7 @@ class AgentWorkflowEngine(MockWorkflowEngine):
 
     _provider_type = AgentProviderRouter
     _profile_provider = "claude"
+    _profile_limits_check = None  # set per instance; None keeps the pre-limits behaviour
     _principal = "agent-engine"
     _budget_check = staticmethod(check_claim_budget)  # unbudgeted unless the run has a bound policy (ADR 020)
 
@@ -128,13 +129,16 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                  verify: Callable[[str, bytes], Awaitable[bool]] = process_outcome_verifier,
                  verifier_id: str = VERIFIER_ID, max_concurrency: int = 2, approval_requester=None,
                  worktree_check: Callable[[str, str, str], tuple[str, bool]] | None = None,
-                 profile_check: Callable[[str], str | None] | None = None):
+                 profile_check: Callable[[str], str | None] | None = None,
+                 profile_limits_check: Callable[[Mapping[str, Any]], str | None] | None = None):
         # max_attempts=2: a gated task spends one attempt on the approval wait.
         super().__init__(connection, router, blobs, verify, verifier_id=verifier_id,
                          max_concurrency=max_concurrency, max_attempts=2, approval_requester=approval_requester)
         self.router, self.specs, self._prompts = router, specs, prompts
         self._worktree_check = worktree_check
         self._profile_check = profile_check  # profile_id -> refusal reason or None; only asked for named profiles
+        # spec -> refusal reason or None: the recorded tools, mode and timeout must still fit the named profile
+        self._profile_limits_check = profile_limits_check
 
     def _profile_for(self, run_id: str, task_id: str, default_profile_id: str) -> str:
         """A task that named a registry profile claims capacity under it (its own cap, ADR 016).
@@ -177,9 +181,19 @@ class AgentWorkflowEngine(MockWorkflowEngine):
             result = self._profile_check(profile_id)
         except Exception:
             return "profile_check_failed"
-        if result is None or (isinstance(result, str) and result):
+        if result is not None and not (isinstance(result, str) and result):
+            return "profile_check_invalid"  # any other value (False, '', ...) still refuses
+        if result is not None:
             return result
-        return "profile_check_invalid"  # any other value (False, '', ...) still refuses
+        if self._profile_limits_check is None:
+            return None  # legacy callers without a limits check keep the old behaviour
+        try:
+            limits = self._profile_limits_check(spec)
+        except Exception:
+            return "profile_limits_check_failed"
+        if limits is None or (isinstance(limits, str) and limits):
+            return limits
+        return "profile_limits_check_invalid"
 
     async def _worktree_problem(self, run_id: str, task_id: str, path: str, expected_head: str) -> str | None:
         """Fail-closed recheck just before spawn: HEAD must be the recorded one and the tree clean."""
@@ -314,6 +328,11 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                 # A gated task must carry a recorded HEAD; a missing one fails closed (never skips the recheck).
                 problem = (await self._worktree_problem(run_id, task_id, spec["worktree"], spec["worktree_head"])
                            if isinstance(spec.get("worktree_head"), str) else "worktree_head_missing")
+            named = spec.get("profile_id")
+            if problem is None and named is not None and profile_id != named:
+                # Capacity, attempt row and budget were charged to another row than the one we would spawn
+                # under (e.g. the profile was disabled when the task was claimed, enabled again since).
+                problem = "profile_assignment_mismatch"
             if problem is None:
                 try:
                     self._record_profile_selected(run_id, task_id, attempt_id, profile_id, spec.get("profile_id"))

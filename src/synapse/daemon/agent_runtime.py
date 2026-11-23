@@ -21,7 +21,7 @@ import sqlite3
 from collections.abc import Awaitable, Callable
 
 from synapse.daemon.agent_config import ApprovalPolicy
-from synapse.daemon.agent_profiles import REGISTRY_REF_PREFIX
+from synapse.daemon.agent_profiles import REGISTRY_REF_PREFIX, mode_within
 from synapse.application.approval_requests import DaemonApprovalRequester
 from synapse.application.budget_policy import BudgetPolicy
 from synapse.domain.contracts import RunId, new_id, validate_id
@@ -220,6 +220,27 @@ class AgentRuntime:
             raise ValueError("profile is not available")
         return replace(self.profile, executable=spec.executable)
 
+    def _profile_limits_problem(self, spec: dict) -> str | None:
+        """Spawn-time recheck that a queued task still fits its named profile as the registry now declares it.
+
+        The registry can be narrowed between acceptance and spawn (edit the file, restart). A task or a parked
+        gated task accepted under wider tools, mode or timeout must not run with them.
+        """
+        named = spec.get("profile_id")
+        if named is None:
+            return None
+        declared = None if self.registry is None else self.registry.get(named)
+        if declared is None:
+            return "profile_unknown"
+        if not set(spec.get("allowed_tools", ())) <= set(declared.allowed_tools):
+            return "profile_narrowed"
+        if not mode_within(spec.get("permission_mode"), declared.permission_mode):
+            return "profile_narrowed"
+        timeout = spec.get("timeout_seconds")
+        if not isinstance(timeout, (int, float)) or timeout > declared.max_timeout_seconds:
+            return "profile_narrowed"
+        return None
+
     def _profile_problem(self, profile_id: str) -> str | None:
         """Spawn-time recheck of a named profile against the profiles table (synced from the registry)."""
         row = self.db.execute("SELECT provider,config_ref,enabled FROM profiles WHERE id=?", (profile_id,)).fetchone()
@@ -261,7 +282,8 @@ class AgentRuntime:
                 self.db, router, self.blobs, task_specs, self._prompt(task_specs), verify=self._verify,
                 max_concurrency=self._max_concurrency,
                 approval_requester=DaemonApprovalRequester(self.db) if gates else None,
-                worktree_check=self._worktree_check, profile_check=self._profile_problem)
+                worktree_check=self._worktree_check, profile_check=self._profile_problem,
+                profile_limits_check=self._profile_limits_problem)
             self._engine = engine
             scenarios = {t: ("agent",) for t in task_specs}
             while True:

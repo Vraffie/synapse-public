@@ -104,7 +104,17 @@ A task that names a registry profile now:
   executable substituted). A named profile that cannot be resolved fails the attempt with `start_rejected` and
   **never** falls back to the default executable. Credentials, `state_dir`, sandbox and the other operator
   settings still come from the base profile; the registry does not model them, so profiles do not (yet) isolate
-  accounts from each other;
+  accounts from each other. `--agent-config` currently sets every declared profile's executable to the base
+  executable, so in the daemon the substitution is a no-op today and only the cap, budget scope, audit and
+  limits above differ per profile; the registry `model` is not passed to the adapter. A `per_profile` budget written
+  for the built-in profile id does not cover tasks that name a registry profile (their ledger rows carry the
+  registry id);
+- **is rechecked against the registry as it is now** just before spawn: the recorded tools, permission mode and
+  timeout must still fit the named profile, otherwise the task fails closed with `profile_narrowed` (a profile
+  narrowed in the file and restarted cannot run work accepted under wider limits, also for tasks parked behind an
+  approval). A task also executes only under the row it was claimed under (`assigned_profile_id`, authoritative
+  after a park/resume); a mismatch (for example the profile was disabled at claim time and is enabled again) fails
+  closed with `profile_assignment_mismatch`;
 - **records the selection** before the spawn as an `agent.profile_selected` event on the attempt:
   `{task_id, profile_id, provider, model, profile_sha256, requested, fell_back_from, reason}`. `model` is always
   `null` (the adapter does not report one), `requested` is `null` for the default profile, `fell_back_from` is

@@ -91,6 +91,11 @@ class MockWorkflowEngine:
         """The profile a task claims capacity under and runs with; the run's profile unless overridden."""
         return default_profile_id
 
+    def _assigned_profile(self, task_id: str) -> str | None:
+        """The profile the task's capacity was actually claimed under (authoritative after a park/resume)."""
+        row = self.db.execute("SELECT assigned_profile_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+        return None if row is None else row[0]
+
     def _block_for_budget(self, run_id: str, task_id: str, version: int, profile_id: str, denied: BudgetDenied) -> None:
         """Record a refused claim (ADR 020 D4): the claim rolled back, so nothing was assigned; the task goes
         READY -> BLOCKED (no silent downgrade, no retry) with an event and an audit row naming the reason."""
@@ -178,7 +183,7 @@ class MockWorkflowEngine:
                     resumed = self.gates.resume(run_id=run_id, task_id=task_id, spec=spec, budget_check=self._budget_check)
                     if resumed.status == ResumeStatus.RESUMED:
                         self._reservations[task_id] = (run_id, resumed.attempt_id)
-                        self._active[task_id] = asyncio.create_task(self._execute(run_id, task_id, resumed.attempt_id, self._profile_for(run_id, task_id, profile_id), self._scenario(scenarios[task_id], resumed.attempt_count - 2), resumed.task_version, resumed.attempt_count))
+                        self._active[task_id] = asyncio.create_task(self._execute(run_id, task_id, resumed.attempt_id, self._assigned_profile(task_id) or self._profile_for(run_id, task_id, profile_id), self._scenario(scenarios[task_id], resumed.attempt_count - 2), resumed.task_version, resumed.attempt_count))
                 for task_id, version, count in self.db.execute("SELECT id,state_version,attempt_count FROM tasks WHERE run_id=? AND state='ready' ORDER BY id", (run_id,)).fetchall():
                     if self._halt or len(self._active) >= self.max_concurrency:
                         break

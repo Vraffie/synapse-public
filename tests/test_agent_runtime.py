@@ -832,3 +832,57 @@ def test_disabled_named_profile_is_not_stuck_unclaimable(env):
     asyncio.run(go())
     assert env.spawns() == [] and env.states()[1] == {"work": "failed"}
     assert _selected(env) == []  # refused before any selection was recorded
+
+
+def _refused(env, detail):
+    assert env.spawns() == [] and env.states()[1] == {"work": "failed"}
+    (summary,) = env.summaries()
+    assert summary["outcome"] == "failed" and summary["detail"] == detail
+    assert _selected(env) == []  # refused before any selection was recorded
+
+
+@pytest.mark.parametrize("narrow", [
+    dict(allowed_tools=("Read",)),            # Edit removed after the task was accepted
+    dict(permission_mode="plan"),             # mode ceiling lowered
+    dict(max_timeout_seconds=5.0),            # timeout ceiling lowered
+])
+def test_profile_narrowed_after_acceptance_fails_closed_at_spawn(env, narrow):
+    from dataclasses import replace
+    _register_profile(env, "reader", 1)
+    env.runtime.registry = type(env.runtime.registry)(
+        (replace(env.runtime.registry.get("reader"), **narrow),), primary="reader")
+
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(profile_id="reader"))  # Edit, acceptEdits, 20s
+        await finish(env)
+    asyncio.run(go())
+    _refused(env, "profile_narrowed")
+
+
+def test_assignment_mismatch_between_claim_and_spawn_fails_closed(env, monkeypatch):
+    from synapse.orchestration.agent_engine import AgentWorkflowEngine
+    _register_profile(env, "reader", 1)
+    # Simulate "claimed under the run's row, the named profile is usable again at spawn".
+    monkeypatch.setattr(AgentWorkflowEngine, "_profile_for", lambda self, run_id, task_id, default: default)
+
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(profile_id="reader"))
+        await finish(env)
+    asyncio.run(go())
+    _refused(env, "profile_assignment_mismatch")
+    assert env.db.execute("SELECT assigned_profile_id FROM tasks WHERE run_id=?", (env.run_id,)).fetchone() == (at.AGENT_PROFILE,)
+
+
+def test_selection_that_cannot_be_recorded_spawns_nothing(env, monkeypatch):
+    from synapse.orchestration.agent_engine import AgentWorkflowEngine
+
+    def boom(self, *args, **kwargs):
+        raise RuntimeError("disk full")
+    monkeypatch.setattr(AgentWorkflowEngine, "_record_profile_selected", boom)
+
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs())
+        await finish(env)
+    asyncio.run(go())
+    assert env.spawns() == [] and env.states()[1] == {"work": "failed"}
+    assert env.summaries()[0]["detail"] == "profile_selection_not_recorded"
