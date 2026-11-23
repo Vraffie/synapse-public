@@ -60,7 +60,13 @@ def test_a_second_run_resumes_from_the_cursor_and_prints_only_new_events(tmp_pat
 
 def test_explicit_after_overrides_the_cursor(tmp_path):
     run(Feed(3), tmp_path)
-    assert run(Feed(5), tmp_path, after=1)[1] == [2, 3, 4, 5]
+    assert run(Feed(5), tmp_path, after=1, cursor_file_explicit=True)[1] == [2, 3, 4, 5]
+
+
+def test_after_rewinding_is_refused_by_default(tmp_path):
+    run(Feed(3), tmp_path)
+    code, seen, err = run(Feed(5), tmp_path, after=1)
+    assert code == 2 and seen == [] and read_cursor(tmp_path / "cursor") == (3, "evt-3")
 
 
 def test_cursor_is_not_saved_when_the_reader_goes_away_so_nothing_is_skipped(tmp_path):
@@ -369,3 +375,63 @@ def test_an_output_encoding_error_exits_one_line_and_keeps_the_cursor(tmp_path):
                          stop_when_idle=True, out=Ascii(), err=err, sleep=lambda s: None)
     assert code == 1 and read_cursor(tmp_path / "cursor") is None
     assert len(err.getvalue().strip().splitlines()) == 1 and "Traceback" not in err.getvalue()
+
+
+def test_a_database_swapped_while_following_is_detected_on_an_idle_poll(tmp_path):
+    state = {"feed": Feed(3), "polls": 0}
+    def fetch(endpoint):
+        state["polls"] += 1
+        if state["polls"] > 3:  # the daemon came back with an older, shorter database
+            state["feed"] = Feed(1, salt="new-")
+        return state["feed"](endpoint)
+    out, err = io.StringIO(), io.StringIO()
+    def sleep(seconds):  # bound the run so a missed detection fails instead of hanging
+        if state["polls"] > 40:
+            raise KeyboardInterrupt
+    code = follow_events(fetch, cursor_file=tmp_path / "cursor", after=None, limit=10, interval=0.1,
+                         stop_when_idle=False, out=out, err=err, sleep=sleep)
+    assert code == 1 and "ahead of the event log" in err.getvalue() and "delete the cursor file" in err.getvalue()
+    assert read_cursor(tmp_path / "cursor") == (3, "evt-3")
+
+
+def test_a_database_swapped_across_a_reconnect_is_detected_before_printing_anything_new(tmp_path):
+    run(Feed(3), tmp_path)  # cursor at 3, id evt-3
+    feed = Feed(5, fail=[ConnectionRefusedError()], salt="other-")  # same length+, different ids, after a restart
+    state = {"n": 0}
+    def fetch(endpoint):
+        state["n"] += 1
+        if state["n"] == 1:  # the startup check sees the old database
+            return events(3, salt="")
+        return feed(endpoint)
+    out, err = io.StringIO(), io.StringIO()
+    code = follow_events(fetch, cursor_file=tmp_path / "cursor", after=None, limit=10, interval=0.1,
+                         stop_when_idle=True, out=out, err=err, sleep=lambda s: None)
+    assert code == 1 and out.getvalue() == "" and "not the one the cursor" in err.getvalue()
+    assert read_cursor(tmp_path / "cursor") == (3, "evt-3")
+
+
+def test_after_beyond_the_head_of_the_log_exits_one_instead_of_stalling(tmp_path):
+    code, seen, err = run(Feed(2), tmp_path, after=5)
+    assert code == 1 and seen == [] and "ahead of the event log" in err and "delete the cursor file" in err
+    assert read_cursor(tmp_path / "cursor") is None
+
+
+def test_a_stdout_oserror_other_than_a_broken_pipe_is_one_line_and_keeps_the_cursor(tmp_path):
+    class Full(io.StringIO):
+        def write(self, text):
+            raise OSError(28, "No space left on device")
+    err = io.StringIO()
+    code = follow_events(Feed(2), cursor_file=tmp_path / "cursor", after=None, limit=10, interval=0.1,
+                         stop_when_idle=True, out=Full(), err=err, sleep=lambda s: None)
+    assert code == 1 and read_cursor(tmp_path / "cursor") is None
+    assert len(err.getvalue().strip().splitlines()) == 1 and "No space left" in err.getvalue()
+
+
+def test_cli_naming_the_default_cursor_file_does_not_allow_rewinding(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    write_cursor(state / "events.cursor", 5, "evt-5")
+    result = subprocess.run([sys.executable, "-m", "synapse.cli", "--state-dir", str(state), "events", "--follow",
+                             "--after", "0", "--cursor-file", str(state / ".." / "state" / "events.cursor")],
+                            capture_output=True, text=True, timeout=30, cwd=ROOT, env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+    assert result.returncode == 2 and read_cursor(state / "events.cursor") == (5, "evt-5")

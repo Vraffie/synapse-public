@@ -617,9 +617,12 @@ def main(argv: list[str] | None = None) -> int:
             from synapse.cli.follow import CURSOR_NAME, follow_events
             if not 0.05 <= args.interval <= 60:
                 parser.error("--interval must be between 0.05 and 60 seconds")
-            return follow_events(_follow_fetch(args.state_dir),
-                                 cursor_file=args.cursor_file or args.state_dir / CURSOR_NAME,
-                                 cursor_file_explicit=args.cursor_file is not None, after=args.after,
+            default_cursor = args.state_dir / CURSOR_NAME
+            cursor_file = args.cursor_file or default_cursor
+            return follow_events(_follow_fetch(args.state_dir), cursor_file=cursor_file,
+                                 # only a file other than the default one may be rewound by --after
+                                 cursor_file_explicit=cursor_file.resolve() != default_cursor.resolve(),
+                                 after=args.after,
                                  limit=args.limit, interval=args.interval, stop_when_idle=args.stop_when_idle)
         endpoint = "/api/v1/events?" + urlencode({"after": args.after or 0, "limit": args.limit})
     else:

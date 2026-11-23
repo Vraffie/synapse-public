@@ -5,7 +5,7 @@ Tail the daemon's event log from a terminal and resume after a restart of either
 ```
 agentctl --state-dir STATE events --follow                 # print new events as JSON lines until Ctrl-C
 agentctl --state-dir STATE events --follow --stop-when-idle   # catch up, then exit 0 (scripts, cron)
-agentctl --state-dir STATE events --follow --after 0        # ignore the saved cursor, replay from the start
+agentctl --state-dir STATE events --follow --cursor-file replay.cursor --after 0   # replay from the start into a separate cursor file
 ```
 
 Options: `--limit` (page size, 1..1000, default 100), `--interval` (seconds between polls when caught up,
@@ -22,12 +22,15 @@ handled and its id, which binds the cursor to one database.
   the two replays that page on the next run. A consumer that needs exactly-once should dedupe on `sequence`.
 - **Cursor bound to the database.** On resume the event AT the cursor is fetched (`after=cursor-1&limit=1`). If the
   log is shorter than the cursor, or the event there has a different id (database recreated or restored), it exits 1
-  with a message and prints nothing; delete the cursor file or pass `--after` to start over. A legacy cursor file (a
+  with a message and prints nothing; to start over, delete the cursor file. The same check runs after every
+  reconnect and on every idle poll while following, so a daemon restarted with a wiped or restored database stops the
+  follower with exit 1 instead of polling an empty log forever. `--after N` (N > 0) gets the same check: an N beyond the
+  end of the log exits 1 instead of stalling. A legacy cursor file (a
   bare integer, written by the previous version) is accepted once: the log must still contain that sequence, a
   warning goes to stderr, and the file is rewritten in the new format with the id of that event.
-- **`--after` never moves a saved cursor backwards.** `--after N` below the saved cursor, without `--cursor-file`,
-  exits 2 with a message and changes nothing. Naming `--cursor-file` is the explicit opt-in (for example a separate
-  file for a replay). `--after` at or above the saved cursor is allowed.
+- **`--after` never moves a saved cursor backwards.** `--after N` below the saved cursor
+  exits 2 with a message and changes nothing, unless `--cursor-file` names a file other than the default
+  `STATE/events.cursor` (compared by resolved path), for example a separate file for a replay. `--after` at or above the saved cursor is allowed.
 - **Cursor cannot be saved** (full disk, missing directory, read-only): one line on stderr, exit 1. The page was
   already printed, so the next run replays it.
 - **Daemon down or restarting** (connection refused, missing socket, timeout, HTTP 5xx): retried with backoff
@@ -38,10 +41,13 @@ handled and its id, which binds the cursor to one database.
   error on the socket, a malformed response, or events that are not strictly increasing.
 - **A reader that goes away** (`| head`): the unwritten page is not marked delivered; exit 1 with no traceback.
 - **Output the terminal encoding cannot represent** (for example an ASCII locale with non-ASCII event text): one line on stderr, exit 1, cursor not moved; use a UTF-8 locale or `PYTHONIOENCODING=utf-8`.
+- **Any other stdout write error** (for example `/dev/full`): one line on stderr, exit 1, cursor not moved.
+- **Two followers on one cursor file** are not locked against each other; they can overwrite each other's cursor,
+  which causes duplicates, never skipped events. Use one cursor file per follower.
 - **SIGTERM** is handled like Ctrl-C: exit 0 (the cursor is saved after every page).
 - `--interval` outside 0.05..60 is rejected with exit 2.
 - A cursor file that is a symlink, not owned by you, group/other accessible, not `SEQUENCE EVENT_ID` (or a bare integer) or larger than the
-  maximum sequence is refused with a message (delete it or pass `--after`); it is never silently treated as 0.
+  maximum sequence is refused with a message (delete it); it is never silently treated as 0.
 
 ## Limits
 

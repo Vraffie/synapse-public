@@ -112,10 +112,11 @@ def _quiet_stdout(out: IO[str]) -> None:
 def follow_events(fetch: Callable[[str], object], *, cursor_file: Path, after: int | None, limit: int,
                   interval: float, stop_when_idle: bool, out: IO[str] = sys.stdout, err: IO[str] = sys.stderr,
                   sleep: Callable[[float], None] = time.sleep, max_errors: int = DEFAULT_MAX_ERRORS,
-                  cursor_file_explicit: bool = True) -> int:
+                  cursor_file_explicit: bool = False) -> int:
     """Print events after the cursor until interrupted (or idle, with ``stop_when_idle``). Returns an exit code.
 
-    ``cursor_file_explicit``: the caller named the cursor file, so ``after`` may rewind it.
+    ``cursor_file_explicit``: the caller named a cursor file other than the default one, so ``after`` may rewind it
+    (the safe default is False: ``after`` never moves a saved cursor backwards).
     """
     if not MIN_INTERVAL <= interval <= MAX_INTERVAL:
         print(f"agentctl: --interval must be between {MIN_INTERVAL:g} and {MAX_INTERVAL:g} seconds", file=err)
@@ -130,10 +131,11 @@ def follow_events(fetch: Callable[[str], object], *, cursor_file: Path, after: i
               "pass --cursor-file to replay into a separate file (the saved cursor is never moved backwards)", file=err)
         return 2
     failures, delay = 0, 0.5
+    reconnected = False
 
     def get(after_sequence: int, page_limit: int) -> list:
         """One page, retrying transient failures; raises _Stop with the exit code on anything else."""
-        nonlocal failures, delay
+        nonlocal failures, delay, reconnected
         while True:
             try:
                 page = fetch("/api/v1/events?" + urlencode({"after": after_sequence, "limit": page_limit}))
@@ -142,6 +144,7 @@ def follow_events(fetch: Callable[[str], object], *, cursor_file: Path, after: i
                     print(f"agentctl: {type(exc).__name__}: {exc}", file=err)
                     raise _Stop(1) from None
                 failures += 1
+                reconnected = True
                 if failures > max_errors:
                     print(f"agentctl: giving up after {max_errors} failed attempts: {type(exc).__name__}", file=err)
                     raise _Stop(1) from None
@@ -171,31 +174,52 @@ def follow_events(fetch: Callable[[str], object], *, cursor_file: Path, after: i
     except ValueError:  # not the main thread
         pass
     try:
+        cursor_id = None
+
+        def verify(sequence: int, event_id: str | None) -> bool:
+            """The event AT ``sequence`` must exist (and have ``event_id`` when known): same database as before."""
+            head = get(sequence - 1, 1) if sequence > 0 else []
+            at = head[0] if head and isinstance(head[0], dict) else None
+            if sequence > 0 and (at is None or at.get("sequence") != sequence):
+                print(f"agentctl: the cursor {sequence} in {cursor_file} is ahead of the event log (the database "
+                      f"was recreated or restored?); delete the cursor file {cursor_file} and run again to start over",
+                      file=err)
+                return False
+            if sequence > 0 and event_id is not None and at.get("id") != event_id:
+                print(f"agentctl: the event at sequence {sequence} is not the one the cursor in {cursor_file} was "
+                      f"saved for (the database was recreated or restored?); delete the cursor file {cursor_file} "
+                      "and run again to start over", file=err)
+                return False
+            return True
+
         if after is not None:
             cursor = after
+            if cursor > 0:
+                if not verify(cursor, saved.event_id if saved is not None and saved.sequence == cursor else None):
+                    return 1
         elif saved is None:
             cursor = 0
         else:
             cursor = saved.sequence
-            # The log must still be the one this cursor came from: the event AT the cursor has to be there.
-            head = get(cursor - 1, 1) if cursor > 0 else []
-            at = head[0] if head and isinstance(head[0], dict) else None
-            if cursor > 0 and (at is None or at.get("sequence") != cursor):
-                print(f"agentctl: the saved cursor {cursor} in {cursor_file} is ahead of the event log (the database "
-                      "was recreated or restored?); delete the cursor file or pass --after to start over", file=err)
-                return 1
-            if cursor > 0 and saved.event_id is not None and at.get("id") != saved.event_id:
-                print(f"agentctl: the event at sequence {cursor} is not the one the cursor in {cursor_file} was saved "
-                      "for (the database was recreated or restored?); delete the cursor file or pass --after to "
-                      "start over", file=err)
+            if not verify(cursor, saved.event_id):
                 return 1
             if cursor > 0 and saved.event_id is None:
                 print(f"agentctl: {cursor_file} is in the legacy format (no event id); accepting it once and "
                       "rewriting it with the id of the event at the cursor", file=err)
-                if not isinstance(at.get("id"), str) or not _EVENT_ID.fullmatch(at["id"]) or not save(cursor, at["id"]):
+                head = get(cursor - 1, 1)
+                at_id = head[0].get("id") if head and isinstance(head[0], dict) else None
+                if not isinstance(at_id, str) or not _EVENT_ID.fullmatch(at_id) or not save(cursor, at_id):
                     return 1
+        if cursor > 0:
+            cursor_id = saved.event_id if saved is not None and saved.sequence == cursor else None
         while True:
             events = get(cursor, limit)
+            # After a reconnect (or on an idle poll) the log must still be the one the cursor came from.
+            if cursor > 0 and (reconnected or not events):
+                reconnected = False
+                if not verify(cursor, cursor_id):
+                    return 1
+                reconnected = False
             last, last_id = cursor, None
             lines = []
             for event in events:
@@ -216,13 +240,17 @@ def follow_events(fetch: Callable[[str], object], *, cursor_file: Path, after: i
                 except BrokenPipeError:
                     _quiet_stdout(out)
                     return 1  # the reader went away: do not claim the page was delivered
+                except OSError as exc:
+                    print(f"agentctl: cannot write events to stdout ({exc.strerror or type(exc).__name__}); "
+                          "the cursor was not moved", file=err)
+                    return 1
                 except UnicodeEncodeError as exc:
                     print(f"agentctl: cannot write events to stdout ({exc.encoding} cannot encode the output); "
                           "set PYTHONIOENCODING=utf-8 or a UTF-8 locale; the cursor was not moved", file=err)
                     return 1
                 if not save(last, last_id):
                     return 1
-                cursor = last
+                cursor, cursor_id = last, last_id
                 continue  # the page may not have been the last one
             if stop_when_idle:
                 return 0
