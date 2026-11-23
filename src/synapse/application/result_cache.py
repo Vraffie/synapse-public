@@ -1,8 +1,9 @@
 """Exact result cache: lookup/record logic against a storage port (M5.4 cache 2/3, ADR 017 D6).
 
 Pure: no SQLite, no file or network I/O, no clock, no daemon. Storage is a ``CacheStore`` port; the
-``InMemoryCacheStore`` here exists for tests. The SQL ``result_cache`` table (ADR 017 D3) needs a
-migration that does not exist yet, so nothing in Synapse calls this module today.
+``InMemoryCacheStore`` here exists for tests. The SQL store over the ``result_cache`` table (ADR 017
+D3, migration 0018) is ``synapse.persistence.result_cache_store``. Nothing in Synapse calls this
+module at runtime today.
 
 Rules:
 
