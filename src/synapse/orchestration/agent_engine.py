@@ -31,6 +31,8 @@ from synapse.application.context_manifest import ManifestEntry, build_manifest, 
 from synapse.domain.contracts import EventEnvelope, encode_payload, new_id
 from synapse.domain.runs import RunChange, RunState
 from synapse.application.output_reducer import reduce_output
+from synapse.application.routing_dry_run import RoutingDryRunConfig, record_routing, routing_record
+from synapse.application.routing_policy import RoutingInput
 from synapse.domain.workflow import State
 from synapse.infrastructure.artifact_blobs import ArtifactBlobStore
 from synapse.orchestration.mock_engine import MockWorkflowEngine, _RunInterrupted
@@ -187,7 +189,8 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                  worktree_check: Callable[[str, str, str], tuple[str, bool]] | None = None,
                  profile_check: Callable[[str], str | None] | None = None,
                  profile_limits_check: Callable[[Mapping[str, Any]], str | None] | None = None,
-                 raw_blobs: ArtifactBlobStore | None = None):
+                 raw_blobs: ArtifactBlobStore | None = None,
+                 routing_dry_run: RoutingDryRunConfig | None = RoutingDryRunConfig()):
         # max_attempts=2: a gated task spends one attempt on the approval wait.
         super().__init__(connection, router, blobs, verify, verifier_id=verifier_id,
                          max_concurrency=max_concurrency, max_attempts=2, approval_requester=approval_requester)
@@ -197,6 +200,7 @@ class AgentWorkflowEngine(MockWorkflowEngine):
         # spec -> refusal reason or None: the recorded tools, mode and timeout must still fit the named profile
         self._profile_limits_check = profile_limits_check
         # Raw provider output may exceed the summary blob bound; same directory, larger limit.
+        self._routing_dry_run = routing_dry_run  # None disables the log; it never changes what runs
         self.raw_blobs = raw_blobs if raw_blobs is not None else blobs.with_max_bytes(_PROVIDER_OUTPUT_CAP)
 
     def _profile_for(self, run_id: str, task_id: str, default_profile_id: str) -> str:
@@ -398,6 +402,26 @@ class AgentWorkflowEngine(MockWorkflowEngine):
         except Exception:
             _LOG.exception("Could not record the context manifest for task %s", task_id)
 
+    def _record_routing(self, run_id: str, task_id: str, attempt_id: str, spec: Mapping[str, Any], attempt_no: int) -> None:
+        """Log what the routing rules would pick for this attempt (M5.5, dry run; nothing is applied).
+
+        Unknown signals stay unknown: the spec carries no role, task kind or file count, so
+        ``is_review`` is unknown and the attempt counts as protected (it can never be downgraded).
+        A gated task spends its first attempt on the approval wait, so that attempt is not a retry.
+        A failure is logged and never affects the run.
+        """
+        if self._routing_dry_run is None:
+            return
+        try:
+            gated = spec.get("approval_step") is not None
+            record = routing_record(self._routing_dry_run, RoutingInput(
+                prompt_bytes=spec.get("prompt_bytes"), has_approval_gate=gated,
+                retry_no=max(0, attempt_no - 1 - (1 if gated else 0))))
+            with self._transaction():
+                record_routing(self.db, run_id=run_id, attempt_id=attempt_id, record=record)
+        except Exception:
+            _LOG.exception("Could not record the routing dry run for task %s", task_id)
+
     async def _execute(self, run_id: str, task_id: str, attempt_id: str, profile_id: str, scenario: str,
                        version: int, attempt_no: int) -> None:
         spec = self.specs[task_id]
@@ -450,6 +474,7 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                 terminal = ProviderEvent("failed", problem)  # refused before any spawn
             else:
                 self._record_manifest(run_id, task_id, attempt_id, spec)
+                self._record_routing(run_id, task_id, attempt_id, spec, attempt_no)
                 request = ExecutionRequest(profile_id, task_id, {
                     "prompt": self._prompts(task_id).decode("utf-8"), "worktree": spec["worktree"],
                     "timeout_seconds": spec["timeout_seconds"], "max_output_bytes": _PROVIDER_OUTPUT_CAP})

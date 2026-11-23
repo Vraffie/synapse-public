@@ -1152,3 +1152,30 @@ def test_a_worktree_head_is_lowercased_and_an_invalid_one_becomes_unknown_not_a_
     assert _manifest_head("A" * 40) == "a" * 40 and _manifest_head("ab12" * 10) == "ab12" * 10
     for bad in ("g" * 40, "a" * 39, "a" * 41, "", None, 7, "A" * 39 + "Z"):
         assert _manifest_head(bad) is None
+
+
+def test_attempt_logs_a_dry_run_routing_decision_without_changing_the_run(env):
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(prompt="ok"))
+        await finish(env)
+    asyncio.run(go())
+    assert env.states() == ("succeeded", {"work": "completed"}) and env.spawns() == ["ok"]
+    ((doc,),) = env.db.execute("SELECT decision_json FROM optimization_decisions").fetchall()
+    record = json.loads(doc)
+    assert record["dry_run"] is True and record["applied"] is False
+    assert record["inputs"]["is_review"] is None and record["decision"]["protected"] is True  # unknown review flag
+    assert record["decision"]["downgraded_from"] is None and record["inputs"]["has_approval_gate"] is False
+    assert env.db.execute("SELECT count(*) FROM events WHERE type='optimization.decision_recorded'").fetchone()[0] == 1
+
+
+def test_routing_log_failure_or_disabled_does_not_affect_the_attempt(env, monkeypatch):
+    import synapse.orchestration.agent_engine as ae
+    def boom(*a, **k):
+        raise RuntimeError("no")
+    monkeypatch.setattr(ae, "record_routing", boom)
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(prompt="ok"))
+        await finish(env)
+    asyncio.run(go())
+    assert env.states() == ("succeeded", {"work": "completed"})
+    assert env.db.execute("SELECT count(*) FROM optimization_decisions").fetchone()[0] == 0
