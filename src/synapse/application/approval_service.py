@@ -51,6 +51,7 @@ class ApprovalAccessDenied(PermissionError):
 DENIAL_REASONS = frozenset({"unauthenticated", "not_permitted", "self_approval", "conflict", "rate_limited"})
 DENIAL_WINDOW_SECONDS = 60
 DENIAL_MAX_PER_WINDOW = 20
+DENIAL_MAX_SUPPRESSED_BUCKETS = 64  # bounds the in-memory dropped-attempt counters
 
 
 def _principal(actor: Actor) -> str:
@@ -76,6 +77,7 @@ class ApprovalService:
         self._authority = authority
         self._clock = clock
         self._denial_window: tuple[int, dict] = (-1, {})  # (window index, {bucket: rows written})
+        self._denial_suppressed: dict[str, int] = {}  # {bucket: attempts dropped since its last written row}
 
     def preauthenticate(self, credential: object) -> None:
         """Run the authority's slow credential check off the event loop when it offers one. Touches no
@@ -107,7 +109,8 @@ class ApprovalService:
         denials, otherwise the constant "unauthenticated". Bounded: at most
         DENIAL_MAX_PER_WINDOW rows per DENIAL_WINDOW_SECONDS per principal bucket
         (unauthenticated callers share one bucket); the first overflow in a window
-        writes one "rate_limited" marker, later attempts are dropped. Failures to write
+        writes one "rate_limited" marker, later attempts are dropped but counted, and the next row written for that principal carries
+        ``suppressed_before`` (in-memory: a restart loses the count). Failures to write
         are swallowed so HTTP responses never change. Committed independently of the
         failed decision transaction (called after it has rolled back).
         """
@@ -122,14 +125,20 @@ class ApprovalService:
             counts = self._denial_window[1]
             used = counts.get(who, 0)
             if used > DENIAL_MAX_PER_WINDOW:
+                if who in self._denial_suppressed or len(self._denial_suppressed) < DENIAL_MAX_SUPPRESSED_BUCKETS:
+                    self._denial_suppressed[who] = self._denial_suppressed.get(who, 0) + 1
                 return False
             if used == DENIAL_MAX_PER_WINDOW:
                 reason = "rate_limited"
             counts[who] = used + 1
             details = {"reason": reason, "http_status": http_status}
+            dropped = self._denial_suppressed.get(who, 0)
+            if dropped:  # the next written row reports how many attempts the cap hid (F10); lost if the daemon restarts first
+                details["suppressed_before"] = dropped
             append_audit(self._db, who, "approval.decide", (approval_id or "unauthenticated") if principal else "unauthenticated",
                          "denied", correlation_id, json.dumps(details, sort_keys=True, separators=(",", ":")),
                          datetime.now(timezone.utc).isoformat())
+            self._denial_suppressed.pop(who, None)  # only after the row (and its count) is durably written
             return True
         except Exception:
             return False

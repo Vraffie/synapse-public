@@ -169,7 +169,7 @@ Existing base: hash, policy and expiry binding with execution-time recheck; syst
   - F7 [open] agent child containment: env allowlist, scratch `HOME`, stdin prompt and rlimits landed (PR #73); the `setsid` escape and kernel-level containment remain. Partially addressed by PR #120 (opt-in bubblewrap sandbox, default off, network namespace shared) and PR #110 (F7 status recorded); PR #90 (tool hardening) is still open.
   - F8 [fixed] backup schema fingerprint and approvals neutralised on restore (PR #75).
   - F9 [fixed] approver-vs-requester recheck (PR #75).
-  - F10 [open] denied-decision audit landed (PR #59); failed operator-authentication logging landed (PR #87); `audit_entries` is chained by PR #119. Partially addressed: the in-memory rate-limit window that can drop denial rows after a burst is not shown as changed in the merged PRs.
+  - F10 [open] denied-decision audit landed (PR #59); failed operator-authentication logging landed (PR #87); `audit_entries` is chained by PR #119. Partially addressed: dropped denial attempts are now counted and reported as `suppressed_before` on the next written row (in memory; lost on restart or if no later denial arrives). Durable counting of dropped attempts remains open.
   - F11 [fixed] socket lock, umask before bind, inherited socket identity (PR #76) and mock IPC socket lock (PR #89).
   - F12 [fixed] `extra_args` allowlist instead of a denylist (PR #73); regression tests (PR #101).
   - F13 [fixed] approved approvals can be revoked (`approval.revoke`) and use is audited (`approval.executed`) (PR #113); residual, accepted: the grant is not strictly single-use.
