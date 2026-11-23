@@ -297,8 +297,8 @@ def up(args) -> int:
     if not args.no_desktop and not alive(state / "desktop.pid"):
         spawn([*runner(), "synapse.desktop", "--state-dir", str(state)], state / "desktop.log", state / "desktop.pid")
         print("desktop started")
-    print("\nStart a real run:\n  agentctl --state-dir %s agent-start --repo %s --base-ref main --tool Read --tool Glob "
-          "--tool Grep --prompt-file - <<< 'your task'\nThen: agent-show RUN, and agent-worktree-commit RUN -m MSG "
+    print("\nStart a real run:\n  agentctl --state-dir %s agent-start --repo %s --base-ref BASE_REF --tool Read --tool Glob "
+          "--tool Grep --idempotency-key KEY --correlation-id KEY --prompt-file - <<< 'your task'\nThen: agent-show RUN, and agent-worktree-commit RUN -m MSG "
           "to keep edits on their own branch." % (state, repo))
     return 0
 
