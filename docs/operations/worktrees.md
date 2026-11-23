@@ -45,7 +45,9 @@ The agent-runs API uses it for the per-run worktree.
   what is checked out.
 - git is run with an argv list (no shell), a scrubbed environment (`PATH`,
   `HOME=/nonexistent`, no system/global config, no prompts), its own process
-  group, and `-c core.hooksPath=/dev/null -c core.fsmonitor=false
+  group, `GIT_NO_LAZY_FETCH=1` and the global option `--no-lazy-fetch` (a partial
+  clone never fetches, which would run `remote.*.uploadpack`; a git too old to know
+  the option rejects it, so calls fail closed), and `-c core.hooksPath=/dev/null -c core.fsmonitor=false
   -c core.pager=cat -c core.attributesFile=/dev/null -c diff.external=`.
   Diffs use `--no-ext-diff --no-textconv`.
 - Unsafe repository state is refused with a clear `WorktreeError`, and the check is
@@ -56,8 +58,25 @@ The agent-runs API uses it for the per-run worktree.
   other than false, `core.hooksPath`, `core.sshCommand`, `core.gitProxy`,
   `core.attributesFile`, `core.askPass`, `core.editor`, `diff.external`,
   `diff.*.command|textconv`, `merge.*.driver`, `credential.*helper`, `gpg.*program`,
-  `extensions.worktreeConfig`, any `config.worktree` file, and a non-comment
-  `info/attributes` file in the repository's git directory.
+  `remote.*.uploadpack|receivepack|vcs|proxy`, `core.alternateRefsCommand`,
+  `uploadpack.*`, `http.*proxy`, config-defined hooks `hook.*` (git 2.54+ runs them even
+  with `core.hooksPath=/dev/null`), `gpg.ssh.defaultKeyCommand`,
+  `extensions.worktreeConfig`, any `config.worktree`
+  file, a non-comment `info/attributes` file in the repository's git directory, and a
+  `.git/config` too large (over 1 MiB listed) to check completely, and any
+  `.git/commondir` (it makes git take config, `info/attributes`, objects and refs
+  from another directory; also refused when the allowlist is loaded). The check lists
+  the effective config with an explicit `--git-dir=<repo>/.git config --local`, so it
+  never walks up to another repo. The check runs first in `check_base` (before any other
+  git query), at the start of `create` (the idempotent path too) and before `remove`,
+  including `remove(force=True)`. So a worktree of a repository whose config became
+  unsafe cannot be removed through Synapse: fix (or remove) the offending key in the
+  repository's `.git/config` first, or delete the worktree directory yourself and run
+  `git worktree prune` in that repository after checking its config.
+- Host-side `status`/`diff` in a worktree pass `--ignore-submodules=all`, so git never
+  starts a child process inside a nested repository the agent created (its own config
+  and `info/attributes` are not checked by the guard). A linked worktree's
+  `.git/worktrees/<id>/commondir` must point back at the owning repository's `.git`.
 - Work-tree git additionally runs with `--attr-source=<empty tree>`, so the tree's
   `.gitattributes` cannot enable a filter or diff driver even if a config plant
   slips in between the check and the call.

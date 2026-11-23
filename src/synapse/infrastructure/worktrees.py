@@ -34,7 +34,12 @@ _DANGEROUS_CONFIG = re.compile(
     r"^(filter\..+\.(smudge|clean|process)|include\.path|includeif\..+\.path"
     r"|core\.(hookspath|sshcommand|gitproxy|attributesfile|askpass|editor)"
     r"|extensions\.worktreeconfig|diff\.external|diff\..+\.(command|textconv)"
-    r"|merge\..+\.driver|credential\..*helper|gpg\..*program)$")
+    r"|merge\..+\.driver|credential\..*helper|gpg\..*program"
+    # Keys that name a program git runs for transports, lazy fetch or alternates.
+    r"|remote\..+\.(uploadpack|receivepack|vcs|proxy)|core\.alternaterefscommand"
+    r"|uploadpack\..+|http\..*proxy"
+    # Config-defined hooks (git 2.54+: hook.<name>.command/event) bypass core.hooksPath=/dev/null.
+    r"|hook\..+|gpg\.ssh\.defaultkeycommand)$")
 
 _locks_guard = threading.Lock()
 _locks: dict[str, threading.Lock] = {}
@@ -103,12 +108,18 @@ def _git_env() -> dict[str, str]:
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_OPTIONAL_LOCKS": "0",
         "GIT_ASKPASS": "/bin/false",
+        # Never lazily fetch missing objects of a partial clone: that would run the repo-chosen
+        # remote.<name>.uploadpack (or a transport) from a read-only query such as `status`.
+        "GIT_NO_LAZY_FETCH": "1",
         "GIT_AUTHOR_NAME": "synapse", "GIT_AUTHOR_EMAIL": "synapse@localhost",
         "GIT_COMMITTER_NAME": "synapse", "GIT_COMMITTER_EMAIL": "synapse@localhost",
     }
     return env
 
 
+# Every call also starts with the global option ``--no-lazy-fetch`` (same effect as GIT_NO_LAZY_FETCH,
+# see ``git help git``). A git too old to know it rejects the option, so every call then fails closed
+# instead of silently allowing a lazy fetch.
 _HARDEN = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
            "-c", "core.pager=cat", "-c", "gc.auto=0", "-c", "protocol.ext.allow=never",
            "-c", "core.attributesFile=/dev/null", "-c", "diff.external=",
@@ -136,7 +147,7 @@ def _git(cwd: str, args: Iterable[str], *, max_bytes: int = DEFAULT_MAX_BYTES,
     wall-clock deadline enforced by reader threads; on expiry the entire process group dies."""
     args = list(args)
     deadline = time.monotonic() + (_GIT_TIMEOUT if timeout is None else timeout)
-    argv = ["git", *_HARDEN, *args]
+    argv = ["git", "--no-lazy-fetch", *_HARDEN, *args]
     try:
         proc = subprocess.Popen(argv, cwd=cwd, env=_git_env(), shell=False,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -224,6 +235,46 @@ def args_name(args: Iterable[str]) -> str:
     return "?"
 
 
+def refuse_unsafe_repo_config(repo: str, cwd: str | None = None) -> None:
+    """Refuse repo state that makes git run repo-chosen programs. Re-run before every git call
+    that touches a work tree (linked worktrees share this config with the agent's shell).
+    Shared with ``synapse.application.workspace`` so discovery applies the identical rule."""
+    dotgit = os.path.join(repo, ".git")
+    # .git/commondir makes git take config, info/attributes, objects and refs from ANOTHER directory,
+    # so every check below would look at the wrong files. Refused outright (fail closed).
+    if os.path.lexists(os.path.join(dotgit, "commondir")):
+        raise WorktreeError("repository .git/commondir is not allowed")
+    # The effective repository config as git itself resolves it for this git dir (explicit --git-dir:
+    # no discovery walk-up; --local lists without following includes, which are refused below). A
+    # listing that does not fit the cap is refused rather than checked partially.
+    _, out, truncated = _git(cwd or repo, [f"--git-dir={dotgit}", "config", "--local", "--list", "-z"],
+                             max_bytes=1 << 20)
+    if truncated:
+        raise WorktreeError("repository config is too large to check")
+    for entry in out.split("\x00"):
+        key, _, value = entry.partition("\n")
+        key = key.lower()
+        if _DANGEROUS_CONFIG.match(key):
+            raise WorktreeError(f"repository config {key!r} is not allowed")
+        if key == "core.fsmonitor" and value.strip().lower() not in ("false", "0", "no", "off"):
+            raise WorktreeError("repository config 'core.fsmonitor' is not allowed")
+        if key.startswith("alias.") and value.lstrip().startswith("!"):
+            raise WorktreeError(f"repository config {key!r} is not allowed")
+    if os.path.lexists(os.path.join(repo, ".git", "config.worktree")):
+        raise WorktreeError("repository config.worktree is not allowed")
+    info = os.path.join(repo, ".git", "info", "attributes")
+    if os.path.lexists(info):
+        try:
+            if os.path.islink(info):
+                raise WorktreeError("repository info/attributes is not allowed")
+            with open(info, "rb") as fh:
+                lines = fh.read(1 << 20).decode("utf-8", "replace").splitlines()
+        except OSError as exc:
+            raise WorktreeError("repository info/attributes is not readable") from exc
+        if any(ln.strip() and not ln.lstrip().startswith("#") for ln in lines):
+            raise WorktreeError("repository info/attributes is not allowed")
+
+
 class WorktreeManager:
     def __init__(self, repo_allowlist: Iterable[str], root_dir: str) -> None:
         repos = list(repo_allowlist)
@@ -251,6 +302,8 @@ class WorktreeManager:
         dotgit = os.path.join(repo, ".git")
         if os.path.islink(dotgit) or not os.path.isdir(dotgit):
             raise ValueError("repo must contain a real .git directory")
+        if os.path.lexists(os.path.join(dotgit, "commondir")):
+            raise ValueError("repo .git/commondir is not allowed")
         return repo
 
     # --- paths ------------------------------------------------------------
@@ -300,34 +353,19 @@ class WorktreeManager:
             raise WorktreeError("worktree metadata missing") from exc
         if back != dotgit:
             raise WorktreeError("worktree backlink mismatch")
+        # git takes this worktree's common dir (config, attributes, refs) from here: it must be the
+        # owning repository's .git that the guard checks, as written by `git worktree add`.
+        try:
+            with open(os.path.join(gitdir, "commondir"), "rb") as fh:
+                common = fh.read(4096).decode("utf-8", "replace").strip()
+        except OSError as exc:
+            raise WorktreeError("worktree metadata missing") from exc
+        if os.path.normpath(os.path.join(gitdir, common)) != os.path.join(repo, ".git"):
+            raise WorktreeError("worktree commondir does not point at its repository")
         return repo
 
     def _refuse_dangerous_config(self, repo: str, cwd: str | None = None) -> None:
-        """Refuse repo state that makes git run repo-chosen programs. Re-run before every git call
-        that touches a work tree (linked worktrees share this config with the agent's shell)."""
-        _, out, _ = _git(cwd or repo, ["config", "--local", "--list", "-z"], max_bytes=1 << 20)
-        for entry in out.split("\x00"):
-            key, _, value = entry.partition("\n")
-            key = key.lower()
-            if _DANGEROUS_CONFIG.match(key):
-                raise WorktreeError(f"repository config {key!r} is not allowed")
-            if key == "core.fsmonitor" and value.strip().lower() not in ("false", "0", "no", "off"):
-                raise WorktreeError("repository config 'core.fsmonitor' is not allowed")
-            if key.startswith("alias.") and value.lstrip().startswith("!"):
-                raise WorktreeError(f"repository config {key!r} is not allowed")
-        if os.path.lexists(os.path.join(repo, ".git", "config.worktree")):
-            raise WorktreeError("repository config.worktree is not allowed")
-        info = os.path.join(repo, ".git", "info", "attributes")
-        if os.path.lexists(info):
-            try:
-                if os.path.islink(info):
-                    raise WorktreeError("repository info/attributes is not allowed")
-                with open(info, "rb") as fh:
-                    lines = fh.read(1 << 20).decode("utf-8", "replace").splitlines()
-            except OSError as exc:
-                raise WorktreeError("repository info/attributes is not readable") from exc
-            if any(ln.strip() and not ln.lstrip().startswith("#") for ln in lines):
-                raise WorktreeError("repository info/attributes is not allowed")
+        refuse_unsafe_repo_config(repo, cwd)
 
     def _tree_git(self, repo: str, path: str, args: Iterable[str], *, max_bytes: int = DEFAULT_MAX_BYTES,
                   check: bool = True) -> tuple[int, str, bool]:
@@ -364,6 +402,9 @@ class WorktreeManager:
     def check_base(self, repo: str, base_ref: str) -> str:
         """Side-effect-free pre-flight for ``create``: allowlist, ref syntax, no dangerous
         repo config and the ref resolves. Returns the commit SHA; raises ValueError/WorktreeError."""
+        if isinstance(repo, str) and repo in self._repos:
+            self._check_repo(repo)  # a missing/odd .git stays a ValueError, as before
+            self._refuse_dangerous_config(repo)  # guard first: no git query at all on a refused repo
         sha = self._resolve_base(repo, base_ref)
         self._refuse_dangerous_config(repo)
         return sha
@@ -378,6 +419,7 @@ class WorktreeManager:
             raise ValueError("invalid base_ref")
         branch = self._branch(run_id, task_id)
         with self._lock(repo):
+            self._refuse_dangerous_config(repo)  # also on the idempotent path below
             if os.path.lexists(path):
                 self._contained(path)
                 if self._repo_of(path) != repo:
@@ -414,10 +456,10 @@ class WorktreeManager:
         path, repo = found
         _, head, _ = self._tree_git(repo, path, ["rev-parse", "HEAD"])
         rc, br, _ = self._tree_git(repo, path, ["symbolic-ref", "--short", "-q", "HEAD"], check=False)
-        _, porc, t1 = self._tree_git(repo, path, ["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
-                           max_bytes=max_bytes)
+        _, porc, t1 = self._tree_git(repo, path, ["status", "--porcelain=v1", "-z", "--untracked-files=normal",
+                                                     "--ignore-submodules=all"], max_bytes=max_bytes)
         _, stat_out, t2 = self._tree_git(repo, path, ["diff", "--stat", "--no-ext-diff", "--no-textconv",
-                                      "--no-color", "HEAD", "--"], max_bytes=max_bytes)
+                                      "--no-color", "--ignore-submodules=all", "HEAD", "--"], max_bytes=max_bytes)
         n = len([e for e in porc.split("\x00") if e])
         return WorktreeStatus(not porc, head.strip(), br.strip() if rc == 0 else "",
                               n, stat_out, t1 or t2)
@@ -427,7 +469,7 @@ class WorktreeManager:
         if found is None:
             raise WorktreeError("worktree does not exist")
         _, out, trunc = self._tree_git(found[1], found[0], ["diff", "--no-ext-diff", "--no-textconv", "--no-color",
-                                        "HEAD", "--"], max_bytes=max_bytes)
+                                        "--ignore-submodules=all", "HEAD", "--"], max_bytes=max_bytes)
         return BoundedText(out, trunc)
 
     def commit(self, run_id: str, task_id: str, message: str) -> dict:
@@ -451,7 +493,8 @@ class WorktreeManager:
             rc, branch, _ = self._tree_git(repo, path, ["symbolic-ref", "--short", "-q", "HEAD"], check=False)
             if rc != 0 or branch.strip() != self._branch(run_id, task_id):
                 raise WorktreeError("worktree is not on the task branch")
-            _, porc, trunc = self._tree_git(repo, path, ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            _, porc, trunc = self._tree_git(repo, path, ["status", "--porcelain=v1", "-z", "--untracked-files=all",
+                                                         "--ignore-submodules=all"],
                                             max_bytes=_COMMIT_LISTING_BYTES)
             entries = [e for e in porc.split("\x00") if e]
             if not entries:
@@ -513,7 +556,7 @@ class WorktreeManager:
         if found is None:
             raise WorktreeError("worktree does not exist")
         _, out, trunc = self._tree_git(found[1], found[0], ["diff", "--no-ext-diff", "--no-textconv", "--no-color",
-                                                           sha, "HEAD", "--"], max_bytes=max_bytes)
+                                                           "--ignore-submodules=all", sha, "HEAD", "--"], max_bytes=max_bytes)
         return BoundedText(out, trunc)
 
     def remove(self, run_id: str, task_id: str, force: bool = False) -> bool:
@@ -527,9 +570,11 @@ class WorktreeManager:
         with self._lock(repo):
             if not os.path.lexists(path):
                 return False
+            # Also on force: `worktree remove`/`branch -D` would fire config hooks of a refused repo.
+            self._refuse_dangerous_config(repo)
             if not force:
                 _, porc, _ = self._tree_git(repo, path, ["status", "--porcelain=v1", "-z",
-                                                         "--untracked-files=normal"])
+                                                         "--untracked-files=normal", "--ignore-submodules=all"])
                 if porc:
                     raise WorktreeError("worktree has uncommitted changes (use force)")
             args = ["worktree", "remove", path]
