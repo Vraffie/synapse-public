@@ -474,9 +474,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state-dir", type=Path, required=True, help="private daemon state directory")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("health", help="show daemon health")
-    events = commands.add_parser("events", help="replay one page of events")
-    events.add_argument("--after", type=_integer(0, _MAX_SEQUENCE), default=0)
+    events = commands.add_parser("events", help="replay one page of events (--follow to tail them)")
+    events.add_argument("--after", type=_integer(0, _MAX_SEQUENCE), default=None)
     events.add_argument("--limit", type=_integer(1, 1000), default=100)
+    events.add_argument("--follow", action="store_true",
+                        help="keep reading, print one JSON event per line, resume from a saved cursor")
+    events.add_argument("--cursor-file", type=Path, default=None, help="cursor file (default: STATE_DIR/events.cursor)")
+    events.add_argument("--interval", type=float, default=1.0, help="seconds between polls when idle (--follow)")
+    events.add_argument("--stop-when-idle", action="store_true", help="with --follow: exit once caught up")
     for command in ("run", "tasks", "usage"):
         query = commands.add_parser(command, help=f"show run {command} details")
         query.add_argument("run_id", help="run identifier")
@@ -593,7 +598,14 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("approval cursor must be at most 256 characters")
         endpoint = "/api/v1/approvals?" + urlencode({"after": args.after, "limit": args.limit})
     elif args.command == "events":
-        endpoint = "/api/v1/events?" + urlencode({"after": args.after, "limit": args.limit})
+        if args.follow:
+            from synapse.cli.follow import CURSOR_NAME, follow_events
+            if not 0.05 <= args.interval <= 60:
+                parser.error("--interval must be between 0.05 and 60 seconds")
+            return follow_events(lambda endpoint: _request(args.state_dir, endpoint),
+                                 cursor_file=args.cursor_file or args.state_dir / CURSOR_NAME, after=args.after,
+                                 limit=args.limit, interval=args.interval, stop_when_idle=args.stop_when_idle)
+        endpoint = "/api/v1/events?" + urlencode({"after": args.after or 0, "limit": args.limit})
     else:
         endpoint = "/api/v1/system/health"
     try:
