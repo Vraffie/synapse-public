@@ -244,6 +244,25 @@ def _approver_init(state_dir: Path, *, rotate: bool) -> int:
     return 0
 
 
+def _blob_backup_command(args) -> int:
+    from synapse.application import blob_backup as bb
+    from synapse.infrastructure.artifact_blobs import ArtifactIntegrityError
+    try:
+        if args.command == "blobs-backup":
+            info = bb.backup_blobs(args.state_dir, args.db_backup, args.dest)
+            print(f"blob backup written: {args.dest} ({info.blob_count} blobs, {info.total_bytes} bytes)")
+        elif args.command == "blobs-verify":
+            info = bb.verify_blob_backup(args.dir, args.db_backup)
+            print(f"blob backup ok: {info.blob_count} blobs, {info.total_bytes} bytes")
+        else:
+            info = bb.restore_blobs(args.state_dir, args.dir, args.db_backup)
+            print(f"blobs restored: {info.blob_count} blobs, {info.total_bytes} bytes")
+    except (bb.BlobBackupError, ArtifactIntegrityError, OSError, ValueError) as exc:
+        print(f"agentctl: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _backup_command(args) -> int:
     from synapse.persistence import backup as bk
     try:
@@ -495,6 +514,13 @@ def main(argv: list[str] | None = None) -> int:
         sub.add_argument("dest" if name == "backup" else "file", type=Path)
         sub.add_argument("--migrations", type=Path, default=default_migrations_dir(),
                          help="migration directory defining the supported schema version")
+    for name, text in (("blobs-backup", "copy the artifact blobs a database backup references into a new directory"),
+                       ("blobs-verify", "verify a blob backup against its database backup"),
+                       ("blobs-restore", "add a verified blob backup to the state directory (run after restore)")):
+        sub = commands.add_parser(name, help=text)
+        sub.add_argument("dest" if name == "blobs-backup" else "dir", type=Path)
+        sub.add_argument("--db-backup", type=Path, required=True,
+                         help="the database backup file this blob backup belongs to")
     mock_start = commands.add_parser("mock-start", help="start the daemon's fixed synthetic mock fixture")
     mock_start.add_argument("run_id", help="queued run identifier")
     mock_cancel = commands.add_parser("mock-cancel", help="request cancellation of a running synthetic mock run")
@@ -520,6 +546,8 @@ def main(argv: list[str] | None = None) -> int:
         return _approver_init(args.state_dir, rotate=args.rotate)
     if args.command in ("backup", "backup-verify", "restore"):
         return _backup_command(args)
+    if args.command in ("blobs-backup", "blobs-verify", "blobs-restore"):
+        return _blob_backup_command(args)
     if args.command in ("run", "tasks", "usage", "threads", "messages", "mock-start", "mock-cancel", "mock-resume"):
         if (not args.run_id.strip() or len(args.run_id) > 256 or "/" in args.run_id
                 or args.run_id in (".", "..")):

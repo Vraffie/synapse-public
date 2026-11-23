@@ -4,8 +4,8 @@
 
 ## What is and is not backed up
 
-- Included: the database only (runs, tasks, events, approvals, messages, workflows, idempotency records, `schema_migrations`).
-- Never included: `operator.token`, `approver.token`, `synapse.sqlite.lock`, `agentd.sock` and the `artifacts/` blob directory. A backup file therefore contains no credentials. Artifact blobs referenced by the database must be preserved separately if you need them after a restore.
+- Included by `backup`: the database only (runs, tasks, events, approvals, messages, workflows, idempotency records, `schema_migrations`). The artifact blobs have their own commands, [below](#artifact-blobs).
+- Never included: `operator.token`, `approver.token`, `synapse.sqlite.lock`, `agentd.sock`. A backup file therefore contains no credentials. The `artifacts/` blob directory is not part of the database backup; back it up with the blob commands below, or the restored database will reference blobs that do not exist (raw agent output, candidate diffs, manifests).
 - Tokens are re-provisioned, not restored. The daemon creates a fresh `operator.token` on first start in a state directory that has none; run `agentctl --state-dir DIR approver-init` to issue a new approver token. A restore into an existing state directory leaves its current tokens untouched.
 - Backup files contain run and message data and are as sensitive as the database. Store them accordingly.
 
@@ -29,7 +29,7 @@ agentctl --state-dir DIR restore /path/to/new-backup.sqlite     # daemon must be
 
 Opens the file without following symlinks (must be a regular, user-owned file), then checks `PRAGMA integrity_check`, `PRAGMA foreign_key_check`, that `schema_migrations` exists with a contiguous history `1..N`, and that `N` is not newer than the newest migration known to this code. It then compares the file's schema objects to a **schema fingerprint**: the packaged migrations `1..N` are applied to a scratch in-memory database and every table, index, trigger and view (type, name, owning table, whitespace-normalised SQL) must match exactly. Missing objects (for example dropped immutability triggers), extra objects (planted triggers/views/indexes) and modified definitions are all refused, naming the first offenders. An older backup is compared against the schema of its own version, so it still verifies and is upgraded by normal migration at daemon start. It never modifies the file.
 
-Limits: the fingerprint is computed from the migrations shipped with the code, so it defends against a tampered or damaged backup, not against someone who can also alter the code or the live database file (see the security review, F1). The daemon does not yet re-check the fingerprint at start.
+Limits: the fingerprint is computed from the migrations shipped with the code, so it defends against a tampered or damaged backup, not against someone who can also alter the code or the live database file (see the security review, F1). The daemon runs the same schema check at start and reports a mismatch as a broken audit chain (gated tasks are refused until resolved).
 
 ### restore (offline only)
 
@@ -42,6 +42,27 @@ Limits: the fingerprint is computed from the migrations shipped with the code, s
 4. Publishes the restored file as `synapse.sqlite` (0600).
 
 Stop the daemon first (the lock check is a safety net, not a substitute). On start the daemon applies any newer migrations to an older restored database as usual. Restoring a backup from a newer version of the code is refused; upgrade the code instead.
+
+## Artifact blobs
+
+Blobs are content-addressed files in `STATE_DIR/artifacts/` (`artifact-blobs.md`). A blob is written before the transaction that references it commits, so a database snapshot never references a blob that does not exist yet. That gives the rule: **take the database backup first, then back up the blobs that backup references.** Never derive the blob list from the live database.
+
+```
+agentctl --state-dir DIR backup /path/db.sqlite
+agentctl --state-dir DIR backup-verify /path/db.sqlite
+agentctl --state-dir DIR blobs-backup /path/blobs --db-backup /path/db.sqlite   # new directory, must not exist
+agentctl --state-dir DIR blobs-verify /path/blobs --db-backup /path/db.sqlite
+# after `restore` (daemon stopped):
+agentctl --state-dir DIR blobs-restore /path/blobs --db-backup /path/db.sqlite
+```
+
+- `blobs-backup` reads the `artifacts` table of the given backup file (read-only, no symlinks) and copies exactly those blobs through the blob store, re-checking every digest and the recorded size. A missing, corrupt or wrongly sized source blob fails the whole backup and removes the directory it created, naming the first offenders. The new directory is `0700`, files `0600`. It writes `MANIFEST.json` (blob digests and sizes plus the SHA-256 of the database backup file).
+- `blobs-verify` refuses a backup whose manifest is missing or malformed, was taken from a different database backup file, lists different blobs than the database backup references, or holds a blob that does not match its digest or size. Extra files in the directory are ignored.
+- `blobs-restore` verifies first, then adds the blobs to `STATE_DIR/artifacts/` (which must already exist, mode `0700`). Existing intact blobs are kept; a corrupt blob with the same name is repaired by the blob store, which preserves the damaged copy as `.corrupt-*`. It never deletes anything. Blobs created after the snapshot stay in place, unreferenced and harmless.
+- A blob larger than 64 MiB is refused (agent raw output is capped at 4 MiB).
+- Blob backups hold agent output and diffs and are as sensitive as the database. Keep the database backup and its blob directory together; the manifest binds them.
+
+Full upgrade rehearsal, including these steps, is `scripts/upgrade-rehearsal.sh` (see [arch-package.md](arch-package.md#upgrade-and-rollback)).
 
 ## Limits
 

@@ -34,7 +34,7 @@ journalctl --user -u synapse-daemon.service -f
 agentctl --state-dir ~/.local/state/synapse health
 ```
 
-To keep it running after logout: `loginctl enable-linger "$USER"`.
+To keep it running after logout: `sudo loginctl enable-linger "$USER"`. This is an explicit opt-in and off by default; see the lingering decision in [arch-package.md](arch-package.md#lingering-decision).
 
 `Restart=on-failure` adds a second layer on top of the supervisor's own bounded restarts (five by default); the unit stops retrying after five starts in five minutes (`StartLimit*`).
 
