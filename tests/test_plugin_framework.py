@@ -137,7 +137,8 @@ def test_enablement_file_must_be_private_user_owned_and_not_a_symlink(tmp_path):
 
 def test_malformed_enablement_and_manifests_are_rejected(tmp_path):
     path = tmp_path / "plugins.json"
-    for text in ('{"v":1,"plugins":[{"id":"a"}]}', '{"v":2,"plugins":[]}', "not json", '{"v":1,"v":1,"plugins":[]}'):
+    for text in ('{"v":1,"plugins":[{"id":"a"}]}', '{"v":2,"plugins":[]}', "not json", '{"v":1,"v":1,"plugins":[]}',
+                 '{"v":true,"plugins":[]}', '{"v":1.0,"plugins":[]}'):  # bool and float must not pass for version 1
         path.write_text(text)
         os.chmod(path, 0o600)
         with pytest.raises(EnablementError):
