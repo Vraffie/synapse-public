@@ -326,6 +326,39 @@ def test_a_plugin_cannot_switch_the_check_off_through_the_loader_module(tmp_path
     assert loader._undo_tampering.__name__ == "_undo_tampering" and loader._undo_tampering.__code__.co_argcount == 5
 
 
+# --------------------------------------------------------------------------- documented limitations
+# These two tests pin CURRENT behaviour of known gaps in the tamper tripwire (docs/operations/plugin-framework.md).
+# They assert that the changes are NOT detected. If one fails, a change closed the gap: make that a deliberate
+# decision, update the docs and replace the test. Everything is restored in a finally.
+def test_known_gap_mutating_the_check_function_object_in_place_is_not_detected(tmp_path):
+    from synapse.plugins import loader
+    real = loader._undo_tampering.__code__
+    body = ("import sys, builtins\n"
+            "sys.modules['synapse.plugins.loader']._undo_tampering.__code__ = (lambda *a, **k: False).__code__\n"
+            "builtins.GAP_PROBE = 1\n" + GOOD)
+    try:
+        hostile_load(tmp_path, body)  # documented limitation: loads without core_tampering
+    finally:
+        loader._undo_tampering.__code__ = real
+        import builtins
+        if hasattr(builtins, "GAP_PROBE"):
+            del builtins.GAP_PROBE
+    assert loader._undo_tampering.__code__ is real
+
+
+def test_known_gap_changing_a_class_method_code_is_not_detected(tmp_path):
+    import synapse.plugins.policy as policy
+    real = policy.PluginPolicyGate._decide.__code__
+    body = ("import synapse.plugins.policy as p\n"
+            "p.PluginPolicyGate._decide.__code__ = (lambda self, action, resource: p.Decision(True, 'x')).__code__\n" + GOOD)
+    try:
+        hostile_load(tmp_path, body)  # documented limitation: loads without core_tampering
+        assert policy.PluginPolicyGate._decide.__code__ is not real
+    finally:
+        policy.PluginPolicyGate._decide.__code__ = real
+    assert policy.PluginPolicyGate._decide.__code__ is real
+
+
 def test_roles_are_copied_so_later_changes_to_the_plugins_object_do_not_reach_the_registry(tmp_path):
     source = "KEPT = []\n" + GOOD.replace("    return PluginRegistration(roles=(role,))",
                                          "    KEPT.append(role)\n    return PluginRegistration(roles=(role,))")

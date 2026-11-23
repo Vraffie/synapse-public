@@ -126,6 +126,14 @@ The stored roles are therefore separate objects that the plugin cannot edit afte
   plugin that imports a new submodule of a watched package (e.g. `import json.tool`) is refused too, and
   so is any load during which *another* daemon thread adds an attribute to a watched module (the undo then
   also removes that thread's attribute): load plugins before starting other threads.
+  **Known gaps, both verified by probe and not detected:** (1) the check's own function objects can be
+  mutated in place, for example `sys.modules['synapse.plugins.loader']._undo_tampering.__code__ = ...` makes
+  it report nothing (binding the names locally only defeats replacing the module attribute, not changing the
+  function object); (2) code state is recorded only for module-level functions, so changing a class method's
+  `__code__` (for example `PluginPolicyGate._decide.__code__`) is not seen, and a later plugin's gate can
+  then allow an action it was never granted. Neither is a bug to be fixed here: the tripwire is for
+  accidental or naive changes, not a boundary, and in-process plugins are trusted code. Two tests document
+  these gaps; if one starts failing, a change closed it and that should be a deliberate decision.
 - **Registered validators are plugin code that runs later,** outside any of these checks. A `Decision`
   the host receives from a plugin (for instance a validator's return value) must never be treated as a
   policy decision; only a `Decision` the host got from its own gate call counts.
@@ -142,7 +150,7 @@ The stored roles are therefore separate objects that the plugin cannot edit afte
 digest, `enable_package` refusing a package changed since review, manifest strictness, symlink/FIFO/non-UTF-8
 packages, walk limits (depth, directory count, entries), the fd check (FIFO or inode swap after the scan), and
 hostile plugins that are refused: edits to core modules, `hashlib`/`os`/`json`/`stat`, classes, function code
-or builtins (undone), switching the check off, role namespace escape, lying `str` subclasses and mappings,
+or builtins (undone), replacing the check's module attribute, role namespace escape, lying `str` subclasses and mappings,
 `SystemExit`/`KeyboardInterrupt`, raising or returning garbage. Regression for the review finding: plugin F
 patching `hashlib.sha256` is refused and undone, and plugin E's changed bytes still fail `hash_mismatch`, also
 when the patch is applied outside the tripwire's window. Also: version and package hash reach the policy and

@@ -82,7 +82,7 @@ def read_enablement(path: Path) -> EnablementFile:
         doc = json.loads(data.decode("utf-8"), object_pairs_hook=_pairs)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise EnablementError("enablement file is not valid JSON") from exc
-    if not isinstance(doc, dict) or set(doc) != {"v", "plugins"} or doc["v"] != 1 or not isinstance(doc["plugins"], list):
+    if not isinstance(doc, dict) or set(doc) != {"v", "plugins"} or type(doc["v"]) is not int or doc["v"] != 1 or not isinstance(doc["plugins"], list):
         raise EnablementError("unsupported enablement file shape")
     out: dict[str, Enabled] = {}
     for item in doc["plugins"]:

@@ -95,7 +95,12 @@ def _code_state(obj: object) -> tuple:
 
 
 def _snapshot() -> tuple[dict, list[dict], list[tuple]]:
-    """Builtins, guarded module dicts, class attribute dicts and function code of guarded modules."""
+    """Builtins, guarded module dicts, class attribute dicts and module-level function code.
+
+    Known gap: code state (``__code__``/defaults) is recorded only for module-level functions, not for methods
+    of classes (only the class attribute *binding* is compared), so ``SomeClass.method.__code__ = ...`` is not
+    detected. See the tripwire notes in docs/operations/plugin-framework.md.
+    """
     deep: list[tuple] = []
     for module in _GUARDED:
         for value in list(vars(module).values()):
@@ -191,7 +196,11 @@ def load_plugin(directory: Path, enabled: Mapping[str, Enabled], policy: PolicyP
                             package_sha256=package.sha256)
     ctx = PluginContext(manifest.id, manifest.version, entry.granted, gate, package.files)
     namespace: dict = {"__name__": f"synapse_plugin_{manifest.id}", "__builtins__": builtins}
-    # Bind everything the check needs locally so the plugin cannot swap it out through module globals.
+    # Bind the check's functions locally so replacing a module attribute (for example
+    # ``loader._undo_tampering = ...``) does not change which function runs here. This is NOT protection
+    # against a plugin that mutates the function object itself (``_undo_tampering.__code__ = ...`` makes the
+    # check report nothing, and the local name still points at that same object). The tripwire catches
+    # accidental or naive changes; it is not a boundary, and in-process plugins are trusted code.
     undo, validate, snapshot, guarded = _undo_tampering, _validated, _snapshot, _GUARDED
     before = snapshot()
     registration = None
