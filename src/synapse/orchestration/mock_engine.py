@@ -42,6 +42,7 @@ class MockWorkflowEngine:
     _profile_provider = "mock"
     _principal = "mock-engine"
     _budget_check = None  # (db, task_id, profile_id) -> None, raising to refuse a claim; set by the agent engine
+    _budget_block_writer = staticmethod(write_budget_block)  # records a refusal; the agent engine fails the task
 
     def __init__(self, connection: sqlite3.Connection, provider: MockProvider, blobs: ArtifactBlobStore,
                  verify: Callable[[str, bytes], Awaitable[bool]], *, verifier_id: str,
@@ -101,8 +102,8 @@ class MockWorkflowEngine:
         READY -> BLOCKED (no silent downgrade, no retry) with an event and an audit row naming the reason."""
         with self._transaction():
             self._check_running(run_id)
-            write_budget_block(self.db, principal=self._principal, run_id=run_id, task_id=task_id, version=version,
-                               before=State.READY, profile_id=profile_id, denied=denied)
+            self._budget_block_writer(self.db, principal=self._principal, run_id=run_id, task_id=task_id, version=version,
+                                      before=State.READY, profile_id=profile_id, denied=denied)
 
     def _check_running(self, run_id: str) -> None:
         row = self.db.execute("SELECT state FROM runs WHERE id=?", (run_id,)).fetchone()
@@ -180,7 +181,8 @@ class MockWorkflowEngine:
                         break
                     if self.db.execute("SELECT 1 FROM tasks t JOIN task_approval_gates g ON g.task_id=t.id WHERE t.id=? AND t.state='awaiting_approval' AND g.resolved_at IS NULL", (task_id,)).fetchone() is None:
                         continue
-                    resumed = self.gates.resume(run_id=run_id, task_id=task_id, spec=spec, budget_check=self._budget_check)
+                    resumed = self.gates.resume(run_id=run_id, task_id=task_id, spec=spec, budget_check=self._budget_check,
+                                                 budget_block=self._budget_block_writer)
                     if resumed.status == ResumeStatus.RESUMED:
                         self._reservations[task_id] = (run_id, resumed.attempt_id)
                         self._active[task_id] = asyncio.create_task(self._execute(run_id, task_id, resumed.attempt_id, self._assigned_profile(task_id) or self._profile_for(run_id, task_id, profile_id), self._scenario(scenarios[task_id], resumed.attempt_count - 2), resumed.task_version, resumed.attempt_count))
