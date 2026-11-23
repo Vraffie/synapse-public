@@ -3,7 +3,13 @@
 Which tests assert each of the ten critical invariants, and what is not covered. The map lives in
 `tests/test_invariant_coverage.py` as data, and that file fails if a named test is renamed or removed
 or if this page stops listing an invariant. It proves the named tests *exist*; whether they pass is the
-job of the suite. Companion to [fault-injection.md](fault-injection.md) (the harness) and
+job of the suite.
+A named test only counts if pytest would collect it: a module-level `test_*` function or a method of a
+module-level `Test*` class (a nested helper of the same name does not). A referenced test that carries
+`skip`, `skipif` or `xfail` is refused, whether as a decorator, a class-level or module-level
+`pytestmark`. `skipif` is refused even when its condition is currently false, because the condition can be
+true in another environment and the coverage claim would then silently vanish. The doc test also requires
+every named test, not just the first, to appear on this page. Companion to [fault-injection.md](fault-injection.md) (the harness) and
 [fault-injection-tests.md](fault-injection-tests.md) (the SIGKILL suite).
 
 Statuses: `covered` (asserted by tests in or beside the harness), `partial` (some aspect untested, stated

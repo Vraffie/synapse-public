@@ -67,8 +67,70 @@ COVERAGE = {
 STATUSES = {"covered", "partial", "outside-harness"}
 
 
-def _functions(path: Path) -> set[str]:
-    return {n.name for n in ast.walk(ast.parse(path.read_text())) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+BLOCKING_MARKS = {"skip", "skipif", "xfail"}
+
+
+def _mark_names(node: ast.AST) -> set[str]:
+    """Names of pytest marks found in a decorator or a pytestmark value (call, attribute, or a list of them)."""
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return set().union(*(_mark_names(e) for e in node.elts)) if node.elts else set()
+    if isinstance(node, ast.Call):
+        node = node.func
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Attribute) and node.value.attr == "mark":
+        return {node.attr} & BLOCKING_MARKS
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "mark":
+        return {node.attr} & BLOCKING_MARKS
+    return set()
+
+
+def _pytestmark(body: list[ast.stmt]) -> set[str]:
+    found: set[str] = set()
+    for stmt in body:
+        if isinstance(stmt, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in stmt.targets):
+            found |= _mark_names(stmt.value)
+    return found
+
+
+def _decorator_marks(fn: ast.AST) -> set[str]:
+    return set().union(*(_mark_names(d) for d in fn.decorator_list)) if fn.decorator_list else set()
+
+
+def _collected(path: Path) -> dict[str, set[str]]:
+    """Tests pytest would collect from the file -> blocking marks on them.
+
+    Only module-level test_* functions and test_* methods of module-level Test* classes count; a nested
+    helper or a function inside another function with the same name does not. Marks come from the
+    function's decorators, its class's decorators and class-level pytestmark, and module-level pytestmark.
+    Every skip, skipif (conditional or not: a condition can silently be true in CI) and xfail counts.
+    """
+    tree = ast.parse(path.read_text())
+    module_marks = _pytestmark(tree.body)
+    funcs = (ast.FunctionDef, ast.AsyncFunctionDef)
+    found: dict[str, set[str]] = {}
+    for node in tree.body:
+        if isinstance(node, funcs) and node.name.startswith("test"):
+            found[node.name] = module_marks | _decorator_marks(node)
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            class_marks = module_marks | _decorator_marks(node) | _pytestmark(node.body)
+            for item in node.body:
+                if isinstance(item, funcs) and item.name.startswith("test"):
+                    found[f"{node.name}::{item.name}"] = class_marks | _decorator_marks(item)
+                    found.setdefault(item.name, found[f"{node.name}::{item.name}"])
+    return found
+
+
+def _problem(tests_dir: Path, ref: str) -> str | None:
+    """Why a named test does not count as coverage, or None if it does."""
+    file, _, name = ref.partition("::")
+    path = tests_dir / file
+    if not path.is_file():
+        return f"no file {file}"
+    collected = _collected(path)
+    if name not in collected:
+        return f"no collected test {ref}"
+    if collected[name]:
+        return f"{ref} is marked {'/'.join(sorted(collected[name]))} and would not assert anything"
+    return None
 
 
 def test_every_invariant_is_listed_with_a_status_and_tests():
@@ -82,17 +144,50 @@ def test_every_named_test_exists():
     problems = []
     for number, (_, _, tests, _) in COVERAGE.items():
         for ref in tests:
-            file, _, name = ref.partition("::")
-            path = TESTS / file
-            if not path.is_file():
-                problems.append(f"{number}: no file {file}")
-            elif name not in _functions(path):
-                problems.append(f"{number}: no test {ref}")
+            if (why := _problem(TESTS, ref)):
+                problems.append(f"{number}: {why}")
     assert not problems, "\n".join(problems)
+
+
+def test_the_checker_refuses_skipped_xfailed_nested_and_missing_tests(tmp_path):
+    (tmp_path / "test_sample.py").write_text(
+        "import pytest\n"
+        "from pytest import mark\n"
+        "def test_ok(): pass\n"
+        "@pytest.mark.skip(reason='x')\ndef test_skipped(): pass\n"
+        "@pytest.mark.skipif(False, reason='x')\ndef test_conditionally_skipped(): pass\n"
+        "@pytest.mark.xfail\ndef test_xfailed(): pass\n"
+        "@mark.skip\ndef test_bare_mark_skipped(): pass\n"
+        "@pytest.mark.parametrize('a', [1])\ndef test_parametrized(a): pass\n"
+        "def helper_owner():\n    def test_nested(): pass\n"
+        "class TestGroup:\n    def test_method(self): pass\n"
+        "    @pytest.mark.skip\n    def test_skipped_method(self): pass\n"
+        "class Helper:\n    def test_not_collected(self): pass\n"
+        "@pytest.mark.skip\nclass TestSkippedClass:\n    def test_in_skipped_class(self): pass\n"
+    )
+    (tmp_path / "test_modmark.py").write_text("import pytest\npytestmark = [pytest.mark.xfail]\ndef test_a(): pass\n")
+    (tmp_path / "test_classmark.py").write_text("import pytest\nclass TestC:\n    pytestmark = pytest.mark.skipif(True, reason='x')\n    def test_a(self): pass\n")
+    ok = ["test_sample.py::test_ok", "test_sample.py::test_parametrized", "test_sample.py::test_method"]
+    assert [_problem(tmp_path, r) for r in ok] == [None, None, None]
+    for ref, text in [
+        ("test_sample.py::test_skipped", "skip"),
+        ("test_sample.py::test_conditionally_skipped", "skipif"),
+        ("test_sample.py::test_xfailed", "xfail"),
+        ("test_sample.py::test_bare_mark_skipped", "skip"),
+        ("test_sample.py::test_skipped_method", "skip"),
+        ("test_sample.py::test_in_skipped_class", "skip"),
+        ("test_modmark.py::test_a", "xfail"),
+        ("test_classmark.py::test_a", "skipif"),
+    ]:
+        assert text in (_problem(tmp_path, ref) or ""), ref
+    for ref in ["test_sample.py::test_nested", "test_sample.py::test_not_collected", "test_sample.py::test_absent"]:
+        assert "no collected test" in _problem(tmp_path, ref), ref
+    assert _problem(tmp_path, "test_missing.py::test_ok") == "no file test_missing.py"
 
 
 def test_the_documentation_lists_every_invariant_and_status():
     text = DOC.read_text()
     for number, (name, status, tests, _) in COVERAGE.items():
         assert name in text and f"`{status}`" in text, number
-        assert tests[0].split("::")[1] in text, f"doc does not mention {tests[0]}"
+        for ref in tests:
+            assert ref.split("::")[1] in text, f"doc does not mention {ref}"
