@@ -1,0 +1,137 @@
+"""Schemas for currently implemented operator API responses."""
+from copy import deepcopy
+
+from fastapi.openapi.utils import get_openapi
+
+
+def _object(properties, *, required=None):
+    return {"type": "object", "properties": properties,
+            "required": list(properties) if required is None else required}
+
+
+def _nullable(kind="string"):
+    return {"anyOf": [{"type": kind}, {"type": "null"}]}
+
+
+STRING = {"type": "string"}
+INTEGER = {"type": "integer"}
+JSON_OBJECT = {"type": "object", "additionalProperties": True}
+EVENT = _object({"sequence": INTEGER, "id": STRING, "aggregate_type": STRING, "aggregate_id": STRING,
+                 "run_id": _nullable(), "type": STRING, "schema_version": INTEGER, "payload": JSON_OBJECT,
+                 "occurred_at": STRING, "correlation_id": _nullable(), "causation_id": _nullable()})
+RUN = _object({"id": STRING, "workflow_id": STRING, "workflow_version": STRING, "state": STRING,
+               "state_version": INTEGER, "created_at": STRING, "updated_at": STRING})
+TASK_FIELDS = {"id": STRING, "node_id": STRING, "state": STRING, "state_version": INTEGER,
+               "assigned_profile_id": _nullable(), "attempt_count": INTEGER, "created_at": STRING, "updated_at": STRING}
+ATTEMPT = _object({"id": STRING, "attempt_no": INTEGER, "profile_id": _nullable(), "state": STRING,
+                   "session_id": _nullable(), "worktree_path": _nullable(), "started_at": _nullable(),
+                   "ended_at": _nullable(), "exit_code": _nullable("integer")})
+TASK = _object(TASK_FIELDS)
+TASK_DETAIL = _object({**TASK_FIELDS, "attempts": {"type": "array", "items": ATTEMPT}})
+DEPENDENCY = _object({"task_id": STRING, "depends_on_id": STRING})
+APPROVAL_SUBJECT = {"anyOf": [{"type": "null"}, _object({
+    "kind": {"type": "string", "const": "agent_run"}, "node_id": STRING, "repo": _nullable(), "base_ref": _nullable(),
+    "worktree_head": _nullable(), "allowed_tools": {"type": "array", "items": STRING}, "permission_mode": STRING,
+    "timeout_seconds": {"type": "number"}, "prompt_bytes": INTEGER, "prompt_preview": _nullable(),
+    "allowed_tools_truncated": {"type": "boolean"}, "prompt_preview_truncated": {"type": "boolean"}, "prompt_unavailable": {"type": "boolean"},
+    "spec_sha256": STRING})],
+    "description": "Read-only, bounded description of what an agent-run approval authorizes; null for other approvals. "
+                   "prompt_preview (at most 8 KiB) is only present while the approval is pending."}
+APPROVAL = _object({"id": STRING, "run_id": STRING, "operation": STRING, "target": STRING,
+                    "candidate_manifest_sha256": STRING, "policy_version": STRING, "state": STRING,
+                    "state_version": INTEGER, "expires_at": STRING, "requested_at": STRING,
+                    "decided_at": _nullable(), "decision_principal": _nullable(), "decision_reason": _nullable(),
+                    "subject": APPROVAL_SUBJECT})
+RUN_SUMMARY = _object({**RUN["properties"], "task_counts": {"type": "object", "additionalProperties": INTEGER},
+                       "pending_approvals": INTEGER})
+THREAD = _object({"cursor": INTEGER, "id": STRING, "subject": STRING, "status": STRING, "created_at": STRING})
+MESSAGE = _object({"cursor": INTEGER, "id": STRING, "sender_instance_id": STRING, "type": STRING,
+                   "schema_version": INTEGER, "correlation_id": _nullable(), "causation_id": _nullable(),
+                   "payload": JSON_OBJECT, "created_at": STRING, "artifact_refs": {"type": "array", "items": STRING}})
+AGENT_WORKTREE = {"anyOf": [{"type": "null"}, _object({"exists": {"type": ["boolean", "null"]}}, required=["exists"])],
+                  "description": "exists=true adds clean, head, branch, changed_paths, diff_stat, diff, diff_truncated."}
+AGENT_TASK = _object({"task_id": STRING, "node_id": STRING, "state": STRING, "spec": JSON_OBJECT,
+                      "attempt": {"anyOf": [{"type": "null"}, JSON_OBJECT]},
+                      "result": {"anyOf": [{"type": "null"}, JSON_OBJECT]}, "worktree": AGENT_WORKTREE})
+ERROR = _object({"code": STRING, "message": STRING, "details": JSON_OBJECT, "correlation_id": STRING,
+                 "detail": {"description": "Legacy error detail retained for compatibility."}})
+
+
+def _page(name, item):
+    return _object({name: {"type": "array", "items": item}})
+
+
+RESPONSES = {
+    ("/api/v1/system/health", "get"): (200, _object({"status": {"type": "string", "const": "ok"}})),
+    ("/api/v1/events", "get"): (200, _page("events", EVENT)),
+    ("/api/v1/runs", "get"): (200, _object({"runs": {"type": "array", "items": RUN_SUMMARY}, "next_cursor": _nullable()})),
+    ("/api/v1/runs/{run_id}", "get"): (200, _object({"run": RUN, "mock_config": {"anyOf": [{"type": "null"}, _object({"fixture": STRING, "profile_id": STRING, "provider": _nullable()})]}, "tasks": {"type": "array", "items": TASK}, "dependencies": {"type": "array", "items": DEPENDENCY}, "last_sequence": INTEGER})),
+    ("/api/v1/runs/{run_id}/tasks", "get"): (200, _page("tasks", TASK_DETAIL)),
+    ("/api/v1/runs/{run_id}/usage", "get"): (200, _object({
+        "run_id": STRING, "attempts_total": INTEGER, "attempts_with_usage": INTEGER,
+        "observations": {"type": "array", "items": _object({
+            "id": STRING, "attempt_id": STRING, "task_id": STRING, "profile_id": STRING, "source": STRING,
+            "confidence": STRING, "observed_at": STRING, "input_tokens": _nullable("integer"),
+            "output_tokens": _nullable("integer"), "cache_read_tokens": _nullable("integer"),
+            "cache_write_tokens": _nullable("integer"), "cost_usd": _nullable("number")})},
+        "totals": _object({"input_tokens": _nullable("integer"), "output_tokens": _nullable("integer"),
+                           "cache_read_tokens": _nullable("integer"), "cache_write_tokens": _nullable("integer"),
+                           "cost_usd": _nullable("number")}),
+        "coverage": _object({f: _object({"known": INTEGER, "attempts": INTEGER}) for f in (
+            "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "cost_usd")})})),
+    ("/api/v1/runs/{run_id}/threads", "get"): (200, _page("threads", THREAD)),
+    ("/api/v1/runs/{run_id}/threads/{thread_id}/messages", "get"): (200, _page("messages", MESSAGE)),
+    ("/api/v1/approvals", "get"): (200, _page("approvals", APPROVAL)),
+    ("/api/v1/workflows", "post"): (201, _object({"workflow_id": STRING, "version": STRING, "definition_sha256": STRING})),
+    ("/api/v1/runs", "post"): (202, _object({"run_id": STRING, "state": {"type": "string", "const": "queued"}, "tasks": {"type": "object", "additionalProperties": STRING}})),
+    ("/api/v1/runs/{run_id}/mock-start", "post"): (202, _object({"run_id": STRING, "state": {"type": "string", "const": "running"}, "fixture": {"type": "string", "const": "fixed-v1"}})),
+    ("/api/v1/runs/{run_id}/mock-resume", "post"): (202, _object({"run_id": STRING, "state": {"type": "string", "const": "running"}, "assertion": {"type": "string", "const": "fixed-v1-no-external-effects"}})),
+    ("/api/v1/approvals/{approval_id}/decision", "post"): (200, _object({"approval_id": STRING, "state": {"type": "string", "enum": ["approved", "rejected"]}, "state_version": INTEGER})),
+    ("/api/v1/agent-runs", "post"): (201, _object({"run_id": STRING, "task_id": STRING, "state": {"type": "string", "const": "running"},
+                                                   "worktree_path": STRING, "repo": STRING, "base_ref": STRING})),
+    ("/api/v1/runs/{run_id}/agent", "get"): (200, _object({"run_id": STRING, "run_state": STRING, "cancellation_requested": {"type": "boolean"},
+                                                           "outcome": _nullable(), "summary_text": _nullable(),
+                                                           "tool_names": {"type": "array", "items": STRING},
+                                                           "worktree": {"anyOf": [{"type": "null"}, _object({"status": STRING, "head": STRING, "diff_stat": STRING, "diff": STRING, "truncated": {"type": "boolean"}})]},
+                                                           "tasks": {"type": "array", "items": AGENT_TASK}})),
+    ("/api/v1/runs/{run_id}/agent-cancel", "post"): (202, _object({"run_id": STRING, "state": {"type": "string", "const": "cancellation_requested"}})),
+    ("/api/v1/runs/{run_id}/agent-abandon", "post"): (200, _object({"run_id": STRING, "state": {"type": "string", "const": "failed"}, "cancelled_tasks": INTEGER})),
+    ("/api/v1/runs/{run_id}/agent-worktree-remove", "post"): (200, _object({"run_id": STRING, "removed": {"type": "boolean"}, "tasks": {"type": "array", "items": _object({"task_id": STRING, "removed": {"type": "boolean"}})}})),
+    ("/api/v1/runs/{run_id}/mock-cancel", "post"): (202, _object({"run_id": STRING, "state": {"type": "string", "const": "cancellation_requested"}})),
+}
+
+
+def install_openapi_contracts(app):
+    """Describe existing wire responses without filtering or rewriting payloads."""
+    def openapi():
+        if app.openapi_schema is None:
+            schema = get_openapi(title=app.title, version=app.version, routes=app.routes)
+            for (path, method), (status, response_schema) in RESPONSES.items():
+                operation = schema["paths"][path][method]
+                headers = {"X-Correlation-ID": {"schema": STRING, "description": "Validated request correlation ID, or a generated ID."},
+                           "Cache-Control": {"schema": STRING, "description": "Always no-store."}}
+                if method == "post":
+                    headers["Idempotency-Replayed"] = {"schema": {"type": "string", "enum": ["true", "false"]}}
+                operation["responses"][str(status)] = {"description": "Successful response", "headers": headers,
+                                                        "content": {"application/json": {"schema": deepcopy(response_schema)}}}
+                if path == "/api/v1/agent-runs":  # an idempotent replay answers 200 with the same body
+                    operation["responses"]["200"] = deepcopy(operation["responses"][str(status)])
+                    operation["responses"]["200"]["description"] = "Idempotent replay of an earlier start"
+                errors = {401, 422, 500}
+                if path == "/api/v1/system/health":  # no input to validate and no failing dependency
+                    errors = {401}
+                if path.startswith("/api/v1/runs/{run_id}") and method == "get":
+                    errors.update({404, 503})
+                if path == "/api/v1/approvals" or (path == "/api/v1/runs" and method == "get"):
+                    errors.add(503)
+                if method == "post":
+                    errors.update({400, 409, 503})
+                    if path == "/api/v1/approvals/{approval_id}/decision":
+                        errors.update({403, 413, 415})
+                    if path in ("/api/v1/workflows", "/api/v1/runs", "/api/v1/runs/{run_id}/mock-resume", "/api/v1/agent-runs"):
+                        errors.update({413, 415})
+                for error_status in sorted(errors):
+                    operation["responses"][str(error_status)] = {"description": "Error response", "content": {"application/json": {"schema": deepcopy(ERROR)}}}
+            app.openapi_schema = schema
+        return app.openapi_schema
+    app.openapi = openapi

@@ -1,0 +1,5 @@
+# Approval persistence
+
+Migration 0003 adds a version to existing approval records, preserving them at version zero. The daemon-owned approval repository writes requests and compare-and-swap transitions with their events and outbox records in the caller's transaction. The caller must roll back on any error and may use the existing idempotent command wrapper for retries. Conflicting or stale transitions fail without an additional event.
+
+An approval decision requires the stored candidate hash and policy version, and rejects an expired request. This repository is not an authorization boundary: callers must authenticate and authorize a distinct human principal, prevent self-approval, and recheck candidate hashes, operation, target, policy and expiry immediately before any external action. These checks and execution services are not implemented here. Agents must not be given direct access to this repository. Expiration is driven by the daemon expiry sweep (see approval-expiry.md). No deployment capability is enabled.

@@ -1,0 +1,54 @@
+============================= test session starts ==============================
+platform linux -- Python 3.14.10, pytest-9.2.0, pluggy-1.7.0
+rootdir: /work/t
+plugins: anyio-4.16.0
+collected 43 items
+
+test_demo.py ........................................FFF                 [100%]
+
+=================================== FAILURES ===================================
+_______________________________ test_assert_diff _______________________________
+
+    def test_assert_diff():
+        expected = {"a": 1, "b": [1, 2, 3], "c": "x"}
+        actual = {"a": 1, "b": [1, 2, 4], "c": "y"}
+>       assert actual == expected
+E       AssertionError: assert {'a': 1, 'b':... 4], 'c': 'y'} == {'a': 1, 'b':... 3], 'c': 'x'}
+E         
+E         Omitting 1 identical items, use -vv to show
+E         Differing items:
+E         {'b': [1, 2, 4]} != {'b': [1, 2, 3]}
+E         {'c': 'y'} != {'c': 'x'}
+E         Use -v to get more diff
+
+test_demo.py:12: AssertionError
+______________________________ test_zero_division ______________________________
+
+    def test_zero_division():
+>       helper(0)
+
+test_demo.py:20: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+x = 0
+
+    def helper(x):
+>       return 1 / x
+               ^^^^^
+E       ZeroDivisionError: division by zero
+
+test_demo.py:16: ZeroDivisionError
+_____________________________ test_raises_keyerror _____________________________
+
+    def test_raises_keyerror():
+        d = {}
+>       return d["missing-key"]
+               ^^^^^^^^^^^^^^^^
+E       KeyError: 'missing-key'
+
+test_demo.py:25: KeyError
+=========================== short test summary info ============================
+FAILED test_demo.py::test_assert_diff - AssertionError: assert {'a': 1, 'b':....
+FAILED test_demo.py::test_zero_division - ZeroDivisionError: division by zero
+FAILED test_demo.py::test_raises_keyerror - KeyError: 'missing-key'
+========================= 3 failed, 40 passed in 0.02s =========================

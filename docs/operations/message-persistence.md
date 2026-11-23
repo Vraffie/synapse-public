@@ -1,0 +1,7 @@
+# Message persistence
+
+The daemon-owned repository stores a message, its ordered artifact references, independent recipient deliveries, an event and an outbox row atomically. The idempotent command binds the complete message and recipient list to the principal and request key. A failed insert rolls back the entire command. Migration 0004 preserves existing messages and seals them with no artifact references, because the preceding schema could not store references. Messages and their sealed references cannot be updated, replaced or deleted through ordinary SQL.
+
+The trusted caller must authenticate the sender and authorize every recipient and artifact before calling the repository. The repository checks that the thread is open, sender and recipients belong to its run, and causation points to a message in that thread. It does not enforce capability scopes, validate artifact visibility, deliver messages, or authenticate principals. Delivery leasing and acknowledgement remain separate work. Events currently do not persist correlation or causation metadata in the event table; those values remain on the message itself.
+
+Sealing of newly created messages relies on all daemon writers using this repository; direct SQL can create an unsealed message. Callers must bind the authenticated principal to the sender and authorize every recipient and artifact, including on idempotent replay, before invoking the repository.

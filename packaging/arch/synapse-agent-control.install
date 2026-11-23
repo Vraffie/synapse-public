@@ -1,0 +1,41 @@
+# Messages only. This script never starts, enables or stops a service and never creates, changes
+# or deletes user data (state directories, tokens, databases, worktrees).
+
+post_install() {
+  cat <<'MSG'
+==> Synapse is installed. Nothing has been started and no user data was created.
+==> Each user who wants the daemon (as that user, not root):
+      install -d -m 0700 ~/.local/state/synapse   # optional: the unit also creates it
+      systemctl --user daemon-reload
+      systemctl --user enable --now synapse-daemon.service
+      agentctl --state-dir ~/.local/state/synapse health
+==> Real agent runs stay disabled until you pass --claude-cli-config (see
+    /usr/share/doc/synapse-agent-control/operations/agent-runs.md).
+==> Keep it running after logout (optional): loginctl enable-linger "$USER"
+MSG
+}
+
+pre_upgrade() {
+  cat <<'MSG'
+==> Upgrading Synapse. Back up the database first (as each user running the daemon):
+      agentctl --state-dir ~/.local/state/synapse backup ~/synapse-backup-$(date +%F).sqlite
+    Migrations run when the daemon next starts; restart it after the upgrade:
+      systemctl --user daemon-reload && systemctl --user try-restart synapse-daemon.service
+MSG
+}
+
+post_upgrade() {
+  cat <<'MSG'
+==> Synapse upgraded. Running daemons keep the old code until restarted:
+      systemctl --user daemon-reload && systemctl --user try-restart synapse-daemon.service
+    Verify with: agentctl --state-dir ~/.local/state/synapse health
+MSG
+}
+
+pre_remove() {
+  cat <<'MSG'
+==> Removing Synapse. Stop the daemon first if it is running (per user):
+      systemctl --user disable --now synapse-daemon.service
+    Your state directory (~/.local/state/synapse: database, tokens) is NOT touched.
+MSG
+}

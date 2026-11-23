@@ -1,0 +1,3 @@
+# Operator run queries
+
+The operator-only local API provides `GET /api/v1/runs/{id}` for a consistent run snapshot, task dependencies and global event cursor, and `GET /api/v1/runs/{id}/tasks` for the run's tasks with their attempts. Each response is independently read in a SQLite snapshot; the two requests need not reflect the same instant. Unknown runs return 404. Authorization is the same all-runs operator credential as other local API reads; never expose it to agents. Attempts may contain local worktree paths and session identifiers. Queries currently return all tasks without pagination, so callers must treat them as bounded by the deployment's run size. No mutation or scheduler operation is provided.

@@ -1,0 +1,11 @@
+bad.c: In function 'main':
+bad.c:3:11: error: initialization of 'int' from 'char *' makes integer from pointer without a cast [-Wint-conversion]
+    3 |   int x = "str";
+      |           ^~~~~
+bad.c:4:3: error: implicit declaration of function 'undefined_fn' [-Wimplicit-function-declaration]
+    4 |   undefined_fn(x);
+      |   ^~~~~~~~~~~~
+bad.c:5:10: error: 'y' undeclared (first use in this function)
+    5 |   return y;
+      |          ^
+bad.c:5:10: note: each undeclared identifier is reported only once for each function it appears in

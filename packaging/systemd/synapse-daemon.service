@@ -1,0 +1,46 @@
+# Synapse local daemon, systemd *user* unit. See docs/operations/systemd-user-service.md.
+[Unit]
+Description=Synapse local daemon (supervised)
+Documentation=file://%h/.local/share/synapse/docs/systemd-user-service.md
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Private (0700) state dir at $XDG_STATE_HOME/synapse, i.e. %S/synapse.
+StateDirectory=synapse
+StateDirectoryMode=0700
+WorkingDirectory=%S/synapse
+ExecStart=%h/.local/share/synapse/venv/bin/python -m synapse.supervisor --state-dir %S/synapse --max-restarts 5 --base-delay 0.25 --max-delay 8 --shutdown-timeout 5
+# The supervisor stops its child on SIGTERM and may need --shutdown-timeout.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=5
+
+# Hardening. No network access: the daemon only uses AF_UNIX sockets.
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ReadWritePaths=%S/synapse
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+IPAddressDeny=any
+
+[Install]
+WantedBy=default.target

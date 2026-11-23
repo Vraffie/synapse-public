@@ -1,0 +1,347 @@
+"""Real-provider task execution through the mock engine's claim/attempt/gate machinery.
+
+``AgentWorkflowEngine`` reuses ``MockWorkflowEngine`` scheduling, attempts,
+approval gates and run completion and replaces only the provider step. Policy
+differences, all deliberately conservative:
+
+* a failed, timed-out or verifier-rejected attempt is never retried (a retry
+  would spend quota and may modify the worktree again);
+* an ``unknown`` provider outcome, or any error after the process may have
+  started, records the attempt as ``unknown`` and blocks the task for an
+  operator; nothing re-spawns it;
+* provider output is reduced to a bounded summary (capped text, tool names
+  only) stored as an artifact; usage is recorded as an event.
+"""
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import replace
+import json
+import logging
+import sqlite3
+from typing import Any
+
+from synapse.domain.contracts import EventEnvelope, encode_payload, new_id
+from synapse.domain.runs import RunChange, RunState
+from synapse.domain.workflow import State
+from synapse.infrastructure.artifact_blobs import ArtifactBlobStore
+from synapse.orchestration.mock_engine import MockWorkflowEngine, _RunInterrupted
+from synapse.persistence.budget_binding import check_claim_budget
+from synapse.persistence.artifact_store import publish_artifact
+from synapse.persistence.mock_execution_store import record_verification, set_attempt
+from synapse.persistence.run_store import write_run_transition
+from synapse.providers.claude_cli import ClaudeCliProfile, ClaudeCliProvider
+from synapse.providers.contracts import ExecutionRequest, ProviderAdapter, ProviderEvent, UsageObservation
+
+_LOG = logging.getLogger(__name__)
+MAX_SUMMARY_TEXT_BYTES = 16 * 1024
+MAX_TOOL_NAMES = 100
+_PROVIDER_OUTPUT_CAP = 4 * 1024 * 1024
+_ATTEMPT_STATE = {"succeeded": "completed", "failed": "failed", "timed_out": "failed",
+                  "cancelled": "cancelled", "unknown": "unknown"}
+VERIFIER_ID = "builtin.agent.process-outcome-verifier.v1"
+
+
+async def process_outcome_verifier(task_id: str, candidate: bytes) -> bool:
+    """Approve only a well-formed summary whose recorded provider outcome is ``succeeded``.
+
+    This checks the engine-observed process result, NOT the quality of the
+    agent's work. Operators needing more inject a stronger verifier.
+    """
+    try:
+        summary = json.loads(candidate)
+    except ValueError:
+        return False
+    return (isinstance(summary, dict) and summary.get("v") == 1 and summary.get("task_id") == task_id
+            and summary.get("outcome") == "succeeded")
+
+
+class AgentProviderRouter:
+    """ProviderAdapter that picks a ``ClaudeCliProvider`` per task spec.
+
+    Tool allowlist and permission mode are profile-level in the adapter, so one
+    provider is built (and cached) for each distinct narrowed combination via
+    ``dataclasses.replace`` on the operator profile, which re-runs its validation.
+    """
+
+    def __init__(self, profile: ClaudeCliProfile, specs: Mapping[str, Mapping[str, Any]],
+                 factory: Callable[[ClaudeCliProfile], ProviderAdapter] = ClaudeCliProvider):
+        self._profile, self._specs, self._factory = profile, specs, factory
+        self._providers: dict[tuple, ProviderAdapter] = {}
+        self._owner: dict[str, ProviderAdapter] = {}
+        self.handles: dict[str, str] = {}
+        self.start_failed: set[str] = set()
+
+    async def probe(self, profile_id):
+        return await next(iter(self._providers.values())).probe(profile_id)
+
+    async def capabilities(self, profile_id):
+        return await next(iter(self._providers.values())).capabilities(profile_id)
+
+    async def start(self, request: ExecutionRequest) -> str:
+        spec = self._specs[request.task_id]
+        key = (tuple(spec["allowed_tools"]), spec["permission_mode"])
+        try:
+            provider = self._providers.get(key)
+            if provider is None:
+                provider = self._providers[key] = self._factory(
+                    replace(self._profile, allowed_tools=key[0], permission_mode=key[1]))
+            handle = await provider.start(request)
+        except BaseException:
+            self.start_failed.add(request.task_id)  # provider.start never spawns: known no process
+            raise
+        self._owner[handle] = provider
+        self.handles[request.task_id] = handle
+        return handle
+
+    def stream(self, handle):
+        return self._owner[handle].stream(handle)
+
+    async def cancel(self, handle):
+        await self._owner[handle].cancel(handle)
+
+    async def usage(self, handle) -> UsageObservation | None:
+        return await self._owner[handle].usage(handle)
+
+
+class AgentWorkflowEngine(MockWorkflowEngine):
+    """Run tasks with a real provider; see module docstring for the policy."""
+
+    _provider_type = AgentProviderRouter
+    _profile_provider = "claude"
+    _principal = "agent-engine"
+    _budget_check = staticmethod(check_claim_budget)  # unbudgeted unless the run has a bound policy (ADR 020)
+
+    def __init__(self, connection: sqlite3.Connection, router: AgentProviderRouter,
+                 blobs: ArtifactBlobStore, specs: Mapping[str, Mapping[str, Any]],
+                 prompts: Callable[[str], bytes], *,
+                 verify: Callable[[str, bytes], Awaitable[bool]] = process_outcome_verifier,
+                 verifier_id: str = VERIFIER_ID, max_concurrency: int = 2, approval_requester=None,
+                 worktree_check: Callable[[str, str, str], tuple[str, bool]] | None = None,
+                 profile_check: Callable[[str], str | None] | None = None):
+        # max_attempts=2: a gated task spends one attempt on the approval wait.
+        super().__init__(connection, router, blobs, verify, verifier_id=verifier_id,
+                         max_concurrency=max_concurrency, max_attempts=2, approval_requester=approval_requester)
+        self.router, self.specs, self._prompts = router, specs, prompts
+        self._worktree_check = worktree_check
+        self._profile_check = profile_check  # profile_id -> refusal reason or None; only asked for named profiles
+
+    def _profile_problem(self, spec: Mapping[str, Any]) -> str | None:
+        """Fail-closed recheck just before spawn of the profile a task was queued under (absent: default)."""
+        profile_id = spec.get("profile_id")
+        if profile_id is None:
+            return None
+        if self._profile_check is None:
+            return "profile_check_unavailable"
+        try:
+            result = self._profile_check(profile_id)
+        except Exception:
+            return "profile_check_failed"
+        if result is None or (isinstance(result, str) and result):
+            return result
+        return "profile_check_invalid"  # any other value (False, '', ...) still refuses
+
+    async def _worktree_problem(self, run_id: str, task_id: str, path: str, expected_head: str) -> str | None:
+        """Fail-closed recheck just before spawn: HEAD must be the recorded one and the tree clean."""
+        if self._worktree_check is None:
+            return "worktree_check_unavailable"
+        try:
+            head, clean = await asyncio.to_thread(self._worktree_check, run_id, task_id, path)
+        except Exception:
+            return "worktree_check_failed"
+        if head != expected_head:
+            return "worktree_head_changed_since_approval"
+        if not clean:
+            return "worktree_dirty_since_approval"
+        return None
+
+    def _retryable(self, attempt_count: int) -> bool:
+        return False
+
+    async def run(self, run_id: str, profile_id: str, scenarios, approval_steps=None) -> str:
+        outcome = await super().run(run_id, profile_id, scenarios, approval_steps)
+        if outcome == "blocked" and not self._halt and self._finish_stranded(run_id):
+            return RunState.FAILED.value
+        return outcome
+
+    def _finish_stranded(self, run_id: str) -> bool:
+        """End a run whose remaining tasks can never run because a prerequisite failed or was cancelled.
+
+        A FAILED or CANCELLED prerequisite is unambiguous (its dependents need every prerequisite
+        COMPLETED), so those dependents are cancelled and the run fails instead of going to
+        ``recovering``. Anything ambiguous keeps the old behaviour: a task that is blocked, awaiting
+        approval or ready, or ANY attempt that is not finished (``unknown`` included), returns False
+        and the caller routes the run to recovery for an operator. Nothing is ever re-spawned here.
+        """
+        db = self.db
+        if db.execute("SELECT state FROM runs WHERE id=?", (run_id,)).fetchone() != ("running",):
+            return False
+        if db.execute("SELECT 1 FROM task_attempts a JOIN tasks t ON t.id=a.task_id WHERE t.run_id=? "
+                      "AND a.state NOT IN ('completed','failed','cancelled') LIMIT 1", (run_id,)).fetchone():
+            return False
+        tasks = {t: (st, ver) for t, st, ver in db.execute("SELECT id,state,state_version FROM tasks WHERE run_id=?", (run_id,))}
+        deps: dict[str, list[str]] = {}
+        for task_id, dep in db.execute("SELECT d.task_id,d.depends_on_id FROM task_dependencies d JOIN tasks t ON t.id=d.task_id WHERE t.run_id=?", (run_id,)):
+            deps.setdefault(task_id, []).append(dep)
+        dead = {t for t, (st, _) in tasks.items() if st in (State.FAILED, State.CANCELLED)}
+        doomed: set[str] = set()
+        changed = True
+        while changed:  # a waiting task is doomed once any prerequisite is dead or doomed
+            changed = False
+            for task_id, (st, _) in tasks.items():
+                if st == State.WAITING_DEPENDENCIES and task_id not in doomed and any(d in dead or d in doomed for d in deps.get(task_id, ())):
+                    doomed.add(task_id)
+                    changed = True
+        unfinished = {t for t, (st, _) in tasks.items() if st not in (State.COMPLETED, State.FAILED, State.CANCELLED)}
+        if not doomed or unfinished != doomed:
+            return False
+        with self._transaction():
+            self._check_running(run_id)
+            for task_id in sorted(doomed):
+                self._change(task_id, State.WAITING_DEPENDENCIES, State.CANCELLED, tasks[task_id][1])
+            run = db.execute("SELECT state,state_version FROM runs WHERE id=?", (run_id,)).fetchone()
+            write_run_transition(db, RunChange(run_id, RunState(run[0]), RunState.FAILED, run[1]), principal=self._principal)
+        return True
+
+    def _usage_event(self, run_id: str, task_id: str, attempt_id: str, usage: UsageObservation, profile_id: str) -> None:
+        """Record provider-reported usage: the event and the append-only ledger row commit together.
+
+        Nothing is recorded when the provider reported nothing usable (unknown is never stored as 0).
+        ``confidence='reported'``: provider-reported, not independently measured.
+        """
+        known = (usage.input_tokens, usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens, usage.cost_usd)
+        if all(v is None for v in known):
+            return
+        event = EventEnvelope.create(aggregate_type="task_attempt", aggregate_id=attempt_id,
+            event_type="agent.usage_observed",
+            payload={"task_id": task_id, "input_tokens": usage.input_tokens,
+                     "output_tokens": usage.output_tokens, "cache_read_tokens": usage.cache_read_tokens,
+                     "cache_write_tokens": usage.cache_write_tokens, "cost_usd": usage.cost_usd,
+                     "source": usage.source})
+        with self._transaction():
+            self.db.execute("INSERT INTO events(id,aggregate_type,aggregate_id,run_id,type,schema_version,payload_json,occurred_at) VALUES(?,?,?,?,?,?,?,?)",
+                            (event.id, event.aggregate_type, attempt_id, run_id, event.event_type, event.schema_version,
+                             encode_payload(event.payload), event.occurred_at))
+            self.db.execute("INSERT INTO outbox(event_id) VALUES(?)", (event.id,))
+            self.db.execute("INSERT INTO usage_observations(id,attempt_id,profile_id,source,input_tokens,output_tokens,"
+                            "cache_read_tokens,cache_write_tokens,cost_usd,confidence,observed_at,source_event_id) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (new_id(), attempt_id, profile_id, usage.source, usage.input_tokens, usage.output_tokens,
+                             usage.cache_read_tokens, usage.cache_write_tokens, usage.cost_usd, "reported",
+                             event.occurred_at, event.id))
+
+    def _publish_summary(self, run_id: str, task_id: str, attempt_id: str, summary: dict) -> tuple[str, dict]:
+        artifact_id = new_id()
+        data = json.dumps(summary, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ref = publish_artifact(self.db, self.blobs, chunks=[data], artifact_id=artifact_id,
+            media_type="application/json",
+            provenance={"run_id": run_id, "task_id": task_id, "attempt_id": attempt_id, "kind": "agent_summary"},
+            principal=self._principal, idempotency_key=attempt_id).response
+        return artifact_id, ref
+
+    async def _execute(self, run_id: str, task_id: str, attempt_id: str, profile_id: str, scenario: str,
+                       version: int, attempt_no: int) -> None:
+        spec = self.specs[task_id]
+        text, texts_total, truncated = bytearray(), 0, False
+        tools: list[str] = []
+        tool_count = 0
+        terminal: ProviderEvent | None = None
+
+        async def emit(event: ProviderEvent) -> None:
+            nonlocal terminal, texts_total, truncated, tool_count
+            if terminal is not None:
+                raise RuntimeError("Provider emitted after terminal outcome")
+            if event.kind == "output" and isinstance(event.text, str):
+                data = event.text.encode("utf-8")
+                texts_total += len(data)
+                room = MAX_SUMMARY_TEXT_BYTES - len(text)
+                if room < len(data):
+                    truncated = True
+                text.extend(data[:max(room, 0)])
+            elif event.kind == "tool_use" and isinstance(event.text, str):
+                tool_count += 1
+                if len(tools) < MAX_TOOL_NAMES:
+                    tools.append(event.text[:128])
+            elif event.kind in ("succeeded", "failed", "timed_out", "cancelled", "unknown"):
+                terminal = event
+            elif event.kind != "started":
+                raise ValueError("Unexpected provider event")
+
+        try:
+            self._check_running(run_id)
+            problem = self._profile_problem(spec)
+            if problem is None and (spec.get("approval_step") is not None or spec.get("worktree_head") is not None):
+                # A gated task must carry a recorded HEAD; a missing one fails closed (never skips the recheck).
+                problem = (await self._worktree_problem(run_id, task_id, spec["worktree"], spec["worktree_head"])
+                           if isinstance(spec.get("worktree_head"), str) else "worktree_head_missing")
+            if problem is not None:
+                terminal = ProviderEvent("failed", problem)  # refused before any spawn
+            else:
+                request = ExecutionRequest(profile_id, task_id, {
+                    "prompt": self._prompts(task_id).decode("utf-8"), "worktree": spec["worktree"],
+                    "timeout_seconds": spec["timeout_seconds"], "max_output_bytes": _PROVIDER_OUTPUT_CAP})
+                try:
+                    await self.provider.execute(request, emit)
+                except BaseException:
+                    if task_id in self.router.start_failed and terminal is None:
+                        terminal = ProviderEvent("failed", "start_rejected")  # no process was ever spawned
+                    else:
+                        raise
+            if terminal is None:
+                terminal = ProviderEvent("unknown", "no_terminal_event")
+            outcome, detail = terminal.kind, terminal.text
+            usage = None
+            handle = self.router.handles.get(task_id)
+            if handle is not None:
+                try:
+                    usage = await self.router.usage(handle)
+                except Exception:
+                    _LOG.warning("Usage observation unavailable for task %s", task_id)
+            if outcome == "unknown":
+                with self._transaction():
+                    self._check_running(run_id)
+                    set_attempt(self.db, attempt_id=attempt_id, before="running", after="unknown", run_id=run_id, task_id=task_id)
+                    self._change(task_id, State.RUNNING, State.BLOCKED, version)
+            else:
+                target = {"succeeded": State.VERIFYING, "cancelled": State.CANCELLED}.get(outcome, State.FAILED)
+                with self._transaction():
+                    self._check_running(run_id)
+                    set_attempt(self.db, attempt_id=attempt_id, before="running", after=_ATTEMPT_STATE[outcome], run_id=run_id, task_id=task_id)
+                    self._change(task_id, State.RUNNING, target, version)
+            summary = {"v": 1, "run_id": run_id, "task_id": task_id, "attempt_id": attempt_id, "outcome": outcome,
+                       "detail": detail if isinstance(detail, str) else None,
+                       "output_text": bytes(text).decode("utf-8", "ignore"), "output_bytes": texts_total,
+                       "output_truncated": truncated, "tool_names": tools, "tool_use_count": tool_count,
+                       "usage": None if usage is None else {"input_tokens": usage.input_tokens,
+                                                            "output_tokens": usage.output_tokens, "source": usage.source}}
+            try:
+                if usage is not None:
+                    self._usage_event(run_id, task_id, attempt_id, usage, profile_id)
+            except Exception:
+                _LOG.exception("Could not record usage for task %s", task_id)
+            if outcome != "succeeded":
+                try:
+                    self._publish_summary(run_id, task_id, attempt_id, summary)
+                except Exception:
+                    _LOG.exception("Could not store summary for task %s", task_id)
+                return
+            artifact_id, ref = self._publish_summary(run_id, task_id, attempt_id, summary)
+            candidate = self.blobs.read(ref["sha256"])
+            approved = await self.verify(task_id, candidate)
+            if type(approved) is not bool:
+                raise ValueError("Verifier must return bool")
+            with self._transaction():
+                self._check_running(run_id)
+                record_verification(self.db, run_id=run_id, task_id=task_id, task_version=version + 1,
+                    candidate_sha256=ref["sha256"], artifact_id=artifact_id, verifier_id=self.verifier_id, approved=approved)
+        except BaseException as exc:
+            state = self.db.execute("SELECT state,state_version FROM tasks WHERE id=?", (task_id,)).fetchone()
+            with self._transaction():
+                if state[0] == State.RUNNING:
+                    set_attempt(self.db, attempt_id=attempt_id, before="running", after="unknown", run_id=run_id, task_id=task_id)
+                    self._change(task_id, State.RUNNING, State.BLOCKED, state[1])
+                elif state[0] == State.VERIFYING:
+                    self._change(task_id, State.VERIFYING, State.BLOCKED, state[1])
+            if not isinstance(exc, _RunInterrupted):
+                raise

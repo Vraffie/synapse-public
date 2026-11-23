@@ -1,0 +1,331 @@
+"""'Start agent run' form: validation, request building, idempotency and the form widget.
+
+Contract (POST /api/v1/agent-runs): body {repo, base_ref, prompt, allowed_tools, permission_mode, timeout_seconds,
+approval_step}. The form validates client-side what it can and never sends bypass/auto permission modes. The
+Idempotency-Key is generated per submission and reused while the very same payload is retried after a lost
+response; any edit that changes the payload is a new submission with a new key. Nothing here handles tokens
+(the Poller's transport loads the operator token) and nothing formats exception text.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from dataclasses import dataclass
+from uuid import uuid4
+
+from PySide6.QtCore import QSettings, Qt, Signal
+from PySide6.QtWidgets import (
+    QCheckBox, QComboBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
+    QSpinBox, QVBoxLayout, QWidget,
+)
+
+TOOLS = ("Read", "Glob", "Grep", "Edit", "Write", "NotebookEdit", "Bash")
+DEFAULT_TOOLS = ("Read", "Glob", "Grep")
+PERMISSION_MODES = ("plan", "acceptEdits", "dontAsk", "manual")  # bypass/auto modes are deliberately absent
+DEFAULT_MODE = "plan"
+MAX_REPO = 1024
+MAX_REF = 256
+MAX_PROMPT = 20000
+MAX_PROMPT_BYTES = 32768  # the daemon counts UTF-8 bytes as well as characters
+MIN_TIMEOUT, MAX_TIMEOUT, DEFAULT_TIMEOUT = 1, 3600, 900
+MIN_TTL, MAX_TTL, DEFAULT_TTL = 1, 86400, 3600
+MAX_FIELD = 128  # operation / target (the approval binding limit)
+RECENT_KEY = "agent/recent_repos"
+MAX_RECENT = 8
+UNAVAILABLE_TEXT = "Agent runs are not available or not configured on this daemon."
+ACTIVE_TEXT = "The daemon refused the start: a run is already active. Try again when it has finished."
+REJECTED_TEXT = ("The daemon rejected the request (422). Either a value exceeds the daemon's limit (for example the "
+                 "timeout) or a tool is not allowed by the daemon's operator config; adjust the form and retry.")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_CREDENTIAL_URL = re.compile(r"://[^/\s]*@")
+_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/@+~^-]*")
+_TOKEN = re.compile(r"[A-Za-z0-9._:/@+-]{1,128}")
+
+
+def prompt_digest(prompt: str) -> str:
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+
+
+def default_approval_step(repo: str, prompt: str) -> dict:
+    """Prefill: sanitised repo name plus a short prompt hash, so the approver can match what was requested.
+    The daemon only accepts [A-Za-z0-9._:/@+-] (1-128 chars) here, so everything else becomes '-'."""
+    base = re.sub(r"[^A-Za-z0-9._@+-]", "-", repo.strip().rstrip("/").rsplit("/", 1)[-1]).strip("-") or "repo"
+    suffix = ":" + prompt_digest(prompt.strip())[:16]
+    return {"operation": "agent_run.start", "target": (base[:MAX_FIELD - len(suffix)] + suffix)[:MAX_FIELD],
+            "ttl_seconds": DEFAULT_TTL}
+
+
+def utf8_len(text: str) -> int | None:
+    try:
+        return len(text.encode("utf-8"))
+    except UnicodeEncodeError:
+        return None
+
+
+def validate(fields: dict) -> tuple[dict | None, list[str]]:
+    """Return (payload, []) or (None, problems). `fields` holds the raw form values."""
+    problems = []
+    repo = str(fields.get("repo", "")).strip()
+    if not repo:
+        problems.append("Repository is required.")
+    elif len(repo) > MAX_REPO or _CONTROL.search(repo):
+        problems.append("Repository must be a single line of at most %d characters." % MAX_REPO)
+    elif _CREDENTIAL_URL.search(repo):
+        problems.append("Repository must not embed credentials (user:password@host).")
+    ref = str(fields.get("base_ref", "")).strip()
+    if not ref:
+        problems.append("Base ref is required.")
+    elif len(ref) > MAX_REF or _REF.fullmatch(ref) is None or ref.startswith("-") or ".." in ref or "//" in ref or ref.endswith((".lock", "/", ".")):
+        problems.append("Base ref must be a branch, tag or commit name starting with a letter or digit, without spaces, "
+                        "'..', '//' or a trailing '/', '.' or '.lock'.")
+    prompt = str(fields.get("prompt", "")).strip()
+    if not prompt:
+        problems.append("Prompt is required.")
+    elif "\x00" in prompt:
+        problems.append("Prompt must not contain NUL characters.")
+    elif len(prompt) > MAX_PROMPT:
+        problems.append("Prompt must be at most %d characters." % MAX_PROMPT)
+    elif utf8_len(prompt) is None or utf8_len(prompt) > MAX_PROMPT_BYTES:
+        problems.append("Prompt must be valid text of at most %d bytes (UTF-8)." % MAX_PROMPT_BYTES)
+    tools = [t for t in TOOLS if t in set(fields.get("allowed_tools", ()))]
+    if not tools:
+        problems.append("Allow at least one tool.")
+    mode = fields.get("permission_mode")
+    if mode not in PERMISSION_MODES:
+        problems.append("Permission mode must be one of: " + ", ".join(PERMISSION_MODES) + ".")
+    timeout = fields.get("timeout_seconds")
+    if type(timeout) is not int or not MIN_TIMEOUT <= timeout <= MAX_TIMEOUT:
+        problems.append("Timeout must be between %d and %d seconds." % (MIN_TIMEOUT, MAX_TIMEOUT))
+    step = fields.get("approval_step")
+    if step is not None:
+        operation, target, ttl = str(step.get("operation", "")).strip(), str(step.get("target", "")).strip(), step.get("ttl_seconds")
+        if _TOKEN.fullmatch(operation) is None:
+            problems.append("Approval operation must be 1-%d characters of letters, digits and . _ : / @ + - (no spaces)." % MAX_FIELD)
+        if _TOKEN.fullmatch(target) is None:
+            problems.append("Approval target must be 1-%d characters of letters, digits and . _ : / @ + - (no spaces)." % MAX_FIELD)
+        if type(ttl) is not int or not MIN_TTL <= ttl <= MAX_TTL:
+            problems.append("Approval lifetime must be between %d and %d seconds." % (MIN_TTL, MAX_TTL))
+        step = {"operation": operation, "target": target, "ttl_seconds": ttl}
+    if problems:
+        return None, problems
+    return {"repo": repo, "base_ref": ref, "prompt": prompt, "allowed_tools": tools, "permission_mode": mode,
+            "timeout_seconds": timeout, "approval_step": step}, []
+
+
+def encode_payload(payload: dict) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+
+
+def summary_text(payload: dict) -> str:
+    prompt = payload["prompt"]
+    shown = prompt if len(prompt) <= 400 else prompt[:400] + "..."
+    lines = [f"Repository: {payload['repo']}", f"Base ref: {payload['base_ref']}",
+             f"Permission mode: {payload['permission_mode']}", f"Allowed tools: {', '.join(payload['allowed_tools'])}",
+             f"Timeout: {payload['timeout_seconds']} s", f"Prompt ({len(prompt)} chars, sha256 {prompt_digest(prompt)[:16]}):", shown]
+    risky = [t for t in payload["allowed_tools"] if t in ("Edit", "Write", "NotebookEdit", "Bash")]
+    if risky:
+        lines.append("WARNING: this agent may change files or run commands (" + ", ".join(risky) + ") in its own worktree.")
+    step = payload["approval_step"]
+    if step:
+        lines.append(f"Approval required before start: {step['operation']} / {step['target']} (valid {step['ttl_seconds']} s)")
+    else:
+        lines.append("No approval step: the agent starts immediately.")
+    return "\n".join(lines)
+
+
+def ask_confirm(parent, title: str, text: str) -> bool:
+    """Modal yes/no confirmation. Module-level so tests can replace it."""
+    box = QMessageBox(QMessageBox.Icon.Question, title, text, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, parent)
+    box.setTextFormat(Qt.TextFormat.PlainText)
+    box.setDefaultButton(QMessageBox.StandardButton.No)
+    try:
+        return box.exec() == QMessageBox.StandardButton.Yes
+    finally:
+        box.deleteLater()
+
+
+def load_recent(settings: QSettings) -> list[str]:
+    value = settings.value(RECENT_KEY, [])
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [v for v in value if isinstance(v, str) and 0 < len(v) <= MAX_REPO and not _CONTROL.search(v)
+            and not _CREDENTIAL_URL.search(v)][:MAX_RECENT]
+
+
+def remember_repo(settings: QSettings, repo: str) -> list[str]:
+    """Most-recent-first, de-duplicated; only the repo string is stored (never prompts or tokens)."""
+    recent = [repo] + [r for r in load_recent(settings) if r != repo]
+    recent = recent[:MAX_RECENT]
+    settings.setValue(RECENT_KEY, recent)
+    settings.sync()
+    return recent
+
+
+@dataclass(frozen=True)
+class AgentSubmission:
+    payload: dict
+    body: bytes
+    key: str
+    correlation: str
+
+
+class AgentRunForm(QWidget):
+    submit_requested = Signal(object)  # AgentSubmission
+
+    def __init__(self, settings: QSettings | None = None, parent=None):
+        super().__init__(parent)
+        self.settings = settings if settings is not None else QSettings("Synapse", "Desktop")
+        self.repo = QComboBox()
+        self.repo.setEditable(True)
+        self.repo.lineEdit().setPlaceholderText("Repository path or URL")
+        self.repo.addItems(load_recent(self.settings))
+        self.repo.setCurrentText("")
+        self.base_ref = QLineEdit("main")
+        self.prompt = self._make_prompt()
+        self.tool_boxes = {}
+        tools_row = QHBoxLayout()
+        for tool in TOOLS:
+            box = QCheckBox(tool)
+            box.setChecked(tool in DEFAULT_TOOLS)
+            self.tool_boxes[tool] = box
+            tools_row.addWidget(box)
+        self.mode = QComboBox()
+        self.mode.addItems(PERMISSION_MODES)
+        self.mode.setCurrentText(DEFAULT_MODE)
+        self.timeout = QSpinBox()
+        self.timeout.setRange(MIN_TIMEOUT, MAX_TIMEOUT)
+        self.timeout.setValue(DEFAULT_TIMEOUT)
+        self.timeout.setSuffix(" s")
+        self.require_approval = QCheckBox("Require my approval before the agent starts")
+        self.approval_operation = QLineEdit()
+        self.approval_target = QLineEdit()
+        self.approval_ttl = QSpinBox()
+        self.approval_ttl.setRange(MIN_TTL, MAX_TTL)
+        self.approval_ttl.setValue(DEFAULT_TTL)
+        self.approval_ttl.setSuffix(" s")
+        self._approval_edited = False
+        for widget in (self.approval_operation, self.approval_target, self.approval_ttl):
+            widget.setEnabled(False)
+        self.submit_button = QPushButton("Start agent run…")
+        self.problems = QLabel("")
+        self.problems.setWordWrap(True)
+        self.status = QLabel("Fill in the form to start an agent run.")
+        self.status.setWordWrap(True)
+        self.tools_row = tools_row
+        self._build_layout()
+        self._last = None  # (body, key, correlation) of the submission awaiting its outcome
+        self._pending = False
+        self._connect_signals()
+
+    def _make_prompt(self) -> QPlainTextEdit:
+        """Hook: subclasses supply a richer prompt editor."""
+        prompt = QPlainTextEdit()
+        prompt.setPlaceholderText("What should the agent do?")
+        prompt.setMaximumHeight(90)
+        return prompt
+
+    def _build_layout(self):
+        tools_row = self.tools_row
+        form = QFormLayout()
+        form.addRow("Repository", self.repo)
+        form.addRow("Base ref", self.base_ref)
+        form.addRow("Prompt", self.prompt)
+        form.addRow("Allowed tools", tools_row)
+        form.addRow("Permission mode", self.mode)
+        form.addRow("Timeout", self.timeout)
+        form.addRow(self.require_approval)
+        form.addRow("Approval operation", self.approval_operation)
+        form.addRow("Approval target", self.approval_target)
+        form.addRow("Approval valid for", self.approval_ttl)
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(self.submit_button)
+        layout.addWidget(self.problems)
+        layout.addWidget(self.status)
+
+    def _connect_signals(self):
+        self.submit_button.clicked.connect(self.submit)
+        self.require_approval.toggled.connect(self._approval_toggled)
+        self.repo.currentTextChanged.connect(self._autofill_approval)
+        self.prompt.textChanged.connect(self._autofill_approval)
+        self.approval_operation.textEdited.connect(self._mark_edited)
+        self.approval_target.textEdited.connect(self._mark_edited)
+
+    def _mark_edited(self, _text=""):
+        self._approval_edited = True
+
+    def _approval_toggled(self, on):
+        for widget in (self.approval_operation, self.approval_target, self.approval_ttl):
+            widget.setEnabled(on)
+        if on and not self._approval_edited:
+            self._autofill_approval()
+
+    def _autofill_approval(self, *_):
+        if self._approval_edited or not self.require_approval.isChecked():
+            return
+        step = default_approval_step(self.repo.currentText(), self.prompt.toPlainText())
+        self.approval_operation.setText(step["operation"])
+        self.approval_target.setText(step["target"])
+
+    def fields(self) -> dict:
+        step = None
+        if self.require_approval.isChecked():
+            step = {"operation": self.approval_operation.text(), "target": self.approval_target.text(),
+                    "ttl_seconds": self.approval_ttl.value()}
+        return {"repo": self.repo.currentText(), "base_ref": self.base_ref.text(), "prompt": self.prompt.toPlainText(),
+                "allowed_tools": [t for t, box in self.tool_boxes.items() if box.isChecked()],
+                "permission_mode": self.mode.currentText(), "timeout_seconds": self.timeout.value(), "approval_step": step}
+
+    def build_submission(self) -> AgentSubmission | None:
+        """Validate and return a submission, reusing the key only for a byte-identical retry; shows problems."""
+        payload, problems = validate(self.fields())
+        self.problems.setText("\n".join(problems))
+        if payload is None:
+            return None
+        body = encode_payload(payload)
+        if self._last is None or self._last[0] != body:
+            self._last = (body, str(uuid4()), str(uuid4()))
+        return AgentSubmission(payload, body, self._last[1], self._last[2])
+
+    def submit(self):
+        if self._pending:
+            return
+        submission = self.build_submission()
+        if submission is None:
+            self.status.setText("Fix the problems above before starting.")
+            return
+        if not ask_confirm(self, "Start agent run", summary_text(submission.payload)):
+            self.status.setText("Cancelled; nothing was sent.")
+            return
+        self.submit_requested.emit(submission)
+
+    def set_pending(self, pending: bool):
+        self._pending = pending
+        self.submit_button.setEnabled(not pending)
+        if pending:
+            self.status.setText("Starting agent run…")
+
+    def finished(self, outcome: str, result: dict | None = None, repo: str = ""):
+        """Show the outcome; only an accepted start (or a definitive refusal) ends the key's life."""
+        self.set_pending(False)
+        if outcome == "accepted":
+            self._last = None
+            if repo:
+                self.repo.clear()
+                self.repo.addItems(remember_repo(self.settings, repo))
+                self.repo.setCurrentText(repo)
+            self.status.setText(f"Agent run {str((result or {}).get('run_id', ''))[:128]} created "
+                                f"(state {str((result or {}).get('state', ''))[:40]}).")
+        elif outcome == "unavailable":
+            self.status.setText(UNAVAILABLE_TEXT)
+        elif outcome == "active":
+            self.status.setText(ACTIVE_TEXT)
+        elif outcome == "rejected":
+            self.status.setText(REJECTED_TEXT)
+        elif outcome == "invalid":
+            self.status.setText("The daemon's response was not understood; retrying reuses the same request key.")
+        else:
+            self.status.setText("Start failed or the response was lost; retrying reuses the same request key.")

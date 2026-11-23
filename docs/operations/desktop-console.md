@@ -1,0 +1,98 @@
+# Desktop operator console
+
+The PySide6 desktop (`python -m synapse.desktop`) talks to the daemon over the private local socket. It never displays or logs tokens; approver tokens are only entered in the per-decision dialog.
+
+## Control Center (default view)
+
+The desktop opens on the **Control Center**, a plain-language, dark-themed overview of the selected run. The earlier tabbed technical console is unchanged and lives under the **Developer** view (the "Developer view" button, or the view tabs).
+
+![Control Center with a parked approval, a failed step and running steps](img/control-center-overview.png)
+
+- Header with connection pill, a run switcher (from `GET /api/v1/runs`) and a prominent **Start run** button that opens the existing start forms.
+- Five tiles from real data: run status, agents working n/N, checks (or steps) done n/N, messages exchanged, approval gate. "Checks passed" is only shown when some steps are identifiable as review or verification steps; otherwise the tile says "Steps done".
+- **Execution topology**: one card per run task, layered by dependency, with status badge (IDLE, RUNNING, DONE, FAILED, WAITING), solid edges for dependencies and parallel fan-out, and purple dashed feedback edges only from a step in `changes_required` back to its prerequisites. Flow animation runs only while a step is running and the view is visible, and is off under reduced motion (`SYNAPSE_REDUCED_MOTION=1` or the `ui/reduced_motion` setting). Click a card to inspect it. With no runs it shows "No runs yet — start one".
+- Phase strip, agent roster with progress bars, and a detail pane for the selected step (uses `GET /api/v1/runs/{id}/agent` when available).
+- **Approval & safety gates** explains locked, pending, approved, rejected and expired states in plain words; Approve and Reject open the existing token decision dialog (token handling is unchanged).
+- Agent communication feed: events and messages rendered as sentences by `desktop/narrative.py`, with a safe generic fallback for anything unknown.
+- **Prompt composer**, always at the bottom: plain-text multi-line editor (Enter = new line, Ctrl+Enter sends after the usual confirmation), paste is stripped to plain text, "Paste from clipboard" button, live character and UTF-8 byte counters against the 32768-byte daemon limit (Send is disabled when over), a guard that keeps only the first 100 KiB of a huge paste, text-file drop (UTF-8 only, 256 KiB cap, binary refused), repository selector and an Options section (tools, permission mode, approval gate) with safe defaults. Validation, payload and Idempotency-Key reuse are shared with the Start run form. Prompt text is never stored, logged or shown in status messages. After an accepted send the new run is selected.
+
+Screenshots are rendered from fixture data (never shown by the real view) with `QT_QPA_PLATFORM=offscreen PYTHONPATH=src python scripts/render_control_center.py`.
+
+## Connection and replay
+
+- The header shows `Connected` or `Disconnected — reconnecting (attempt N, retry in Ns)`, with a detail line explaining what is stale.
+- Reconnect uses exponential backoff starting at the poll interval (1 s), doubling up to 15 s, and resets on the first successful poll. Panes keep their last result while disconnected.
+- Event replay uses a single cursor (last delivered sequence). It only advances after an event is delivered to the UI, so a drop or daemon restart resumes with `after=<cursor>`: no event is skipped or shown twice. A malformed event aborts the page and the page is re-requested from the cursor.
+- Catching up on a backlog fetches the next 100-event page immediately rather than waiting a full interval.
+
+## Runs
+
+- Enter a run ID (or pick from "Runs inspected this session") to see run state, a per-task list (node, state, attempts), and the dependency graph. The graph is only rebuilt when tasks or dependencies change.
+- Tasks in `awaiting_approval` are summarised, and the requested approvals for the run found on the currently loaded approvals page are listed with approval id, operation and target. "Review selected approval…" switches to the Approvals tab and selects it; the existing Approve/Reject dialog performs the decision.
+- Cancel: the daemon only exposes `POST /api/v1/runs/{id}/mock-cancel`, which the existing "Cancel fixed mock run" button uses.
+
+## Layout of the code
+
+`src/synapse/desktop/`: `__main__.py` (entry point, stable import path), `connection.py` (Poller: the only thread talking to the daemon), `main_window.py` (tabs, menus, shortcuts, status bar), `approvals_view.py`, `runs_view.py`, `messages_view.py`, `events_view.py` (tab logic, mixed into `MainWindow`), `start_panel.py`, `agent_form.py`, `agent_view.py`, `agent_usage.py`, `notifications.py`, `redaction.py`, `status_bar.py`, `shortcuts.py`, plus the existing `approval_decision.py` and `mock_resume.py`. No API, CLI or daemon code is involved.
+
+## Approvals first
+
+- The console opens on the Approvals tab. The tab title carries a badge, `Approvals (N)`, and the status bar shows `Pending approvals: N` (`N+` when more pages exist). The count is the requested approvals on the loaded page.
+- The newest requested approval (highest id) is auto-selected when nothing is selected or the selection is no longer requested, and whenever a new request arrives. Selection is never moved while the decision dialog is open or a decision is in flight.
+- A newly requested approval (first page only; the initial backlog is not announced) raises a notification: a system tray message when a tray is available, otherwise a 10 s status-bar message. The text is only `<operation> on <target>` (or a count plus the latest), truncated, with no ids, digests, reasons or payload.
+- Approve/Reject use the existing decision dialog (per-decision token entry; the token is never stored, displayed or logged).
+
+## Events timeline
+
+- Filters: run (runs seen in events, plus an "Inspected run" shortcut button), event type (types seen so far), and text search. Search covers the safe top-level fields only (sequence, type, aggregate type/id, run id, timestamps, correlation/causation ids), never the payload.
+- Selecting an event shows its JSON in a detail pane. Any key whose name matches token, secret, credential, password/passwd, api key, authorization or private key (any depth, case-insensitive) is shown as `[REDACTED]`; output is size-bounded. Filters change the view only: the 1000-event buffer and cursor are unaffected, and the status line reports how many rows are hidden.
+
+## Status bar
+
+Permanent fields: daemon socket path, health, API version (`v1`, plus the daemon version if health ever reports one), connection state (`connected` or `reconnecting (attempt N, retry in Ns)`), and pending approvals.
+
+## Keyboard shortcuts (Help > Shortcuts, F1)
+
+F5 refresh (polls immediately, reloads the approvals page, cuts a reconnect backoff short); Ctrl+1..4 Approvals, Runs, Events, Messages; Ctrl+Shift+A / Ctrl+Shift+R open the approve / reject dialog for the selected approval; Ctrl+F search events; F1 shortcuts; Ctrl+Q quit. The same table drives the actions and the dialog.
+
+## Start run panel
+
+`StartRunPanel` (Runs tab) has two modes, chosen with a combo box:
+
+- **Mock fixture (queued run)**: unchanged; emits a `StartRequest(run_id, kind)` and drives `POST /api/v1/runs/{id}/mock-start` through the poller.
+- **Agent run**: the `AgentRunForm` in `agent_form.py`, which starts a real agent run with `POST /api/v1/agent-runs`.
+
+### Start agent run form
+
+Fields: repository (editable combo; the last 8 repositories are remembered in non-secret `QSettings` under `agent/recent_repos`, never prompts, tokens or credentials), base ref (default `main`), multi-line prompt, allowed tools (checklist; Read/Glob/Grep on by default, Edit/Write/NotebookEdit/Bash off), permission mode (`plan` default, `acceptEdits`, `dontAsk`, `manual`; bypass and auto modes are not offered), timeout (1 to 3600 s, default 900), and an optional "Require my approval before the agent starts" step with operation/target prefilled (target `<sanitised repo basename>:<first 16 hex of the prompt SHA-256>`, at most 128 characters; editable) plus a lifetime of 1 to 86400 s.
+
+Client-side validation mirrors the daemon contract (required fields, single-line repo without embedded `user:pass@` credentials, safe ref syntax, prompt at most 20000 characters and at most 32768 UTF-8 bytes without NUL, base ref starting with a letter or digit and not ending in `/`, `.` or `.lock`, at least one tool, known mode, integer timeout 1-3600 s, approval operation/target 1-128 characters of `A-Za-z0-9._:/@+-` only, so no spaces). Problems are listed and nothing is sent. A valid form opens a confirmation summary (repository, ref, mode, tools, timeout, prompt length and hash, a warning when edit/Bash tools are allowed, and the approval step) before anything is sent.
+
+Request: `Authorization: Bearer <operator token>` (added by the transport; the form never sees it), `Idempotency-Key`, `X-Correlation-ID`; body `{repo, base_ref, prompt, allowed_tools, permission_mode, timeout_seconds, approval_step|null}`. A fresh key is generated per submission and reused only when the byte-identical payload is retried after a lost or failed response; editing any field starts a new submission. On acceptance the new run is selected on the Runs tab. 404 and 503 show "Agent runs are not available or not configured on this daemon."; 409 shows that a run is already active; 422 says a value exceeds the daemon's limit (for example the timeout) or a tool is not allowed by the daemon's operator config (the transport keeps no response body, so the two cannot be told apart); other failures show a generic retry message. Exception text and response bodies are never displayed.
+
+### Agent detail pane
+
+On the Runs tab the poller also reads `GET /api/v1/runs/{id}/agent` for the selected run (re-probed only every 10th poll after an unavailable answer) and the Agent pane shows outcome, bounded summary text, tool names (first 50), worktree status/head/diff stat and a read-only monospace diff viewer. Everything is treated as untrusted plain text: control characters are stripped, the summary is cut at 8000 characters and the diff at 60000, and the pane states when the diff is truncated (by the daemon or locally). When the run has a requested approval, a banner offers Approve... / Reject... which select that approval and open the existing token decision dialog. "Cancel agent run..." asks for confirmation and then calls `POST /api/v1/runs/{id}/agent-cancel` (empty body, as the daemon refuses any body; one idempotency key per run, reused on retry); it is disabled once the outcome is known or the run is terminal.
+
+#### Abandon, worktree removal and usage
+
+All three reuse routes already on main; the Poller is still the only thread that talks to the daemon, and no token handling changed. Outcomes are shown as plain sentences; response bodies and exception text are never displayed.
+
+- **Abandon recovering run...** calls `POST /api/v1/runs/{id}/agent-abandon` with `{"expected_run_version": N, "assertion": "no-agent-process-remains"}` (N is the state version of the loaded run snapshot). It is enabled only while the run state is `recovering`, an agent detail is loaded and no other request is in flight. The confirmation says that the run is failed and its unfinished tasks cancelled, that recovery stops and nothing is resumed, that a still-requested parked approval is revoked, that the worktree is kept, and that confirming asserts you have checked no agent process for the run is still running (the daemon cannot verify this). 409 (no longer recovering or version changed), 422 and 404/503 each show their own message; a lost response keeps the idempotency key (one per run and version) so a retry replays; a refused request starts a fresh key next time.
+- **Remove worktree...** calls `POST /api/v1/runs/{id}/agent-worktree-remove` (empty body). Enabled only when the run state is `succeeded`, `failed` or `cancelled`. The confirmation lists what is removed (each task's worktree directory and branch) and what is not (the run, events, artifacts). A 409 may mean the run is not finished or a worktree has uncommitted changes; because the daemon can remove task 1 and then fail on task 2, the message says removal was refused or incomplete, that some task worktrees may already be gone, and to check the run's audit trail and refresh (it never claims nothing was removed). **Forced removal (`?force=true`) is CLI/API-only**: it discards uncommitted work and unmerged commits irreversibly, so the desktop deliberately does not offer it. A response that is not the documented success shape (`run_id`, `removed`, `tasks`; for abandon `state == "failed"`) is reported as an unexpected response. If another command is in flight, or the run changed while the confirmation was open, the desktop says so and sends nothing.
+- **Usage** (`usage_pane`, `agent_usage.py`) shows `GET /api/v1/runs/{id}/usage` with the agent detail: one row per observation (task, attempt, input, output, cache read, cache write, cost). It is provider-reported, and cost is labelled an estimate. A field the provider did not report is shown as `unknown`, never `0`; a real zero is shown as `0`. The totals line sums known values only and says "lower bound" with `known/attempts` whenever coverage for that field is partial. Empty ledger, 404/503 and unreadable responses have their own text; values must be non-negative integers (cost a finite number) or the response is rejected, at most 200 rows are shown, and a cost too large for a float is treated as unknown. Coverage with known > attempts is shown as `unknown (inconsistent coverage)`. The table has an accessible name and description, truncated ids carry the full id as a tooltip, labels render as plain text, and the pane is cleared when the agent detail becomes unavailable for the run.
+
+Verified with offscreen tests and a fake daemon client only; not click-tested against a real daemon.
+
+The approval decision dialog shows the same bounded diff as a read-only block when the approval belongs to the selected agent run. It is display only: token entry, validation, the request body and the poller path are unchanged.
+
+## Limits
+
+- Events view keeps the latest 1000 rows and shows how many were received/dropped from view. Threads, messages and approvals are paged at 100 with previous/next. The task list shows at most 200 tasks (the graph at most 1000).
+
+## Known gaps (API, not changed here)
+
+- No run-list endpoint: the "run list" is the runs inspected in this session.
+- No generic run cancel endpoint, only the mock fixture cancel.
+- Tasks carry no approval id, so a parked task cannot be linked to its approval exactly; the UI lists the run's requested approvals beside the parked tasks. Approvals beyond the first loaded page need "Next approvals".
+- If a daemon restart resets event sequences below the cursor, the page is rejected and the console stays in reconnecting state; restart the desktop.

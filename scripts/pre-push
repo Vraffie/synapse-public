@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Git pre-push hook: run `scripts/check.sh --quick` before a push that touches src/ or tests/, and block the push if
+# it fails. A docs-only push skips the check. Install it (opt-in) with scripts/install-hooks.sh.
+#
+# Bypass: `SKIP_CHECK=1 git push` or `git push --no-verify`.
+# Prints only what check.sh prints; never echoes the environment, the remote URL or the push arguments.
+set -u
+zero=0000000000000000000000000000000000000000
+
+if [ "${SKIP_CHECK:-}" = "1" ]; then
+  echo "pre-push: SKIP_CHECK=1, skipping local check"
+  exit 0
+fi
+
+root="$(git rev-parse --show-toplevel)" || exit 0
+touches_code=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -n "${local_sha:-}" ] || continue
+  [ "$local_sha" = "$zero" ] && continue            # branch deletion: nothing to check
+  if [ "$remote_sha" != "$zero" ] && git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+    range="$remote_sha..$local_sha"
+  else
+    # New branch (or remote commit unknown locally): everything not already on a remote.
+    range="$local_sha --not --remotes"
+  fi
+  # shellcheck disable=SC2086
+  if git log --name-only --pretty=format: $range 2>/dev/null | grep -Eq '^(src|tests)/'; then
+    touches_code=1
+    break
+  fi
+done
+
+if [ "$touches_code" = "0" ]; then
+  echo "pre-push: no src/ or tests/ changes in this push, skipping local check"
+  exit 0
+fi
+
+echo "pre-push: running scripts/check.sh --quick (bypass: SKIP_CHECK=1 git push, or --no-verify)"
+if ! "$root/scripts/check.sh" --quick; then
+  echo "pre-push: local check FAILED, push blocked (bypass: SKIP_CHECK=1 git push, or --no-verify)" >&2
+  exit 1
+fi
+exit 0

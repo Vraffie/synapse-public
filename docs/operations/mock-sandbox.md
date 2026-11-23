@@ -1,0 +1,7 @@
+# Fixed mock worker sandbox
+
+`run_fixed_mock(managed_root, worktree)` is an opt-in, daemon-internal Linux primitive, currently not connected to scheduling or any API. It runs only a built-in synthetic output program using `/usr/bin/bwrap` and `/usr/bin/python3`; a missing executable, blocked user namespace, sandbox setup failure or invalid output fails closed. The trusted caller must supply an existing user-owned managed root and an authorized task worktree beneath it. The root and worktree must be protected against path replacement by same-UID processes; containment checking is not a worktree registry or secure descriptor-based mount.
+
+The sandbox mounts only read-only `/usr` and the one writable worktree, exposes a fresh PID namespace and `/proc`, has a private `/tmp`, isolated network, minimal environment, no extra inherited file descriptors and no access to subscription credentials. It does not provide resource ceilings or isolation against arbitrary same-UID host processes, protect kernel attack surfaces, provide a message gateway, prove human identity, or run Claude/Codex. Timeout and caller interruption terminate the spawned process group. See [ADR 014](../adr/014-mock-worker-sandbox.md).
+
+The namespace regression test also forks a test-only descendant that creates a new session and verifies it cannot write after the parent sandbox times out. This tests the fixed Linux/bubblewrap harness, not arbitrary provider processes, resource exhaustion, or kernel compromise.

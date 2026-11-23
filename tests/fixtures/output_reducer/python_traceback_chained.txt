@@ -1,0 +1,18 @@
+Traceback (most recent call last):
+  File "<string>", line 5, in go
+    load()
+    ~~~~^^
+  File "<string>", line 2, in load
+    return {}['k']
+           ~~^^^^^
+KeyError: 'k'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "<string>", line 8, in <module>
+    go()
+    ~~^^
+  File "<string>", line 7, in go
+    raise RuntimeError('config failed') from e
+RuntimeError: config failed

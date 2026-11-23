@@ -1,0 +1,7 @@
+# Operator workflow commands
+
+The private local operator API accepts `POST /api/v1/workflows` with `{"workflow_id":"example","version":"1","nodes":[{"id":"build","dependencies":[]}]}` and `POST /api/v1/runs` with `{"workflow_id":"example","workflow_version":"1"}`. Both require exactly one `Idempotency-Key` and `X-Correlation-ID` header, each 1–256 printable non-space ASCII characters, and `application/json`. Request bodies are capped at 1 MiB, reject duplicate JSON keys and unknown fields, and workflow graph validation additionally enforces DAG and node/edge limits. The correlation ID is returned in the response header for request tracing; it is not yet persisted in workflow events.
+
+Publishing returns 201; creation returns 202 with queued run and task IDs. `Idempotency-Replayed` indicates replay; a repeated key with changed content returns 409. A different key cannot overwrite an already-published version. A failed command rolls back its database writes. A queued run does not start a worker; runtime control is separate.
+
+The API authenticates the bearer token holder over a private Unix socket and records the fixed principal `local-operator`; it does not prove the holder is a human. Do not expose the operator token or socket to workers. Same-user worker isolation is not yet enforced and must be established before running untrusted agents. This endpoint does not grant approval or deployment authority.

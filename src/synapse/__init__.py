@@ -1,0 +1,1 @@
+"""Synapse agent orchestration core."""

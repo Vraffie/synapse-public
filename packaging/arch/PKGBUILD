@@ -1,0 +1,42 @@
+# Maintainer: local build (no upstream release yet). See docs/operations/arch-package.md.
+#
+# Build with packaging/arch/build.sh, which exports the current commit as a tarball, fills in the
+# real SHA-256 and runs makepkg in a clean scratch directory. The checksum below is SKIP only
+# because the source is a local, per-commit tarball that does not exist until it is exported;
+# build.sh replaces it with the actual digest before makepkg verifies it.
+pkgname=synapse-agent-control
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Local-first multi-agent orchestration daemon, operator CLI and desktop shell'
+arch=(any)
+url='https://github.com/Vraffie/synapse-public'
+# No software license has been selected yet (README, "Status and licensing"). This package is for
+# local use only; do not redistribute until a license is chosen.
+license=(LicenseRef-unlicensed)
+depends=(python python-fastapi python-pydantic uvicorn python-websockets)
+makedepends=(python-build python-installer python-setuptools python-wheel)
+# python-mcp is deliberately NOT listed: pyproject pins mcp>=1.20,<2 (extras "mcp"/"test"), Arch ships mcp 2.x and the MCP gateway
+# fails against 2.x (see docs/operations/arch-package.md).
+optdepends=('pyside6: agent-desktop (Qt desktop shell)')
+install=synapse-agent-control.install
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname-$pkgver"
+  python -m build --wheel --no-isolation
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  python -m installer --destdir="$pkgdir" dist/*.whl
+
+  # System-wide user unit. Identical hardening to packaging/systemd/synapse-daemon.service; only
+  # ExecStart (packaged interpreter instead of a per-user venv) and Documentation differ.
+  install -Dm644 packaging/arch/synapse-daemon.service \
+    "$pkgdir/usr/lib/systemd/user/synapse-daemon.service"
+
+  install -d "$pkgdir/usr/share/doc/$pkgname"
+  cp -r docs/operations "$pkgdir/usr/share/doc/$pkgname/operations"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

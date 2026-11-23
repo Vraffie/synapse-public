@@ -1,0 +1,43 @@
+# Autonomous progress
+
+Current state, refreshed 2026-11-20 from `git log origin/main`, `gh pr list` and a full test run on origin/main at `e247f08`. Earlier per-slice integration notes (PR #39 integration branch, `/tmp` worktrees, session handoffs) were transient and have been removed; the commit history and merged PRs are the record. Anything not listed here is unverified.
+
+## Test evidence
+
+Full suite on `e247f08`: 1045 passed, 6 skipped, 1 warning in 126.52s, exit code 0. Command: `QT_QPA_PLATFORM=offscreen uv run --extra test --extra desktop --with-editable . python -m pytest -q`. The MCP extra was not requested in this run.
+
+Re-run on `204f99c` (origin/main at this sync, `scripts/check.sh`): 2005 passed, 13 skipped, 2 xfailed, 2 failed in 223.88s. The two failures are `tests/test_api_contract_coverage.py::test_case_table_covers_exactly_the_documented_routes` and `::test_every_documented_status_has_a_case`: the `/api/v1/runs/{run_id}/usage` route has no case in the coverage table (PR #123 adds it).
+
+## Merged on main
+
+PRs #1-#73 are merged or closed (closed unmerged: #7, #14, #15, #18, #22-#24, #29, #31-#37, which were superseded by the integration in PR #39). Main includes:
+
+- M1 persistence: migrations 0001-0014 (`src/synapse/persistence/migrations_sql`), transactional repositories, append-only events, consistent snapshots, approval persistence with requester binding.
+- M2 mock orchestration: mock provider and scenarios, supervised in-process executions, daemon-owned mock runtime, approval gates in the mock engine (#54, #61), approval expiry sweep (#51), stale-socket reclaim under the daemon lock (#43, #56).
+- M3 clients: local API, `agentctl`, PySide6 desktop with reconnect backoff and an approvals-first UI (#60, #66), human approval decision endpoint, CLI and desktop dialog (#42, #44-#46, #48), denied-decision audit (#59), `GET /api/v1/runs` (#63).
+- Agent runs: Claude CLI adapter, disabled by default (#53, #55, #73), `AgentRuntime` (#67), real agent runs through the API, `agentctl` and desktop (#68, #69), per-task git worktree manager (#62) hardened in #71.
+- Ops: systemd user service (#57), backup/restore (#58), packaged migrations (#64), end-to-end mock demo and live-daemon smoke test (#65), security review document (#72).
+
+## Also merged since #73
+
+Checked against `gh pr list --state merged`: #74 (desktop Control Center home), #75 (backup schema fingerprint, restore revokes approvals), #76/#89 (socket lock, umask, identity), #77 (full-spec approval binding and spawn-time worktree recheck), #80, #83, #85 (ADR 015), #91 (profile registry, not wired), #92 (usage ledger, migration 0014), #93 (Codex adapter, not wired), #95/#98/#112 (ADRs 016, 017, 019), #97 (candidate manifest), #100 (budget/routing policy, not wired), #102 (Arch package), #105 (agent roles), #106 (output reducer, not wired), #109, #111, #118 and the test PRs #101, #103, #104.
+
+## Open PRs (not merged)
+
+Open at the time of this sync (`gh pr list --state open`): #78 (backlog), #79 (Claude CLI version probe), #81 (agent worktree removal), #82 (abandon recovering agent runs), #84 (`--tools` restriction), #87, #88 (multi-task agent runs), #90, #96, #107, #108, #110, #113, #114, #115, #116, #117, #119, #120, #121, #122 and #123. Their review and CI status was not checked.
+
+## Known open nits (checked against current main code)
+
+- Desktop `closeEvent` (`src/synapse/desktop/main_window.py`) waits up to 11 s for the poller and ignores the close if it does not stop.
+- Same-user approver token is a file, not isolation from same-user agent processes.
+
+Items from the earlier list that are no longer true: stale `agentd.sock` blocks restart (reclaim added in #43), event stream pausing 250 ms after each full page (fixed, the loop continues without idling), `run_queries` mapping every `ValueError` to 404 (now only `RunNotFound` maps to 404).
+
+## Remaining acceptance gaps
+
+- M1-M3 exit gates are not demonstrated as complete (see `IMPLEMENTATION_BACKLOG.md`).
+- Secure agent session provisioning and worker isolation; live MCP/fallback communication.
+- Real-worker process fencing and automatic reconciliation; mock resume is fixed-fixture only and must not be generalised to subprocess or provider effects.
+- Genuinely independent reviewer; stronger distinct-human identity.
+- Wiring of the Codex adapter and profile registry, budget and routing policy, output reducer and usage analytics (M4 remainder, M5; the adapter, registry, policy modules and usage ledger are merged but not wired or only partly wired), multi-repo plugin (M6), deployment and release gates (M7).
+- No live provider is enabled by default and no deployment has occurred.

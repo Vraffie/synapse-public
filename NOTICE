@@ -1,0 +1,8 @@
+Synapse
+Copyright 2026 The Synapse authors
+
+This product is licensed under the MIT License (see LICENSE).
+
+Third-party components are used under their own licences. Notably, the optional desktop client depends on
+PySide6 (Qt for Python), which is licensed under the GNU LGPL v3 (or GPL v3 / commercial); it is used as an
+unmodified, dynamically linked dependency and is not distributed in this repository.
