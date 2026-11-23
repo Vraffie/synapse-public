@@ -50,6 +50,11 @@ elif mode in ("errors", "errors-fail"):
     if mode == "errors-fail":
         sys.exit(3)
     ok()
+elif mode in ("errors-emoji", "errors-cjk", "errors-quotes"):
+    filler = {{"errors-emoji": chr(0x1F600) * 60, "errors-cjk": chr(0x9519) * 80, "errors-quotes": ('"' + chr(92)) * 40}}[mode]
+    for i in range(3000):
+        text("error: distinct failure %d " % i + filler)
+    ok()
 elif mode == "nul":
     text("start\\x00binary")
     text("FAILED tests/test_n.py::test_nul - AssertionError: after nul")
@@ -1083,3 +1088,14 @@ def test_a_capped_capture_is_reported_as_incomplete_in_the_summary_fields(env):
     fields = asyncio.run(go())
     assert fields["raw_complete"] is False and fields["output_truncated"] is True and fields["raw_artifact_id"]
     assert fields["raw_sha256"] == hashlib.sha256(b"line one\nline two\n").hexdigest()
+
+
+@pytest.mark.parametrize("prompt", ["errors-emoji", "errors-cjk", "errors-quotes"])
+def test_the_summary_is_sized_on_its_serialised_json_so_escaped_text_cannot_overflow(env, prompt):
+    _run(env, prompt)
+    assert env.states() == ("succeeded", {"work": "completed"})
+    (row,) = env.db.execute("SELECT sha256,byte_size FROM artifacts WHERE json_extract(provenance_json,'$.kind')='agent_summary'").fetchall()
+    assert row[1] <= 48 * 1024  # the stored JSON, not the text
+    (summary,) = env.summaries()
+    assert summary["clipped"] is True and "[clipped" in summary["output_text"] and summary["raw_artifact_id"]
+    assert env.db.execute("SELECT outcome FROM verification_results").fetchall() == [("approved",)]

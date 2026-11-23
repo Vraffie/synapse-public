@@ -45,6 +45,8 @@ MAX_SUMMARY_TEXT_BYTES = 16 * 1024
 # reduce_output keeps every failure line even past its budget (up to 1 MiB); the summary blob holds 64 KiB, so the
 # forwarded text is clipped hard. The full text is always in the raw artifact.
 MAX_FORWARDED_TEXT_BYTES = 32 * 1024
+# The serialised summary (json.dumps escapes non-ASCII: up to 3x) must fit the 64 KiB blob bound with headroom.
+MAX_SUMMARY_JSON_BYTES = 48 * 1024
 _CLIP_MARKER = "\n[clipped: output continues in the raw artifact]\n"
 MAX_TOOL_NAMES = 100
 _PROVIDER_OUTPUT_CAP = 4 * 1024 * 1024
@@ -123,6 +125,29 @@ class AgentProviderRouter:
 
     async def usage(self, handle) -> UsageObservation | None:
         return await self._owner[handle].usage(handle)
+
+
+def _serialize_summary(summary: dict) -> bytes:
+    return json.dumps(summary, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _fit_summary(summary: dict) -> dict:
+    """Shrink ``output_text`` until the SERIALISED summary fits; measured on the JSON, not on the text."""
+    if len(_serialize_summary(summary)) <= MAX_SUMMARY_JSON_BYTES:
+        return summary
+    fitted = dict(summary, clipped=True, output_truncated=True)
+    text = fitted.get("output_text")
+    text = text if isinstance(text, str) else ""
+    keep = len(text)
+    while keep > 0:
+        fitted["output_text"] = text[:keep].rstrip() + _CLIP_MARKER
+        size = len(_serialize_summary(fitted))
+        if size <= MAX_SUMMARY_JSON_BYTES:
+            return fitted
+        # shrink in proportion to the overshoot (escaping makes bytes-per-char uneven), always making progress
+        keep = min(keep - 1, int(keep * MAX_SUMMARY_JSON_BYTES / size * 0.95))
+    fitted["output_text"] = _CLIP_MARKER
+    return fitted
 
 
 def _clip_text(text: str) -> tuple[str, bool]:
@@ -309,7 +334,7 @@ class AgentWorkflowEngine(MockWorkflowEngine):
 
     def _publish_summary(self, run_id: str, task_id: str, attempt_id: str, summary: dict) -> tuple[str, dict]:
         artifact_id = new_id()
-        data = json.dumps(summary, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        data = _serialize_summary(_fit_summary(summary))
         ref = publish_artifact(self.db, self.blobs, chunks=[data], artifact_id=artifact_id,
             media_type="application/json",
             provenance={"run_id": run_id, "task_id": task_id, "attempt_id": attempt_id, "kind": "agent_summary"},
