@@ -87,6 +87,7 @@ class Env:
                               abandon_agent_run=self.runtime.abandon,
 
                               remove_agent_worktree=self.service.remove_worktree,
+                              commit_agent_worktree=self.service.commit_worktree,
                               read_run=lambda rid: read_run_snapshot(self.db, rid))
 
     def body(self, **over):
@@ -920,3 +921,42 @@ def test_per_task_profiles_run_each_task_under_its_own_profile(env):
         "SELECT payload_json FROM events WHERE type='agent.profile_selected'")}
     assert {p["profile_id"] for p in picked.values()} == {"reader", at.AGENT_PROFILE}
     assert env.db.execute("SELECT COUNT(*) FROM events WHERE type='agent.profile_selected'").fetchone() == (2,)
+
+
+# ------------------------------------------------------------ worktree commit
+def _commit(c, run_id, message="agent edits", key="c1", **kw):
+    return c.post("/api/v1/runs/%s/agent-worktree-commit" % run_id, headers=headers(key), json={"message": message, **kw})
+
+
+def test_commit_worktree_commits_on_task_branch_audits_and_is_clean_afterwards(env):
+    async def go(c):
+        start = await c.post("/api/v1/agent-runs", headers=headers(), json=env.body())
+        run_id, path = start.json()["run_id"], start.json()["worktree_path"]
+        await wait_state(env, run_id, {"succeeded"})
+        first = await _commit(c, run_id, "SECRET-MESSAGE")
+        second = await _commit(c, run_id, key="c2")  # tree is clean now: nothing to commit
+        dirty_remove = await _remove(c, run_id, key="c3")  # clean, so removal needs no force
+        return run_id, first, second, dirty_remove
+    run_id, first, second, removed = drive(env, go)
+    assert first.status_code == 200, first.text
+    task = first.json()["tasks"][0]
+    assert task["branch"].startswith("synapse/%s/" % run_id) and len(task["head"]) == 40 and task["paths"] >= 1
+    assert second.status_code == 409 and "Nothing to commit" in second.text
+    assert removed.status_code == 200
+    ev = env.db.execute("SELECT payload_json FROM events WHERE run_id=? AND type='agent.worktree_committed'", (run_id,)).fetchall()
+    assert len(ev) == 1 and task["head"] in ev[0][0] and "SECRET-MESSAGE" not in ev[0][0]
+
+
+def test_commit_worktree_refusals(env):
+    async def go(c):
+        start = await c.post("/api/v1/agent-runs", headers=headers(), json=env.body())
+        run_id = start.json()["run_id"]
+        active = await _commit(c, run_id)
+        await wait_state(env, run_id, {"succeeded"})
+        return (active, await _commit(c, run_id, "", key="c2"), await _commit(c, run_id, "x", key="c3", bogus=1),
+                await _commit(c, "nope", key="c4"),
+                await c.post("/api/v1/runs/%s/agent-worktree-commit" % run_id, headers={"Idempotency-Key": "k", "X-Correlation-ID": "t"},
+                             json={"message": "m"}))
+    active, empty, extra, unknown, anon = drive(env, go)
+    assert active.status_code == 409 and empty.status_code == 422 and extra.status_code == 422
+    assert unknown.status_code == 404 and anon.status_code == 401

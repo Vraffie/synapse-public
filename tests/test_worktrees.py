@@ -427,3 +427,52 @@ def test_worktree_whose_repo_left_allowlist_is_refused(two, tmp_path):
         m2.status("r", "t")
     with pytest.raises(WorktreeError):
         m2.remove("r", "t", force=True)
+
+
+def test_commit_lands_on_task_branch_only(mgr, repo):
+    p = mgr.create("run1", "task1", repo, "main")
+    main_before = run_git(repo, "rev-parse", "main").strip()
+    open(os.path.join(p, "a.txt"), "w").write("changed\n")
+    open(os.path.join(p, "new.txt"), "w").write("new\n")
+    out = mgr.commit("run1", "task1", "fix things")
+    assert out["branch"] == "synapse/run1/task1" and out["paths"] == 2 and out["head"] != out["head_before"]
+    assert mgr.status("run1", "task1").clean
+    assert run_git(repo, "rev-parse", "main").strip() == main_before  # owner's branch untouched
+    assert open(os.path.join(repo, "a.txt")).read() == "hi\n"
+    assert run_git(repo, "log", "-1", "--format=%s", out["branch"]).strip() == "fix things"
+    assert run_git(repo, "log", "-1", "--format=%an", out["branch"]).strip() == "synapse"
+
+
+def test_commit_refuses_clean_bad_message_and_missing(mgr, repo):
+    p = mgr.create("run1", "task1", repo, "main")
+    with pytest.raises(WorktreeError, match="nothing to commit"):
+        mgr.commit("run1", "task1", "x")
+    open(os.path.join(p, "a.txt"), "w").write("c\n")
+    for bad in ("", "  ", "a" * 2001, "x\x00y", None):
+        with pytest.raises(ValueError):
+            mgr.commit("run1", "task1", bad)
+    with pytest.raises(WorktreeError, match="does not exist"):
+        mgr.commit("nope", "task1", "x")
+
+
+def test_commit_ignores_hooks_and_refuses_gitlinks(mgr, repo):
+    p = mgr.create("run1", "task1", repo, "main")
+    hooks = os.path.join(repo, ".git", "hooks")
+    marker = os.path.join(repo, "hook-ran")
+    with open(os.path.join(hooks, "pre-commit"), "w") as fh:
+        fh.write(f"#!/bin/sh\ntouch {marker}\n")
+    os.chmod(os.path.join(hooks, "pre-commit"), 0o755)
+    open(os.path.join(p, "a.txt"), "w").write("c\n")
+    mgr.commit("run1", "task1", "x")
+    assert not os.path.exists(marker)
+    nested = os.path.join(p, "inner")
+    os.mkdir(nested)
+    run_git(nested, "init", "-q", "-b", "main")
+    open(os.path.join(nested, "f"), "w").write("1")
+    run_git(nested, "add", "f")
+    run_git(nested, "commit", "-q", "-m", "i")
+    head = mgr.status("run1", "task1").head
+    with pytest.raises(WorktreeError, match="gitlink"):
+        mgr.commit("run1", "task1", "y")
+    assert mgr.status("run1", "task1").head == head  # nothing committed, index reset
+    assert run_git(p, "diff", "--cached", "--name-only").strip() == ""

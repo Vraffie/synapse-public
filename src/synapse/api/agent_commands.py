@@ -26,6 +26,7 @@ CancelAgent = Callable[[str, str], object]
 # (run_id, key, expected_run_version, assertion) -> CommandResult
 AbandonAgent = Callable[[str, str, int, str], object]
 RemoveWorktree = Callable[[str, bool], dict | Awaitable[dict]]
+CommitWorktree = Callable[[str, str], dict | Awaitable[dict]]
 
 
 class AgentRunError(Exception):
@@ -40,6 +41,11 @@ class ApprovalStepRequest(BaseModel):
     operation: str = Field(strict=True, min_length=1, max_length=128)
     target: str = Field(strict=True, min_length=1, max_length=128)
     ttl_seconds: int | None = Field(default=None, strict=True, ge=1, le=86400)
+
+
+class CommitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    message: str = Field(strict=True, min_length=1, max_length=2000)
 
 
 class AbandonRequest(BaseModel):
@@ -95,7 +101,8 @@ def _schema():
 
 def agent_command_router(start: StartAgent | None, read: ReadAgent | None, cancel: CancelAgent | None,
                          abandon: AbandonAgent | None = None,
-                         remove_worktree: RemoveWorktree | None = None) -> APIRouter:
+                         remove_worktree: RemoveWorktree | None = None,
+                         commit_worktree: CommitWorktree | None = None) -> APIRouter:
     router = APIRouter(dependencies=[Security(HTTPBearer())])
 
     def respond(result, status, correlation):
@@ -198,6 +205,26 @@ def agent_command_router(start: StartAgent | None, read: ReadAgent | None, cance
                 raise HTTPException(400, detail="Request body is not supported")
         try:
             result = remove_worktree(run_id, force)
+            if inspect.isawaitable(result):
+                result = await result
+        except RunNotFound:
+            raise HTTPException(404, detail="Agent run not found") from None
+        except AgentRunError as exc:
+            raise HTTPException(exc.status, detail=exc.message) from None
+        return JSONResponse(result)
+
+    @router.post("/api/v1/runs/{run_id}/agent-worktree-commit", openapi_extra={
+        "parameters": _COMMAND_HEADERS,
+        "requestBody": {"required": True, "content": {"application/json": {"schema": CommitRequest.model_json_schema()}}}})
+    async def agent_worktree_commit(request: Request, run_id: str = Path(min_length=1, max_length=256)):
+        _headers(request)
+        if not run_id.strip():
+            raise HTTPException(422, detail="Invalid run ID")
+        if commit_worktree is None:
+            raise HTTPException(503, detail="Agent runs unavailable")
+        body = await _body(request, CommitRequest)
+        try:
+            result = commit_worktree(run_id, body.message)
             if inspect.isawaitable(result):
                 result = await result
         except RunNotFound:

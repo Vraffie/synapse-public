@@ -20,6 +20,7 @@ Generated from the contracts in `src/synapse/api/openapi_contracts.py`; regenera
 - Runs: `POST /api/v1/runs`
 - Runs: `GET /api/v1/runs/{run_id}`
 - Runs: `POST /api/v1/runs/{run_id}/agent-abandon`
+- Runs: `POST /api/v1/runs/{run_id}/agent-worktree-commit`
 - Runs: `POST /api/v1/runs/{run_id}/agent-worktree-remove`
 - Runs: `POST /api/v1/runs/{run_id}/mock-cancel`
 - Runs: `POST /api/v1/runs/{run_id}/mock-resume`
@@ -720,6 +721,138 @@ Success (or idempotent replay of an earlier command).
   "run_id": "string",
   "state": "failed",
   "cancelled_tasks": 1
+}
+```
+
+#### 400
+
+Bad request: malformed header, body or idempotency key.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 401
+
+Missing or invalid operator bearer token.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 409
+
+Conflict: stale state version, or the idempotency key was reused with a different request.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 422
+
+Validation error: a parameter or body field is outside its documented bounds.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 500
+
+Internal error (the body never contains traces or file paths).
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 503
+
+A dependency is temporarily unavailable; retry later.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+### `POST /api/v1/runs/{run_id}/agent-worktree-commit`
+
+Agent Worktree Commit.
+
+**Auth:** operator bearer token (`Authorization: Bearer <token>`).
+
+**Parameters**
+
+| Name | In | Required | Constraints |
+| --- | --- | --- | --- |
+| `run_id` | path | yes | string, minLength=1, maxLength=256 |
+| `Idempotency-Key` | header | yes | string, minLength=1, maxLength=256, pattern=`^[!-~]+$` |
+| `X-Correlation-ID` | header | yes | string, minLength=1, maxLength=256, pattern=`^[!-~]+$` |
+
+**Request body** (`application/json`, required)
+
+| Field | Required | Constraints |
+| --- | --- | --- |
+| `message` | yes | string, minLength=1, maxLength=2000 |
+
+Example:
+
+```json
+{
+  "message": "string"
+}
+```
+
+**Responses**
+
+#### 200
+
+Success (or idempotent replay of an earlier command).
+
+```json
+{
+  "run_id": "string",
+  "tasks": [
+    {
+      "task_id": "string",
+      "branch": "string",
+      "head": "string",
+      "paths": 1
+    }
+  ]
 }
 ```
 

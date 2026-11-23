@@ -23,6 +23,8 @@ from synapse.domain.contracts import validate_id
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _MAX_REF = 256
+MAX_COMMIT_MESSAGE = 2000
+MAX_COMMIT_PATHS = 1000
 _GIT_TIMEOUT = 60.0
 DEFAULT_MAX_BYTES = 64 * 1024
 # Repo-local config keys that make git run repo-chosen executables during
@@ -426,6 +428,49 @@ class WorktreeManager:
         _, out, trunc = self._tree_git(found[1], found[0], ["diff", "--no-ext-diff", "--no-textconv", "--no-color",
                                         "HEAD", "--"], max_bytes=max_bytes)
         return BoundedText(out, trunc)
+
+    def commit(self, run_id: str, task_id: str, message: str) -> dict:
+        """Host-side commit of everything in the task's worktree onto the task's own branch.
+
+        The agent cannot commit from inside its sandbox, so this is how a finished run's edits become a
+        reviewable commit. It never touches the owner's checkout or any other branch and never pushes.
+        Same hardening as every other tree operation (hooks off, config guard, attributes pinned) plus:
+        a bounded message and path count, no gitlinks (nested repositories), no signing, no ``--no-verify``
+        reliance (hooks are disabled for all host git). Returns {"head_before","head","branch","paths"}.
+        """
+        if (not isinstance(message, str) or not message.strip() or len(message) > MAX_COMMIT_MESSAGE
+                or "\x00" in message):
+            raise ValueError("invalid commit message")
+        found = self._existing(run_id, task_id)
+        if found is None:
+            raise WorktreeError("worktree does not exist")
+        path, repo = found
+        with self._lock(repo):
+            _, head_before, _ = self._tree_git(repo, path, ["rev-parse", "HEAD"])
+            rc, branch, _ = self._tree_git(repo, path, ["symbolic-ref", "--short", "-q", "HEAD"], check=False)
+            if rc != 0 or branch.strip() != self._branch(run_id, task_id):
+                raise WorktreeError("worktree is not on the task branch")
+            _, porc, trunc = self._tree_git(repo, path, ["status", "--porcelain=v1", "-z", "--untracked-files=normal"])
+            entries = [e for e in porc.split("\x00") if e]
+            if not entries:
+                raise WorktreeError("nothing to commit")
+            if trunc or len(entries) > MAX_COMMIT_PATHS:
+                raise WorktreeError("too many changed paths to commit")
+            self._tree_git(repo, path, ["add", "-A", "--"])
+            try:
+                _, raw, _ = self._tree_git(repo, path, ["diff", "--cached", "--raw", "-z", "--no-renames",
+                                                        "--no-ext-diff", "--no-textconv"])
+                if any(rec.startswith(":") and "160000" in rec.split(" ")[:2] for rec in raw.split("\x00")):
+                    raise WorktreeError("a nested repository (gitlink) cannot be committed")
+                self._tree_git(repo, path, ["-c", "commit.gpgsign=false", "-c", "user.useConfigOnly=false",
+                                            "commit", "--no-verify", "--no-gpg-sign", "-q", "--allow-empty-message",
+                                            "-m", message.strip()])
+            except BaseException:
+                self._tree_git(repo, path, ["reset", "-q", "--"], check=False)  # leave the tree as the agent left it
+                raise
+            _, head, _ = self._tree_git(repo, path, ["rev-parse", "HEAD"])
+        return {"head_before": head_before.strip(), "head": head.strip(), "branch": branch.strip(),
+                "paths": len(entries)}
 
     # --- read-only candidate facts (used by the candidate manifest) --------
     def worktree_repo(self, run_id: str, task_id: str) -> str | None:

@@ -126,6 +126,8 @@ def stubs():
         "read_agent_run": read_agent, "read_usage": read_usage,
         "cancel_agent_run": lambda *a, **k: _result({"run_id": "r1", "state": "cancellation_requested"}),
         "abandon_agent_run": lambda *a, **k: _result({"run_id": "r1", "state": "failed", "cancelled_tasks": 1}),
+        "commit_agent_worktree": lambda run_id, message: {"run_id": run_id, "tasks": [
+            {"task_id": "t1", "branch": "synapse/r/t1", "head": "a" * 40, "paths": 1}]},
         "remove_agent_worktree": lambda run_id, force: {"run_id": run_id, "removed": True,
                                                         "tasks": [{"task_id": "t", "removed": True}]},
     }
@@ -247,6 +249,11 @@ CASES[("/api/v1/runs/{run_id}/agent-worktree-remove", "post")] = {
     **_post_cases("/api/v1/runs/{run_id}/agent-worktree-remove", None, "remove_agent_worktree", 200,
                   conflict=AgentRunError(409, "Run is still active"), blank=True),
 }
+CASES[("/api/v1/runs/{run_id}/agent-worktree-commit", "post")] = {
+    status: case for status, case in _post_cases(
+        "/api/v1/runs/{run_id}/agent-worktree-commit", {"message": "m"}, "commit_agent_worktree", 200,
+        conflict=AgentRunError(409, "Nothing to commit")).items()
+    if status not in (413, 415)}  # like agent-abandon, the contract table does not document these
 CASES[("/api/v1/runs/{run_id}/mock-resume", "post")] = _post_cases(
     "/api/v1/runs/{run_id}/mock-resume", RESUME_BODY, "resume_mock", 202)
 CASES[("/api/v1/approvals/{approval_id}/decision", "post")] = {

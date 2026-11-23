@@ -496,10 +496,55 @@ class AgentRunService:
             raise refusal
         return {"run_id": run_id, "removed": any(r["removed"] for r in results), "tasks": results}
 
-    def _audit_worktree_removed(self, run_id: str, force: bool, task_ids: list[str]) -> None:
+    async def commit_worktree(self, run_id: str, message: str) -> dict:
+        """Operator-requested host-side commit of a FINISHED agent run's edits onto each task's own branch.
+
+        The sandboxed agent cannot write to the repository's git metadata, so this is how its edits become a
+        reviewable commit. Never automatic, never touches the owner's checkout or branch, never pushes. Tasks
+        with nothing to commit are skipped; if no task has anything, the request is refused (409). Audited with
+        the task ids and resulting commit ids (never the message).
+        """
+        if self.manager is None:
+            raise AgentRunError(503, "Agent runs are not configured (enable the Claude CLI config with repos and worktree_root)")
+        row = self.db.execute("SELECT state FROM runs WHERE id=?", (run_id,)).fetchone()
+        if row is None or not at.is_agent_run(self.db, run_id):
+            raise RunNotFound("Agent run not found")
+        if row[0] not in _FINISHED_RUN_STATES:
+            raise AgentRunError(409, "The run has not finished; cancel it or wait before committing its worktree")
+        manager = self.manager
+        task_ids = [t for (t,) in self.db.execute("SELECT id FROM tasks WHERE run_id=? ORDER BY id", (run_id,)).fetchall()]
+        results: list[dict] = []
         try:
-            event = EventEnvelope.create(aggregate_type="run", aggregate_id=run_id, event_type="agent.worktree_removed",
-                                         payload={"run_id": run_id, "principal": PRINCIPAL, "forced": bool(force), "task_ids": list(task_ids)})
+            for task_id in task_ids:
+                try:
+                    status = await asyncio.to_thread(manager.status, run_id, task_id)
+                except WorktreeError:
+                    continue  # worktree already removed
+                if status.clean:
+                    continue
+                try:
+                    out = await asyncio.to_thread(manager.commit, run_id, task_id, message)
+                except ValueError:
+                    raise AgentRunError(422, "Invalid commit message") from None
+                except WorktreeError:
+                    raise AgentRunError(409, "A worktree could not be committed (nested repository, too many paths, "
+                                             "or it changed); inspect it") from None
+                results.append({"task_id": task_id, "branch": out["branch"], "head": out["head"], "paths": out["paths"]})
+        finally:
+            if results:  # audit what was committed even when a later task refused
+                self._audit_worktree_event(run_id, "agent.worktree_committed", {
+                    "tasks": [{"task_id": r["task_id"], "head": r["head"]} for r in results]})
+        if not results:
+            raise AgentRunError(409, "Nothing to commit: every worktree is clean or gone")
+        return {"run_id": run_id, "tasks": results}
+
+    def _audit_worktree_removed(self, run_id: str, force: bool, task_ids: list[str]) -> None:
+        self._audit_worktree_event(run_id, "agent.worktree_removed", {"forced": bool(force), "task_ids": list(task_ids)})
+
+    def _audit_worktree_event(self, run_id: str, event_type: str, extra: dict) -> None:
+        try:
+            event = EventEnvelope.create(aggregate_type="run", aggregate_id=run_id, event_type=event_type,
+                                         payload={"run_id": run_id, "principal": PRINCIPAL, **extra})
             self.db.execute("BEGIN IMMEDIATE")
             try:
                 self.db.execute("INSERT INTO events(id,aggregate_type,aggregate_id,run_id,type,schema_version,payload_json,occurred_at) "
@@ -513,7 +558,7 @@ class AgentRunService:
                     self.db.execute("ROLLBACK")
                 raise
         except Exception:
-            _LOG.error("Worktree of run %s was removed but the audit event could not be written", run_id)
+            _LOG.error("Worktree event %s of run %s happened but the audit event could not be written", event_type, run_id)
 
     # ---------------------------------------------------------------- cancel
     def cancel(self, run_id: str, key: str):

@@ -89,7 +89,7 @@ def _request(state_dir: Path, endpoint: str, *, body: bytes | None = None,
         else:
             method = "POST"
             expected = 201 if endpoint == "/api/v1/workflows" else 200 if endpoint.endswith("/decision") else 202
-            if endpoint.split("?", 1)[0].endswith(("/agent-abandon", "/agent-worktree-remove")):
+            if endpoint.split("?", 1)[0].endswith(("/agent-abandon", "/agent-worktree-remove", "/agent-worktree-commit")):
                 expected = 200
             if endpoint == "/api/v1/agent-runs":
                 expected = (200, 201)  # 201 new start, 200 idempotent replay
@@ -375,6 +375,12 @@ def _add_agent_parsers(commands) -> None:
                         help="discard uncommitted changes and unmerged commits on the run's branch")
     remove.add_argument("--idempotency-key", type=_command_header)
     remove.add_argument("--correlation-id", type=_command_header)
+    commit = commands.add_parser("agent-worktree-commit", help="commit a FINISHED real agent run's edits onto its own "
+                                 "branch (host-side; the sandboxed agent cannot commit; never touches your checkout)")
+    commit.add_argument("run_id")
+    commit.add_argument("--message", "-m", required=True, help="commit message (max 2000 characters)")
+    commit.add_argument("--idempotency-key", type=_command_header)
+    commit.add_argument("--correlation-id", type=_command_header)
 
 
 def _agent_command(args, parser) -> int:
@@ -422,6 +428,11 @@ def _agent_command(args, parser) -> int:
         elif args.command == "agent-worktree-remove":
             result = _request(args.state_dir, "/api/v1/runs/" + quote(args.run_id, safe="") + "/agent-worktree-remove"
                               + ("?force=true" if args.force else ""), body=b"",
+                              idempotency_key=args.idempotency_key or str(uuid.uuid4()),
+                              correlation_id=args.correlation_id or str(uuid.uuid4()))
+        elif args.command == "agent-worktree-commit":
+            result = _request(args.state_dir, "/api/v1/runs/" + quote(args.run_id, safe="") + "/agent-worktree-commit",
+                              body=json.dumps({"message": args.message}).encode("utf-8"),
                               idempotency_key=args.idempotency_key or str(uuid.uuid4()),
                               correlation_id=args.correlation_id or str(uuid.uuid4()))
         else:
@@ -536,7 +547,8 @@ def main(argv: list[str] | None = None) -> int:
         return _runs_command(args)
     if args.command in ("profiles", "profile-cooldown"):
         return _profile_command(args, parser)
-    if args.command in ("agent-start", "agent-show", "agent-cancel", "agent-abandon", "agent-worktree-remove"):
+    if args.command in ("agent-start", "agent-show", "agent-cancel", "agent-abandon", "agent-worktree-remove",
+                        "agent-worktree-commit"):
         return _agent_command(args, parser)
     if args.command == "approver-unlock":
         return _approver_unlock(args.state_dir)

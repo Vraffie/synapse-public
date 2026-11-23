@@ -99,6 +99,7 @@ RESPONSES = {
     ("/api/v1/runs/{run_id}/agent-cancel", "post"): (202, _object({"run_id": STRING, "state": {"type": "string", "const": "cancellation_requested"}})),
     ("/api/v1/runs/{run_id}/agent-abandon", "post"): (200, _object({"run_id": STRING, "state": {"type": "string", "const": "failed"}, "cancelled_tasks": INTEGER})),
     ("/api/v1/runs/{run_id}/agent-worktree-remove", "post"): (200, _object({"run_id": STRING, "removed": {"type": "boolean"}, "tasks": {"type": "array", "items": _object({"task_id": STRING, "removed": {"type": "boolean"}})}})),
+    ("/api/v1/runs/{run_id}/agent-worktree-commit", "post"): (200, _object({"run_id": STRING, "tasks": {"type": "array", "items": _object({"task_id": STRING, "branch": STRING, "head": STRING, "paths": INTEGER})}})),
     ("/api/v1/profiles", "get"): (200, _object({"profiles": {"type": "array", "items": _object({
         "id": STRING, "provider": STRING, "enabled": {"type": "boolean"}, "max_concurrency": INTEGER,
         "load": _nullable("integer"), "cooldown_remaining_seconds": {"type": "number"},
