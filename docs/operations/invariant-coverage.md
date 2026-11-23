@@ -101,8 +101,11 @@ Status: `partial`.
 - `test_output_reducer.py::test_pytest_failures_survive_a_tight_budget`
 - `test_output_reducer.py::test_failures_beyond_the_budget_are_kept_and_reported_over_budget`
 - `test_budget_wiring.py::test_approved_gated_step_is_blocked_at_resume_and_never_runs`
+- `test_agent_runtime.py::test_raw_output_is_stored_and_summary_carries_reduction_and_raw_hash`
+- `test_agent_runtime.py::test_a_large_reduction_is_clipped_so_a_succeeded_attempt_still_gets_a_summary`
+- `test_agent_runtime.py::test_a_stored_raw_artifact_with_the_wrong_digest_fails_a_succeeded_attempt_closed`
 
-Not covered: the reducer and budget are unit-tested; no fault scenario drives reduction or caching through the engine until the M5.3 wiring merges.
+Not covered: reduction is now exercised through the engine (raw output kept, failure lines survive, a summary that would overflow is clipped, a raw artifact that cannot be stored fails a success closed), but the exact cache (M5.4 second half) is not built and routing is a dry-run log only, so neither can bypass a check yet and neither has a fault scenario.
 
 ## Invariant 8 scenario
 
@@ -117,5 +120,5 @@ its observable effect on the daemon is exactly these dropped sockets.
 
 - Invariant 6: no end-to-end test that an agent message cannot widen the agent's own tools.
 - Invariant 7: the display of unknown quota in the desktop and CLI is not asserted by the harness.
-- Invariant 10: engine-level reduction and caching scenarios wait for the M5.3 wiring and the M5.4 cache.
+- Invariant 10: reduction is covered through the engine since M5.3; scenarios for the exact cache wait for the M5.4 second half, and routing is dry-run only.
 - Stability: the harness (`tests/test_invariants.py`, `tests/test_fault_injection*.py`, this map) passed 5 consecutive runs of 98 tests each (2026-11-23, local, about 15 s per run). That is evidence against obvious flakiness, not a proof, and CI was not used.
