@@ -34,7 +34,10 @@ _DANGEROUS_CONFIG = re.compile(
     r"^(filter\..+\.(smudge|clean|process)|include\.path|includeif\..+\.path"
     r"|core\.(hookspath|sshcommand|gitproxy|attributesfile|askpass|editor)"
     r"|extensions\.worktreeconfig|diff\.external|diff\..+\.(command|textconv)"
-    r"|merge\..+\.driver|credential\..*helper|gpg\..*program)$")
+    r"|merge\..+\.driver|credential\..*helper|gpg\..*program"
+    # Keys that name a program git runs for transports, lazy fetch or alternates.
+    r"|remote\..+\.(uploadpack|receivepack|vcs|proxy)|core\.alternaterefscommand"
+    r"|uploadpack\..+|http\..*proxy)$")
 
 _locks_guard = threading.Lock()
 _locks: dict[str, threading.Lock] = {}
@@ -103,6 +106,9 @@ def _git_env() -> dict[str, str]:
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_OPTIONAL_LOCKS": "0",
         "GIT_ASKPASS": "/bin/false",
+        # Never lazily fetch missing objects of a partial clone: that would run the repo-chosen
+        # remote.<name>.uploadpack (or a transport) from a read-only query such as `status`.
+        "GIT_NO_LAZY_FETCH": "1",
         "GIT_AUTHOR_NAME": "synapse", "GIT_AUTHOR_EMAIL": "synapse@localhost",
         "GIT_COMMITTER_NAME": "synapse", "GIT_COMMITTER_EMAIL": "synapse@localhost",
     }
@@ -228,7 +234,12 @@ def refuse_unsafe_repo_config(repo: str, cwd: str | None = None) -> None:
     """Refuse repo state that makes git run repo-chosen programs. Re-run before every git call
     that touches a work tree (linked worktrees share this config with the agent's shell).
     Shared with ``synapse.application.workspace`` so discovery applies the identical rule."""
-    _, out, _ = _git(cwd or repo, ["config", "--local", "--list", "-z"], max_bytes=1 << 20)
+    # Read the repository's own config file by path (no discovery walk-up, no includes); a listing
+    # that does not fit the cap is refused rather than checked partially.
+    _, out, truncated = _git(cwd or repo, ["config", "--file", os.path.join(repo, ".git", "config"),
+                                           "--list", "-z"], max_bytes=1 << 20)
+    if truncated:
+        raise WorktreeError("repository config is too large to check")
     for entry in out.split("\x00"):
         key, _, value = entry.partition("\n")
         key = key.lower()

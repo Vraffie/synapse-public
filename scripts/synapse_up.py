@@ -128,7 +128,9 @@ def write_config(path: Path, executable: Path, repo, tools: tuple[str, ...], wor
                 "worktree_root": str(worktrees),
                 "allowed_tools": sorted(set(cfg.get("allowed_tools", [])) | set(tools))})
     tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    if os.path.lexists(tmp):  # leftover from a crash (or a planted symlink): never write through it
+        os.unlink(tmp)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w") as fh:
         os.fchmod(fh.fileno(), 0o600)
         json.dump(cfg, fh, indent=1)

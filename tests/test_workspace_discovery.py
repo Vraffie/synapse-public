@@ -295,3 +295,55 @@ def test_module_stays_out_of_daemon_and_desktop():
     for forbidden in ("synapse.daemon", "synapse.persistence", "synapse.desktop", "synapse.api", "sqlite3",
                       "shell=True"):
         assert forbidden not in src
+
+
+def _partial_clone_with_hostile_uploadpack(root: Path, marker: Path) -> Path:
+    """Security review repro: a promisor remote whose uploadpack runs on a lazy fetch during `status`."""
+    repo = make_repo(root / "promisor", commits=0)
+    (repo / "f").write_text("x")
+    git(repo, "add", "f")
+    git(repo, "commit", "-q", "-m", "f")
+    tree = git(repo, "rev-parse", "HEAD^{tree}").strip()
+    (repo / ".git" / "objects" / tree[:2] / tree[2:]).unlink()
+    git(repo, "config", "core.repositoryformatversion", "1")
+    git(repo, "config", "extensions.partialclone", "origin")
+    git(repo, "config", "remote.origin.promisor", "true")
+    git(repo, "config", "remote.origin.url", str(root / "promisor"))
+    git(repo, "config", "remote.origin.uploadpack", "touch '%s'; git-upload-pack" % marker)
+    return repo
+
+
+def test_promisor_uploadpack_is_refused_and_never_runs(tmp_path):
+    marker = tmp_path / "marker"
+    _partial_clone_with_hostile_uploadpack(tmp_path / "ws", marker)
+    info = by_rel(scan(tmp_path / "ws"))["promisor"]
+    assert not marker.exists()
+    assert not info.usable and "remote.origin.uploadpack" in info.reason
+
+
+def test_lazy_fetch_is_disabled_even_if_the_guard_missed_a_key(tmp_path, monkeypatch):
+    """Defence in depth: with the guard bypassed, GIT_NO_LAZY_FETCH in the runner still stops the fetch."""
+    marker = tmp_path / "marker"
+    repo = _partial_clone_with_hostile_uploadpack(tmp_path / "ws", marker)
+    monkeypatch.setattr(ws, "refuse_unsafe_repo_config", lambda repo, cwd=None: None)
+    ws.inspect_repo(str(repo.resolve()))
+    assert not marker.exists()
+
+
+def test_oversized_config_fails_closed(tmp_path):
+    repo = make_repo(tmp_path / "ws" / "big")
+    with open(repo / ".git" / "config", "a") as fh:
+        for i in range(60000):  # > 1 MiB when listed
+            fh.write('[pad "p%05d"]\n\tk = %s\n' % (i, "v" * 20))
+        fh.write("[core]\n\tsshCommand = evil\n")
+    info = ws.inspect_repo(str(repo.resolve()))
+    assert not info.usable and "too large" in info.reason
+
+
+def test_scan_time_limit_marks_truncated(tmp_path):
+    root = tmp_path / "ws"
+    make_repo(root / "a")
+    make_repo(root / "b")
+    res = scan(root, deadline_seconds=0)
+    assert res.repos == () and res.truncated
+    assert {s.reason for s in res.skipped} == {"not inspected: scan time limit reached"}

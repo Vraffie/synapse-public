@@ -208,3 +208,11 @@ def test_legacy_up_repo_still_registers_one_repo(workspace_dir, fake_env):
     assert up.main(["up", str(workspace_dir / "api"), "--no-desktop"]) == 0
     data = json.loads((fake_env / "agent.json").read_text())
     assert data["repos"] == [str(workspace_dir / "api")] and data["sandbox"] is True
+
+
+def test_config_write_never_follows_a_planted_tmp_symlink(tmp_path):
+    victim = tmp_path / "victim"
+    victim.write_text("keep")
+    (tmp_path / "agent.json.tmp").symlink_to(victim)
+    up.write_config(tmp_path / "agent.json", tmp_path / "claude", Path("/r/one"), ("Read",), tmp_path / "wt")
+    assert victim.read_text() == "keep" and json.loads((tmp_path / "agent.json").read_text())["sandbox"] is True

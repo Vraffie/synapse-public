@@ -39,7 +39,7 @@ Not usable, with the reason shown:
 | Case | Why |
 |---|---|
 | no commits | a worktree needs a committed base ref |
-| unsafe config (`core.fsmonitor`, `core.hooksPath`, filters, `include.path`, `!` aliases, `config.worktree`, `info/attributes`, ...) | exactly the rule `WorktreeManager` applies before every run, so the daemon would refuse it anyway |
+| unsafe config (`core.fsmonitor`, `core.hooksPath`, filters, `include.path`, `!` aliases, `remote.*.uploadpack`/`receivepack`/`vcs`/`proxy`, `core.alternateRefsCommand`, `config.worktree`, `info/attributes`, a config too large to check, ...) | exactly the rule `WorktreeManager` applies before every run, so the daemon would refuse it anyway |
 | bare repository | no working tree |
 | `.git` is a file (linked worktree or submodule) | register the main repository instead |
 | `.git` is a symlink, or not owned by you | the daemon's allowlist rules refuse these |
@@ -52,8 +52,8 @@ Not usable, with the reason shown:
   are listed as *skipped*; symlinks to files are ignored.
 - Hidden directories (`.git`, `.venv`, `.cache`, ...) and `node_modules`, `__pycache__`, `site-packages`,
   `venv` are not descended into.
-- At most `max_entries` (2000) directory entries and `max_repos` (200) repositories; when a bound is hit the
-  scan says so (`truncated`), and `depth_limited` says some folders below `max_depth` were not looked into.
+- At most `max_entries` (2000) directory entries and `max_repos` (64) repositories, and an overall time limit (300 s)
+  for the git queries; when a bound is hit the scan says so (`truncated`), and `depth_limited` says some folders below `max_depth` were not looked into.
   An unreadable directory is listed as skipped and the walk continues.
 - The input folder must be an existing, absolute, resolved directory without control characters (the CLI
   expands `~` and resolves it first). Names with control characters are skipped; names printed in the table
@@ -64,10 +64,11 @@ Inside each found repository only read-only git queries run (`config --local --l
 untrusted input: every call goes through the hardened runner in `synapse.infrastructure.worktrees`
 (`-c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.pager=cat -c protocol.ext.allow=never
 -c diff.external= ...`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `HOME=/nonexistent`,
-`GIT_TERMINAL_PROMPT=0`, `GIT_OPTIONAL_LOCKS=0` so `status` does not rewrite the index, argv lists without a
+`GIT_TERMINAL_PROMPT=0`, `GIT_OPTIONAL_LOCKS=0` so `status` does not rewrite the index, `GIT_NO_LAZY_FETCH=1`
+so a partial clone never fetches missing objects (which would run `remote.<name>.uploadpack`), argv lists without a
 shell, a wall-clock timeout per call and an output cap). `--git-dir`/`--work-tree` are passed explicitly so git
 never walks up into a parent repository, and `status` uses attributes from the empty tree and
-`--ignore-submodules=all`. The unsafe-config check runs first; for a refused repository `git status` (the only
+`--ignore-submodules=all`. The unsafe-config check runs first and reads `.git/config` by path (no discovery, no includes); for a refused repository `git status` (the only
 query that could reach filters) is never run. The config check also reads `.git/info/attributes` (as
 `WorktreeManager` does); no other file is read by Synapse itself.
 

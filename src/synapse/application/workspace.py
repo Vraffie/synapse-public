@@ -25,6 +25,7 @@ from __future__ import annotations
 import errno
 import os
 import stat
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 
@@ -91,7 +92,7 @@ class WorkspaceScan:
     repos: tuple[RepoInfo, ...]
     skipped: tuple[Skipped, ...]
     entries_seen: int
-    truncated: bool         # max_entries or max_repos was hit: the listing is incomplete
+    truncated: bool         # max_entries, max_repos or the time limit was hit: the result is incomplete
     depth_limited: bool     # some non-repository folder at max_depth was not looked into
     ignored_dirs: int       # hidden / node_modules-style directories not descended into
 
@@ -222,7 +223,7 @@ def _inspect_gitdir(info: RepoInfo) -> RepoInfo:
 
 
 def discover_repos(folder: str | os.PathLike[str], *, max_depth: int = 2, max_entries: int = 2000,
-                   max_repos: int = 200) -> WorkspaceScan:
+                   max_repos: int = 64, deadline_seconds: float = 300.0) -> WorkspaceScan:
     """Find the repositories under FOLDER (see the module docstring for what is and is not touched)."""
     root = check_folder(folder)
     if max_depth < 1 or max_entries < 1 or max_repos < 1:
@@ -283,7 +284,12 @@ def discover_repos(folder: str | os.PathLike[str], *, max_depth: int = 2, max_en
                 depth_limited = True
         stack.extend((d, depth + 1) for d in reversed(subdirs))
     repos: list[RepoInfo] = []
+    stop_at = time.monotonic() + deadline_seconds
     for c in sorted(candidates):
+        if time.monotonic() >= stop_at:  # overall bound: each repo's queries are bounded on their own too
+            skipped.append(Skipped(c, "not inspected: scan time limit reached"))
+            truncated = True
+            continue
         try:
             repos.append(replace(inspect_repo(c), rel=os.path.relpath(c, root)))
         except ValueError as exc:
