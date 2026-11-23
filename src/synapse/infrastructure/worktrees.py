@@ -25,6 +25,7 @@ _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _MAX_REF = 256
 MAX_COMMIT_MESSAGE = 2000
 MAX_COMMIT_PATHS = 1000
+_COMMIT_LISTING_BYTES = 4 * 1024 * 1024
 _GIT_TIMEOUT = 60.0
 DEFAULT_MAX_BYTES = 64 * 1024
 # Repo-local config keys that make git run repo-chosen executables during
@@ -450,18 +451,32 @@ class WorktreeManager:
             rc, branch, _ = self._tree_git(repo, path, ["symbolic-ref", "--short", "-q", "HEAD"], check=False)
             if rc != 0 or branch.strip() != self._branch(run_id, task_id):
                 raise WorktreeError("worktree is not on the task branch")
-            _, porc, trunc = self._tree_git(repo, path, ["status", "--porcelain=v1", "-z", "--untracked-files=normal"])
+            _, porc, trunc = self._tree_git(repo, path, ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                                            max_bytes=_COMMIT_LISTING_BYTES)
             entries = [e for e in porc.split("\x00") if e]
             if not entries:
                 raise WorktreeError("nothing to commit")
             if trunc or len(entries) > MAX_COMMIT_PATHS:
                 raise WorktreeError("too many changed paths to commit")
-            self._tree_git(repo, path, ["add", "-A", "--"])
             try:
-                _, raw, _ = self._tree_git(repo, path, ["diff", "--cached", "--raw", "-z", "--no-renames",
-                                                        "--no-ext-diff", "--no-textconv"])
-                if any(rec.startswith(":") and "160000" in rec.split(" ")[:2] for rec in raw.split("\x00")):
+                self._tree_git(repo, path, ["add", "-A", "--"])
+                # Judge what is STAGED, not what status showed: status folds directories and the worktree's
+                # agent-written .gitmodules can change how diff presents a gitlink, so ignore it explicitly.
+                _, raw, raw_trunc = self._tree_git(repo, path, ["diff", "--cached", "--raw", "-z", "--no-renames",
+                                                                "--no-ext-diff", "--no-textconv",
+                                                                "--ignore-submodules=none"],
+                                                   max_bytes=_COMMIT_LISTING_BYTES)
+                if raw_trunc:
+                    raise WorktreeError("too many changed paths to commit")
+                tokens = raw.split("\x00")
+                records = [(t.split(" "), tokens[i + 1] if i + 1 < len(tokens) else "")
+                           for i, t in enumerate(tokens) if t.startswith(":")]
+                if len(records) > MAX_COMMIT_PATHS:
+                    raise WorktreeError("too many changed paths to commit")
+                if any("160000" in fields[:2] for fields, _ in records):
                     raise WorktreeError("a nested repository (gitlink) cannot be committed")
+                if any(os.path.basename(name) == ".gitmodules" for _, name in records):
+                    raise WorktreeError("a .gitmodules change cannot be committed")
                 self._tree_git(repo, path, ["-c", "commit.gpgsign=false", "-c", "user.useConfigOnly=false",
                                             "commit", "--no-verify", "--no-gpg-sign", "-q", "--allow-empty-message",
                                             "-m", message.strip()])
@@ -470,7 +485,7 @@ class WorktreeManager:
                 raise
             _, head, _ = self._tree_git(repo, path, ["rev-parse", "HEAD"])
         return {"head_before": head_before.strip(), "head": head.strip(), "branch": branch.strip(),
-                "paths": len(entries)}
+                "paths": len(records)}
 
     # --- read-only candidate facts (used by the candidate manifest) --------
     def worktree_repo(self, run_id: str, task_id: str) -> str | None:

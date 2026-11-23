@@ -476,3 +476,52 @@ def test_commit_ignores_hooks_and_refuses_gitlinks(mgr, repo):
         mgr.commit("run1", "task1", "y")
     assert mgr.status("run1", "task1").head == head  # nothing committed, index reset
     assert run_git(p, "diff", "--cached", "--name-only").strip() == ""
+
+
+def _nested_repo(parent, name="inner"):
+    nested = os.path.join(parent, name)
+    os.mkdir(nested)
+    run_git(nested, "init", "-q", "-b", "main")
+    open(os.path.join(nested, "f"), "w").write("1")
+    run_git(nested, "add", "f")
+    run_git(nested, "commit", "-q", "-m", "i")
+
+
+def _assert_nothing_committed(mgr, p, head):
+    assert mgr.status("run1", "task1").head == head
+    assert run_git(p, "diff", "--cached", "--name-only").strip() == ""
+
+
+def test_commit_refuses_a_gitlink_hidden_by_gitmodules_ignore_all(mgr, repo):
+    """Reviewer repro: the agent-written .gitmodules `ignore = all` must not hide a gitlink from the check."""
+    p = mgr.create("run1", "task1", repo, "main")
+    head = mgr.status("run1", "task1").head
+    _nested_repo(p)
+    open(os.path.join(p, ".gitmodules"), "w").write('[submodule "inner"]\n\tpath = inner\n\turl = ./x\n\tignore = all\n')
+    with pytest.raises(WorktreeError):
+        mgr.commit("run1", "task1", "x")
+    _assert_nothing_committed(mgr, p, head)
+
+
+def test_commit_refuses_a_gitmodules_change_alone(mgr, repo):
+    p = mgr.create("run1", "task1", repo, "main")
+    head = mgr.status("run1", "task1").head
+    open(os.path.join(p, ".gitmodules"), "w").write("[submodule \"x\"]\n\tpath = x\n\turl = ./x\n")
+    with pytest.raises(WorktreeError, match="gitmodules"):
+        mgr.commit("run1", "task1", "x")
+    _assert_nothing_committed(mgr, p, head)
+
+
+def test_commit_path_cap_counts_files_not_folded_directories_and_fails_closed_on_truncation(mgr, repo):
+    """Reviewer repro: one untracked dir with many long-named files plus a nested repo must be refused, not
+    slip through because status folds the directory or the listing is truncated."""
+    p = mgr.create("run1", "task1", repo, "main")
+    head = mgr.status("run1", "task1").head
+    many = os.path.join(p, "a")
+    os.mkdir(many)
+    for i in range(1500):
+        open(os.path.join(many, ("%04d" % i) + "x" * 200), "w").close()
+    _nested_repo(p, "zz")
+    with pytest.raises(WorktreeError, match="too many"):
+        mgr.commit("run1", "task1", "x")
+    _assert_nothing_committed(mgr, p, head)

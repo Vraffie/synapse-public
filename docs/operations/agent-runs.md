@@ -194,8 +194,17 @@ characters) has the daemon commit them host-side onto each task's own branch `sy
 - It never touches your checkout or any other branch and never pushes. To use the work, review the diff
   (`agent-show`) and merge or cherry-pick the branch yourself.
 - Same hardened git as every host-side operation (hooks, filters, attributes and config guard as for `status`).
-  Refused with 409 for a nested repository (gitlink) or more than 1000 changed paths; a refusal leaves the index
-  as the agent left it. The commit author is `synapse <synapse@localhost>`; signing is off.
+  The check runs on what is actually STAGED (`git add -A`, then the cached raw diff with submodule ignoring
+  forced off, because the agent writes `.gitmodules`): refused with 409 for a nested repository (gitlink), any
+  `.gitmodules` change, or more than 1000 changed files (files, not folded directories); an oversized listing
+  fails closed. A refusal resets the index to what the agent left. The commit author is
+  `synapse <synapse@localhost>`; signing is off.
+- A multi-task run commits task by task; if a later task is refused the 409 does not list the earlier commits,
+  the `agent.worktree_committed` audit event does. The `Idempotency-Key` header is required but a replay simply
+  re-runs the commit (a clean tree then answers 409).
+- Run it only once the run is finished. After `agent-abandon` of a RECOVERING run, the abandon assertion that no
+  agent process remains is the guard against an old process still writing to the tree; the commit does not
+  re-check it.
 - Audited as an `agent.worktree_committed` event carrying the task ids and commit ids, never the message.
 
 

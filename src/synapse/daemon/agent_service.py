@@ -516,19 +516,20 @@ class AgentRunService:
         results: list[dict] = []
         try:
             for task_id in task_ids:
+                if await asyncio.to_thread(manager.worktree_repo, run_id, task_id) is None:
+                    continue  # worktree already removed
+                refusal = AgentRunError(409, "A worktree could not be committed (nested repository, .gitmodules, too many "
+                                             "paths, or it was tampered with or changed); inspect it. Tasks listed in the "
+                                             "audit event agent.worktree_committed may already be committed")
                 try:
                     status = await asyncio.to_thread(manager.status, run_id, task_id)
-                except WorktreeError:
-                    continue  # worktree already removed
-                if status.clean:
-                    continue
-                try:
+                    if status.clean:
+                        continue
                     out = await asyncio.to_thread(manager.commit, run_id, task_id, message)
                 except ValueError:
                     raise AgentRunError(422, "Invalid commit message") from None
                 except WorktreeError:
-                    raise AgentRunError(409, "A worktree could not be committed (nested repository, too many paths, "
-                                             "or it changed); inspect it") from None
+                    raise refusal from None
                 results.append({"task_id": task_id, "branch": out["branch"], "head": out["head"], "paths": out["paths"]})
         finally:
             if results:  # audit what was committed even when a later task refused
