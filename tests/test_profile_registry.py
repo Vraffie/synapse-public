@@ -44,7 +44,7 @@ def doc(env, **over):
     base = {"profiles": [prof(exe, "c1"), prof(exe, "c2", model="opus-5"),
                          {"id": "x1", "provider": "codex", "executable": str(codex), "allowed_tools": [],
                           "max_concurrency": 1, "enabled": True}],
-            "primary": "c1", "fallback": ["c2", "x1"], "max_concurrency": 4}
+            "primary": "c1", "fallback": ["c2"], "max_concurrency": 4}
     base.update(over)
     return base
 
@@ -54,7 +54,7 @@ def test_loads_a_full_registry(env):
     tmp, _, _, state = env
     reg = load_registry(write(tmp, doc(env)), state)
     assert [p.id for p in reg.profiles] == ["c1", "c2", "x1"] and reg.primary == "c1"
-    assert reg.fallback == ("c2", "x1") and reg.max_concurrency == 4 and reg.chain == ("c1", "c2", "x1")
+    assert reg.fallback == ("c2",) and reg.max_concurrency == 4 and reg.chain == ("c1", "c2")
     assert reg.get("c2").model == "opus-5" and reg.get("x1").provider == "codex" and reg.get("x1").allowed_tools == ()
     assert reg.get("c1").max_timeout_seconds == 3600.0 and reg.get("nope") is None
     assert reg.repos == () and reg.worktree_root is None
@@ -207,6 +207,19 @@ def test_foreign_owned_file_is_refused(env, monkeypatch):
     monkeypatch.setattr(os, "geteuid", lambda: os.stat(path).st_uid + 1)
     with pytest.raises(RegistryError, match="user-owned"):
         load_registry(path, state)
+
+
+@pytest.mark.parametrize("mutate,text", [
+    (lambda d: d.update(fallback=["c2", "x1"]), "cannot be a fallback"),
+    (lambda d: d.update(primary="x1", fallback=[]), "cannot be the primary"),
+])
+def test_codex_is_never_primary_or_fallback(env, mutate, text):
+    # ADR 016 decision 5: no cross-provider fallback; codex runs only when a task names it.
+    tmp, _, _, state = env
+    d = doc(env)
+    mutate(d)
+    with pytest.raises(RegistryError, match=text):
+        load_registry(write(tmp, d), state)
 
 
 def test_validate_registry_rejects_hand_built_inconsistencies(env):

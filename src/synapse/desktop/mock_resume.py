@@ -1,9 +1,35 @@
 """Validate and present operator evidence for fixed synthetic mock recovery."""
 from PySide6.QtWidgets import QCheckBox, QDialog, QDialogButtonBox, QLabel, QPlainTextEdit, QVBoxLayout
 import json
+from urllib.parse import urlencode
 
 ASSERTION = "fixed-v1-no-external-effects"
 PROFILE = "synapse.builtin.mock.v1"
+TASK_PAGE_LIMIT = 500
+MAX_EVIDENCE_TASKS = 1000
+
+
+def fetch_all_tasks(fetch, state_dir, base: str) -> dict:
+    """Follow /tasks next_cursor pages into one {"tasks": [...]}; evidence needs every task, never a truncated page.
+
+    Fails closed on a malformed page, a non-final empty page, or more tasks than collect_evidence accepts, so a
+    misbehaving daemon cannot make this loop forever. Consistency across pages is checked by collect_evidence,
+    which compares the result with run snapshots taken before and after.
+    """
+    tasks, cursor = [], None
+    while True:
+        query = {"limit": TASK_PAGE_LIMIT, **({"cursor": cursor} if cursor is not None else {})}
+        page = fetch(state_dir, base + "/tasks?" + urlencode(query))
+        if not isinstance(page, dict) or not isinstance(page.get("tasks"), list):
+            raise ValueError("Invalid task page")
+        tasks.extend(page["tasks"])
+        if len(tasks) > MAX_EVIDENCE_TASKS:
+            raise ValueError("Too many tasks to inspect")
+        cursor = page.get("next_cursor")
+        if cursor is None:
+            return {"tasks": tasks}
+        if not isinstance(cursor, str) or not cursor or len(cursor) > 1024 or not page["tasks"]:
+            raise ValueError("Invalid task page cursor")
 
 
 def collect_evidence(run_id: str, before: dict, details: dict, after: dict) -> tuple[dict, dict]:
@@ -19,7 +45,7 @@ def collect_evidence(run_id: str, before: dict, details: dict, after: dict) -> t
     if first.get('state') != 'recovering' or last.get('state') != 'recovering' or type(version) is not int or version < 0 or version != last.get('state_version'):
         raise ValueError("Run state or version changed")
     first_tasks, last_tasks, records = before.get('tasks'), after.get('tasks'), details.get('tasks')
-    if not isinstance(first_tasks, list) or not isinstance(last_tasks, list) or not isinstance(records, list) or not 1 <= len(records) <= 1000:
+    if not isinstance(first_tasks, list) or not isinstance(last_tasks, list) or not isinstance(records, list) or not 1 <= len(records) <= MAX_EVIDENCE_TASKS:
         raise ValueError("Invalid task snapshots")
     def fingerprint(rows):
         result = {}

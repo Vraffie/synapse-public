@@ -1,6 +1,16 @@
 # ADR 016: Wiring the profile registry, usage ledger and Codex adapter into agent runs
 
-Status: proposed (design only; no source changes). Date: 2026-11-20. Follows ADR 015 (`docs/adr/015-m4b-parallel-agents-and-profiles.md`, PR #85).
+Status: accepted in part. W0 (finished runs release capacity) and W1 are implemented; decision 4 (Codex router
+wiring, sandbox mapping, eligibility, recovery set) and the codex part of decision 5 (never primary/fallback, no
+fallback after a spawn refusal or `unknown`) are implemented and tested with fake executables only (2026-11-23). Not
+done: automatic fallback/`allow_fallback`, the decision 9 gates (no independent review of the wiring and no real
+`SYNAPSE_REAL_CODEX=1` run through the daemon yet), a probe API surface. Security review of PR #33: Synapse runs
+Codex without bwrap, so a codex profile is refused when the base profile has `"sandbox": true` (a fake-executable test
+proved a codex child could otherwise read `approver.token`); with the sandbox off it runs unsandboxed under the
+`--allow-same-user-agents` acknowledgement, which records `codex_unsandboxed`. Re-review: `workspace-write` is refused at
+spawn on any Codex version outside `VERIFIED_CLI_VERSIONS` (the `/tmp` tightening keys are verified only on 0.170.0;
+a 0.171.0 install, as the re-review reported on the owner's machine, can therefore only run `read-only` tasks, each
+logged). Date: 2026-11-20. Follows ADR 015 (`docs/adr/015-m4b-parallel-agents-and-profiles.md`, PR #85).
 
 This ADR decides how the open M4-B pieces are connected. It was written against `origin/main` plus the **unmerged**
 PRs it names; every statement about those PRs describes their heads at the time of writing and must be re-checked
@@ -253,7 +263,9 @@ Codex stays `enabled: false` unless the operator turns it on, and may be used on
    (`[UNVERIFIED]`, #93 only warns); until then document "re-login may be needed".
 7. **Hostile-prompt tests** (repo file or tool output instructing a write outside the worktree) on the real binary.
 8. **Version policy**: only `VERIFIED_CLI_VERSIONS` (`0.170.0`) is `healthy`; an `unverified_version` profile is
-   refused as primary/fallback, and the operator sees why in `GET /api/v1/profiles`.
+   refused as primary/fallback. Implemented now: a spawn-time version gate refuses `workspace-write` on an unverified
+   version (`codex_ineligible`) and logs each `read-only` spawn on one. Still a future gate: showing the probe result
+   in `GET /api/v1/profiles` (there is no probe API surface yet).
 9. **Approval binding**: decide whether the profile/provider must be part of an approval's binding (today the
    approval binds the prompt hash, operation, target and policy version, not the provider). Until decided, a gated
    task runs on the profile recorded when it was parked and is **never moved** on resume; if that profile is
@@ -297,6 +309,9 @@ Then the wiring, in this order (each is a reviewable PR):
   Exit: fake-executable tests for mapping, eligibility 422s and a mixed Claude+Codex DAG; opt-in real run
   (`SYNAPSE_REAL_CODEX=1`) of a mixed DAG through `scripts/demo_agent.py` with the `/tmp` regression included.
   Do not merge W3 without the independent review in gate 1.
+  *Status 2026-11-23:* code and fake-executable exit tests (mapping, eligibility 422s, mixed Claude+Codex DAG,
+  recovery, journal, probe) are in review (`tests/test_codex_agent_runs.py`); the opt-in real mixed-DAG run and the
+  gate 1 review are **not** done.
 - **W4, surfaces**: desktop profile panel/selector, run-view profile column, docs (`agent-runs.md`,
   `profile-registry.md`, new `agent-profiles.md`).
 - **W5, later**: automatic cooldown detectors from captured fixtures (decision 6), Codex usage fields, lifting the

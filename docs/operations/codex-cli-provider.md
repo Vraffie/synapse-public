@@ -1,9 +1,51 @@
-# Codex CLI provider adapter (disabled by default, not wired)
+# Codex CLI provider adapter (disabled by default; runs only for tasks that name a Codex profile)
+
+Codex is optional and off by default: Synapse never needs the `codex` binary to start or to run Claude tasks, it is only used for a task that names a Codex profile, and a Codex profile is refused when the daemon sandbox is on (the `synapse_up.py` default), so a sandboxed Claude-only setup never sees it.
 
 `synapse.providers.codex_cli.CodexCliProvider` runs `codex exec --json` as a supervised subprocess in a
 caller-supplied git worktree. It implements the `ProviderAdapter` protocol and mirrors the hardening of the
-[Claude adapter](claude-cli-provider.md). It is **not** wired into the engine, the API, `agent_config` or
-`AgentRuntime`; wiring (profile registry, routing) is separate work (ADR 015, B3).
+[Claude adapter](claude-cli-provider.md). Since ADR 016 decision 4 it is wired into agent runs through a `codex`
+entry in `--agent-config` ([agent profiles](agent-profiles.md#codex-profiles)): `AgentProviderRouter` builds a
+`CodexCliProvider` for a task that **names** an enabled Codex profile, and nothing else. Codex is never the default
+profile or a fallback (registry validation refuses both), there is no Claude<->Codex fallback, and a spawn refusal or
+an `unknown` outcome is never retried on another profile. No real Codex run has been made through the daemon path
+(see Still unverified).
+
+## How agent runs use it
+
+**Codex runs unsandboxed by Synapse.** Synapse does not wrap the Codex child in bwrap; the only confinement is Codex's own `-s read-only` / `-s workspace-write`, and `read-only` does not confine reads. A Codex child can therefore read anything the daemon's user can: `approver.token` and `operator.token` in the state dir (so it can approve its own gated requests), the SQLite database, `agentd.sock`, and the user's other credentials. For that reason a codex profile is **refused** (startup error, and `codex_ineligible`/422 as backstops) whenever the `--claude-cli-config` base has `"sandbox": true`: it would silently get less isolation than every Claude child. Codex is only available with the base sandbox off and `--allow-same-user-agents` acknowledged; the startup warning and the `agent_runtime.same_user_acknowledged` audit row then record `codex_unsandboxed: true`.
+
+| task field | Codex |
+| --- | --- |
+| `permission_mode` `plan` | `-s read-only` |
+| `permission_mode` `acceptEdits` | `-s workspace-write` (plus the fixed tightening below) when `Edit` or `Write` is requested, else `read-only` |
+| `permission_mode` `dontAsk`, `manual` | refused: 422 at validation, `codex_ineligible` at spawn |
+| `allowed_tools` | must be a subset of `Read`, `Glob`, `Grep`, `Edit`, `Write`; anything else (any `Bash(...)`) is refused. It selects the sandbox only and is **not a tool restriction**: inside the sandbox the agent can run any shell command |
+| `Edit`/`Write` with `plan` | refused |
+
+The router builds `CodexCliProfile(executable=<registry entry>, state_dir=<daemon state dir>, enabled=True,
+sandbox=<derived>, extra_args=(), max_timeout_seconds=<entry>)` plus the base profile's `memory_limit_bytes`,
+`max_output_bytes_limit`, `max_line_bytes` and `term_grace_seconds` (the same rlimits as a Claude child): no
+`credentials_file` (the default lookup below
+applies), no model (`agent.profile_selected` records `model: null`; the `--model=` allowlist entry is not used by the
+daemon), and the daemon's spawn journal, exactly like Claude spawns. Providers are cached per
+`(profile_id, allowed_tools, permission_mode)`. Recovery reconciles Codex attempts like Claude ones
+(`recover_mock_run(provider_kind={"claude","codex"})`). `AgentRuntime.probe_profile(id)` runs only `codex --version`
+(no agent, no worktree, no credential copy) and returns `healthy`, `unverified_version` or `unavailable`; it has no
+API surface yet. The version child runs in its own session with a scrubbed environment and stderr discarded; its
+stdout is read from a non-blocking descriptor with `poll` (no 1024-descriptor limit, unlike `select`) in the calling
+thread against one 10 s deadline, capped at 4 KiB, and
+once the child has exited only what is already in the pipe is read, so a descendant that escaped with `setsid` and
+keeps the pipe open cannot delay the result. The whole call returns within about 10 s; the child's process group is
+then killed and the child reaped with a bounded wait (SIGKILL to the group, then to the child, at most 2 s each, then
+an error is logged instead of hanging); a `setsid` descendant is outside that group and is not killed. The probe child
+gets the same rlimits as an agent spawn (CPU 11 s, NOFILE, FSIZE, no core, NPROC, optional address space).
+
+**Version gate at spawn.** Before every Codex spawn the router checks `codex --version` (run off the event loop and cached per executable realpath, device, inode, size, mtime and ctime, at most 16 entries; a successful result is kept while that identity holds, a failed one for 30 s, so a transient failure is retried. The key is the configured executable: if it is a wrapper script, a change to what the wrapper execs is not noticed until the wrapper itself changes). The `/tmp`/`$TMPDIR` exclusion of `workspace-write` relies on `-c sandbox_workspace_write.*` keys verified only on `VERIFIED_CLI_VERSIONS` (`0.170.0`), and a newer Codex could silently ignore a renamed key, so a task that would run `workspace-write` on any other (or unparseable) version is refused before spawning with detail `codex_ineligible`. A `read-only` task still runs on an unverified version, and each such spawn logs a warning naming the task, the profile and the parsed version (digits and dots only, otherwise `unknown`). Updating Codex therefore disables Codex edits until the new version is verified and added to `VERIFIED_CLI_VERSIONS`. **Probe failure** (the binary is missing, exits non-zero, prints no parseable `codex-cli X.Y.Z`, times out after 10 s, or the check itself errors) counts as *no version*: exactly like an unverified version, a `workspace-write` task is refused with `codex_ineligible` and nothing is spawned, while a `read-only` task still runs and its spawn logs the version as `unknown`. A probe failure never fails a task as `start_rejected` by itself and never affects Claude tasks.
+
+Executable checks: like the Claude base executable, the codex `executable` must be an absolute, normalized path and
+(when enabled) an existing executable file; neither adapter refuses a symlink or a group/world-writable binary.
+Keep the binary owned by the daemon's user or root and not writable by others.
 
 ## Profile
 
@@ -30,9 +72,9 @@ cap; cancel and timeout send TERM to the group, then KILL after the grace period
 
 Given a `spawn_journal` (ADR 023), the adapter journals each spawn exactly like the Claude adapter: intent before
 `Popen` (if it cannot be written, nothing is spawned), pid, start ticks and boot id right after, removed once reaped
-unless the stop status was `unknown`. Entries carry no prompt, argv, path or credential. Because the adapter is not
-wired into the daemon, no daemon run passes a journal to it today; the behaviour is covered by
-`tests/test_codex_spawn_journal.py`.
+unless the stop status was `unknown`. Entries carry no prompt, argv, path or credential. The daemon passes its journal to
+every Codex provider it builds; covered by `tests/test_codex_spawn_journal.py` and, through the engine,
+`tests/test_codex_agent_runs.py`.
 
 Event mapping (schema observed on 0.170.0, see Verified): `item.completed` of an `agent_message` -> `output`;
 `item.started` of any non-message item -> `tool_use` with **the item type only** (for example
@@ -79,11 +121,18 @@ The effect of `network_access=false` was **not** checked.
 ## Verified against codex-cli 0.170.0 (2026-11-20, Linux)
 
 `VERIFIED_CLI_VERSIONS = ("0.170.0",)`. `probe()` runs `codex --version` (scrubbed env, no stdin, 10 s timeout) and
-returns `healthy` for a verified version, `unverified_version` for another parseable one, `unavailable` otherwise;
-it is advisory and does not block execution.
+returns `healthy` for a verified version, `unverified_version` for another parseable one, `unavailable` otherwise.
+On its own it does not block execution; through the daemon, the spawn-time version gate above refuses
+`workspace-write` on any unverified version.
 
 Recorded event fixtures (scrubbed of paths): `tests/fixtures/codex_cli_0_170_0/` (`read_only_command`,
 `read_only_write_refused`, `turn_failed_bad_model`, `workspace_write_command`). The fake-executable tests replay them.
+
+Test isolation: `tests/conftest.py` points `CODEX_HOME`/`CLAUDE_CONFIG_DIR` at fake credential files and guards both
+adapters' credential readers, so a fake-executable test that reaches the real `~/.codex` or `~/.claude` login (even
+through an explicit environment naming the real `HOME`) is refused before the file is opened and fails. Only tests
+marked `real_cli("SYNAPSE_REAL_CODEX")`/`real_cli("SYNAPSE_REAL_CLAUDE")` see the real environment when their flag is
+`1`; run them in a separate invocation (`SYNAPSE_REAL_CODEX=1 pytest tests/test_codex_cli_real.py`).
 
 `tests/test_codex_cli_real.py` (opt-in `SYNAPSE_REAL_CODEX=1`) passed 7/7:
 
@@ -118,7 +167,10 @@ no events; stderr is separate from the JSONL on stdout (the adapter discards std
   signals (none were observed), and cost.
 - Behaviour with a trusted project (the repo-config observation above is for an untrusted/fresh scratch setup),
   and resource-limit behaviour under `memory_limit_bytes`.
-- Engine integration: not wired, so no approval-gate, worktree, scheduling or desktop behaviour is claimed.
+- Engine integration is covered **only with the fake executable** (`tests/test_codex_agent_runs.py`: lifecycle, sandbox
+  derivation, ineligible tools/modes, disabled profile, spawn refusal without fallback, unknown outcome, recovery,
+  journal, probe). No real `codex` was run through the daemon, so a real daemon run (and ADR 016 gate 1, the
+  independent review, and the opt-in `SYNAPSE_REAL_CODEX=1` run through the engine) is still outstanding.
 
 ## Repo-config refusal list (security review F3)
 

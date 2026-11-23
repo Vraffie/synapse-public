@@ -25,6 +25,10 @@ optional keys that must be given together:
 ```
 
 `repos`: 1 to 32 absolute, normalized, symlink-free repositories with a real `.git` directory.
+The list is fixed when the daemon starts and is an operator decision: nothing in the daemon API or an agent
+can change it. To pick repositories out of a project folder that holds several (for example a workspace with
+sibling repos and plain data folders), run `python scripts/synapse_up.py workspace FOLDER` and register the
+chosen ones with `up --workspace FOLDER --repo NAME ...` (see workspace.md); restart the daemon afterwards.
 `worktree_root`: absolute, outside the state directory, not overlapping any repo (created `0700`).
 Optional approval policy keys (F6): `"require_approval": true` makes every run need an
 `approval_step`; `"require_approval_for_modes": ["acceptEdits"]` and
@@ -93,6 +97,30 @@ Failure after the run exists (worktree creation, runtime refusal, crash): the ne
 branch are force-removed (idempotent; skipped if the run already started) and the still-queued run is
 cancelled with its task, so no queued or running run remains. The cancelled run is a visible audit
 trace (runs cannot be deleted); a retry with the same key creates a fresh run.
+
+### Running a task on Codex
+
+Codex runs only for a task (or a request) that **names** an enabled `codex` profile declared in `--agent-config`
+([agent profiles](agent-profiles.md#codex-profiles)); it is never the default and never a fallback. Name it with
+`"profile"` on the task (or on the request, for every task):
+
+```json
+{"repo": "/srv/repo", "base_ref": "main", "timeout_seconds": 600, "tasks": [
+  {"id": "review", "prompt": "...", "allowed_tools": ["Read", "Grep"], "permission_mode": "plan", "profile": "codex-edit"},
+  {"id": "fix", "prompt": "...", "allowed_tools": ["Read", "Edit"], "permission_mode": "acceptEdits",
+   "profile": "codex-edit", "depends_on": ["review"]}
+]}
+```
+
+`plan` runs Codex with `-s read-only`; `acceptEdits` with `Edit`/`Write` runs it with `-s workspace-write` (no
+`/tmp`/`$TMPDIR` writes, `network_access=false` requested). The request is refused with 422 when a Codex task lists any
+tool outside `Read`, `Glob`, `Grep`, `Edit`, `Write` (for example any `Bash(...)`), uses `dontAsk` or `manual`, asks for
+`Edit`/`Write` with `plan`, or names a disabled or unknown profile. The tool list does **not** restrict what Codex does
+inside its sandbox (it can run shell commands there); it only selects the sandbox. Same-user trust applies as for
+Claude: the agent runs as the daemon's user and can read that user's files.
+
+**Codex runs unsandboxed by Synapse.** Synapse does not wrap the Codex child in bwrap; the only confinement is Codex's own `-s read-only` / `-s workspace-write`, and `read-only` does not confine reads. A Codex child can therefore read anything the daemon's user can: `approver.token` and `operator.token` in the state dir (so it can approve its own gated requests), the SQLite database, `agentd.sock`, and the user's other credentials. For that reason a codex profile is **refused** (startup error, and `codex_ineligible`/422 as backstops) whenever the `--claude-cli-config` base has `"sandbox": true`: it would silently get less isolation than every Claude child. Codex is only available with the base sandbox off and `--allow-same-user-agents` acknowledged; the startup warning and the `agent_runtime.same_user_acknowledged` audit row then record `codex_unsandboxed: true`. In practice: only name a Codex profile for work you would let run with full read access to
+your account and to the daemon's approval secrets; approvals do not constrain a Codex task.
 
 ## `GET /api/v1/runs/{run_id}/agent`
 

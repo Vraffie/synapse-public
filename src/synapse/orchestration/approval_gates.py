@@ -141,14 +141,16 @@ class ApprovalGateCoordinator:
             raise
 
     def resume(self, *, run_id: str, task_id: str, spec: ApprovalStepSpec,
-               budget_check: Callable[[sqlite3.Connection, str, str], None] | None = None) -> Resumed:
+               budget_check: Callable[[sqlite3.Connection, str, str], None] | None = None,
+               budget_block: Callable[..., int] = write_budget_block) -> Resumed:
         """Re-verify the binding and, only if it holds, resume with a new attempt.
 
         Rejected/expired/revoked/lapsed approvals and binding mismatches fail the
         task through gate resolution. A still-pending approval leaves it parked.
         ``budget_check`` runs in the reservation transaction, before the real attempt exists; on
         ``BudgetDenied`` the gate is consumed and the task goes RUNNING -> BLOCKED in that same
-        transaction (fail closed, no attempt, no retry) and ``BLOCKED`` is returned.
+        transaction (fail closed, no attempt, no retry) and ``BLOCKED`` is returned. ``budget_block`` records
+        the refusal (default ``write_budget_block``; the agent engine passes a writer that fails the task).
         """
         row = self.db.execute("SELECT state,state_version FROM tasks WHERE id=? AND run_id=?", (task_id, run_id)).fetchone()
         if row is None or row[0] != State.AWAITING_APPROVAL:
@@ -168,7 +170,7 @@ class ApprovalGateCoordinator:
                 try:
                     budget_check(self.db, task_id, profile_id)
                 except BudgetDenied as denied:
-                    blocked = write_budget_block(self.db, principal=self._principal, run_id=run_id, task_id=task_id,
+                    blocked = budget_block(self.db, principal=self._principal, run_id=run_id, task_id=task_id,
                                                  version=version + 1, before=State.RUNNING, profile_id=profile_id,
                                                  denied=denied)
                     self.db.execute("COMMIT")

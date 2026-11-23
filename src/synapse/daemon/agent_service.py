@@ -34,6 +34,7 @@ from synapse.persistence.run_snapshot import RunNotFound
 from synapse.persistence.run_store import write_run_transition
 from synapse.persistence.state_store import StateConflict, write_task_transition
 from synapse.persistence.workflow_store import create_run, publish_workflow
+from synapse.providers.codex_cli import CodexIneligible, sandbox_for_task
 
 _LOG = logging.getLogger(__name__)
 PRINCIPAL = "local-operator"
@@ -111,8 +112,10 @@ class AgentRunService:
             raise _bad("unknown profile")
         if not spec.enabled:
             raise _bad("profile is disabled")
-        if spec.provider != "claude":
+        if spec.provider not in ("claude", "codex"):
             raise _bad("profile provider is not supported")
+        if spec.provider == "codex" and getattr(self.runtime.profile, "sandbox", True) is not False:
+            raise _bad("codex profiles are refused while the base profile is sandboxed")
         return spec
 
     def validate(self, req: dict, profile_id: str | None = None) -> dict:
@@ -172,9 +175,16 @@ class AgentRunService:
         if (not isinstance(tools, list) or not 1 <= len(tools) <= MAX_TOOLS
                 or any(not isinstance(x, str) for x in tools)):
             raise _bad("allowed_tools must be a nonempty list of tool names")
+        mode = t.get("permission_mode", default_mode)
+        if spec.provider == "codex":
+            # Codex has no tool allowlist: tools and mode only select a sandbox class (ADR 016 decision 4).
+            # Anything it cannot express (Bash patterns, other tools, dontAsk/manual, Edit/Write under plan) is a 422.
+            try:
+                sandbox_for_task(tools, mode)
+            except CodexIneligible as exc:
+                raise _bad(str(exc)) from None
         if not set(tools) <= set(profile.allowed_tools):
             raise _bad("allowed_tools must be a subset of the operator allowlist")
-        mode = t.get("permission_mode", default_mode)
         if mode not in at.AGENT_PERMISSION_MODES:
             raise _bad("permission_mode is not permitted")
         if not mode_within(mode, spec.permission_mode):

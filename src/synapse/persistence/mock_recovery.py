@@ -10,20 +10,27 @@ from synapse.persistence.state_store import StateConflict, write_task_transition
 
 
 def recover_mock_run(connection: sqlite3.Connection, *, run_id: str, principal: str,
-                     no_workers_survive: bool, provider_kind: str = "mock") -> tuple[tuple[str, ...], tuple[str, ...]]:
+                     no_workers_survive: bool,
+                     provider_kind: str | frozenset[str] = "mock") -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Reconcile one run after exclusive startup; never restart any work.
 
     The caller MUST hold the daemon ownership lock and establish that no
     previous worker can run or issue external effects. The boolean is explicit
     operator/application attestation, not a process fence. All candidate
     profiles must be of ``provider_kind`` (``mock`` unless a real-agent runtime
-    passes its own); failure aborts the entire transaction.
+    passes its own: one provider name or a frozenset of them, e.g. ``{"claude",
+    "codex"}``); failure aborts the entire transaction.
     Returns (newly unknown attempt IDs, newly blocked task IDs).
     """
     if no_workers_survive is not True:
         raise ValueError("Explicit assurance that no workers survive is required")
     validate_id(run_id)
     validate_id(principal)
+    kinds = (frozenset({provider_kind}) if isinstance(provider_kind, str)
+             else frozenset(provider_kind) if isinstance(provider_kind, (set, frozenset)) else None)
+    if (kinds is None or not kinds or any(k not in ("mock", "claude", "codex") for k in kinds)
+            or ("mock" in kinds and len(kinds) > 1)):  # mock and real work are never reconciled together
+        raise ValueError("provider_kind must name known providers")
     if connection.in_transaction:
         raise RuntimeError("Recovery requires an autocommit connection")
     connection.execute("BEGIN IMMEDIATE")
@@ -42,14 +49,15 @@ def recover_mock_run(connection: sqlite3.Connection, *, run_id: str, principal: 
             raise StateConflict("Terminal run contains unresolved work")
         allowed = {State.ASSIGNED, State.RUNNING, State.VERIFYING, State.READY, State.WAITING_DEPENDENCIES, State.BLOCKED}
         for task_id, state, _, provider in rows:
-            if provider != provider_kind:
+            if provider not in kinds:
                 raise StateConflict("Recovery requires mock-owned tasks with known profiles")
             if state not in allowed:
                 raise StateConflict("Unresolved attempt has an inconsistent task state")
             non_mock = connection.execute(
                 "SELECT 1 FROM task_attempts a LEFT JOIN profiles p ON p.id=a.profile_id "
                 "WHERE a.task_id=? "
-                "AND (p.provider IS NULL OR p.provider <> ?) LIMIT 1", (task_id, provider_kind),
+                "AND (p.provider IS NULL OR p.provider NOT IN (%s)) LIMIT 1" % ",".join("?" * len(kinds)),
+                (task_id, *sorted(kinds)),
             ).fetchone()
             if non_mock:
                 raise StateConflict("Recovery requires mock-owned attempts with known profiles")

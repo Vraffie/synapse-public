@@ -17,8 +17,8 @@ All `CacheKeyInputs` fields are daemon-owned facts. The agent never supplies any
 
 | reason | when |
 | --- | --- |
-| `edit_task`, `review_task`, `verification_task`, `independent_check_task` | the task class is one of these, even if an operator marked it cacheable |
-| `unknown_task_class` | the class is not `read_only_analysis` or `validation` |
+| `edit_task`, `review_task`, `verification_task`, `validation_task`, `independent_check_task` | the task class is one of these, even if an operator marked it cacheable. A validation is a check on a candidate, which ADR 017 D6 never allows to be cached (invariants 9 and 10) |
+| `unknown_task_class` | the class is not `read_only_analysis`, the only cacheable class (ADR 017 D6: operator-marked read-only analysis) |
 | `not_marked_cacheable` | the operator policy did not set `operator_marked_cacheable=True` (the default is no) |
 | `approval_gated` | the task is approval-gated (any value other than `False`) |
 | `bash_tool` | any `Bash` tool, including `Bash(...)` patterns |

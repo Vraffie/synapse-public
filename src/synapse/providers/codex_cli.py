@@ -1,4 +1,4 @@
-"""Codex CLI provider adapter (disabled by default, not wired into the daemon).
+"""Codex CLI provider adapter (disabled by default; runs only for a task that names a Codex profile).
 
 Runs `codex exec --json` as a supervised subprocess in a caller-supplied git worktree.
 Same-user, single trust domain, like the Claude adapter: the child runs as the daemon's OS
@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import resource
+import select
 import shutil
 import signal
 import stat
@@ -53,6 +54,8 @@ _LOG = logging.getLogger(__name__)
 VERIFIED_CLI_VERSIONS = ("0.170.0",)
 _VERSION_RE = re.compile(r"^codex-cli (\d{1,4}\.\d{1,4}\.\d{1,4})(?:\s|$)")
 _VERSION_TIMEOUT_SECONDS = 10.0
+_VERSION_MAX_BYTES = 4096
+_REAP_TIMEOUT_SECONDS = 2.0
 
 # `-s danger-full-access` is deliberately NOT allowed.
 SANDBOX_MODES = frozenset({"read-only", "workspace-write"})
@@ -107,6 +110,154 @@ class CodexOutcome(StrEnum):
     TIMED_OUT = "timed_out"
     CANCELLED = "cancelled"
     UNKNOWN = "unknown"  # process outcome not established: never retry blindly
+
+
+# Task eligibility for a Codex profile (ADR 016 decision 4). A Synapse task carries Claude-shaped
+# `allowed_tools` and `permission_mode`; Codex has no tool allowlist, so they only select a sandbox
+# class. Tools the sandbox cannot express (any `Bash(...)` pattern, WebFetch, ...) make the task
+# ineligible rather than being silently widened, and the Claude-only modes `dontAsk` and `manual`
+# have no Codex equivalent.
+CODEX_TASK_TOOLS = frozenset({"Read", "Glob", "Grep", "Edit", "Write"})
+_WRITE_TOOLS = frozenset({"Edit", "Write"})
+_MODE_SANDBOX = {"plan": "read-only", "acceptEdits": "workspace-write"}
+
+
+class CodexIneligible(ValueError):
+    """The task's tools or permission mode cannot be mapped onto a Codex sandbox."""
+
+
+def sandbox_for_task(allowed_tools, permission_mode) -> str:
+    """The Codex sandbox for a task, or CodexIneligible. Fixed table, nothing configurable.
+
+    ``plan`` -> ``read-only``; ``acceptEdits`` -> ``workspace-write`` when Edit or Write is
+    requested, else ``read-only``. ``Edit``/``Write`` with ``plan`` is refused (it would either
+    silently drop the write or widen ``plan``).
+    """
+    if permission_mode not in _MODE_SANDBOX:
+        # Fixed text (it reaches API errors, which never echo input).
+        raise CodexIneligible("permission_mode is not supported on a codex profile (only plan and acceptEdits)")
+    if (isinstance(allowed_tools, (str, bytes)) or not all(isinstance(t, str) for t in allowed_tools)
+            or not set(allowed_tools) <= CODEX_TASK_TOOLS):
+        raise CodexIneligible("allowed_tools on a codex profile must be a subset of %s"
+                              % ", ".join(sorted(CODEX_TASK_TOOLS)))
+    writes = bool(set(allowed_tools) & _WRITE_TOOLS)
+    if writes and permission_mode == "plan":
+        raise CodexIneligible("Edit/Write need permission_mode acceptEdits on a codex profile")
+    return "workspace-write" if writes else "read-only"
+
+
+def cli_version(executable: str, environ: Mapping[str, str], preexec=None) -> str | None:
+    """Run ``<executable> --version``; return "X.Y.Z" or None (never raises). Wall-clock bounded by one deadline.
+
+    Own session/process group, scrubbed env, stderr discarded, optional ``preexec`` (the spawn's rlimits). stdout is
+    read from a raw, non-blocking fd in this thread with ``poll`` (no FD_SETSIZE limit, unlike ``select``) against the
+    deadline and capped at _VERSION_MAX_BYTES; once the child has exited only what is already in the pipe is read, so
+    a descendant that escaped the group (``setsid``) and keeps the pipe open cannot delay the result. Afterwards the
+    group is killed and the child reaped with a bounded wait; a descendant that left the group via ``setsid`` is
+    outside it by construction and is not killed.
+    """
+    env = {k: v for k, v in environ.items() if k in _ENV_ALLOWLIST}
+    deadline = time.monotonic() + _VERSION_TIMEOUT_SECONDS
+    try:
+        proc = subprocess.Popen([executable, "--version"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, env=env, cwd="/", start_new_session=True,
+                                close_fds=True, bufsize=0, preexec_fn=preexec)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    buf = bytearray()
+    exited = False
+    fd = None
+    try:
+        fd = os.dup(proc.stdout.fileno())  # our own descriptor: the file object is closed below, never read
+        proc.stdout.close()
+        os.set_blocking(fd, False)
+        poller = select.poll()
+        poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        eof = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if not exited:
+                # WNOWAIT keeps the exited leader as a zombie, so its process-group id cannot be reused before killpg.
+                exited = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+            if not eof and len(buf) < _VERSION_MAX_BYTES:
+                timeout_ms = 0 if exited else max(1, int(min(0.02, remaining) * 1000))
+                if poller.poll(timeout_ms):
+                    try:
+                        chunk = os.read(fd, _VERSION_MAX_BYTES - len(buf))
+                    except BlockingIOError:
+                        chunk = None
+                    if chunk == b"":
+                        eof = True
+                    elif chunk:
+                        buf += chunk
+                        continue  # drain what is there before deciding
+            elif not exited:
+                time.sleep(min(0.02, remaining))
+            if exited:
+                break  # everything the child wrote is already in the pipe; never wait for a descendant's EOF
+    except Exception:
+        _LOG.warning("codex --version check failed", exc_info=True)
+        exited = False
+    finally:
+        _kill_and_reap(proc)
+        if fd is not None:
+            os.close(fd)
+        elif proc.stdout is not None and not proc.stdout.closed:
+            proc.stdout.close()
+    if not exited or proc.returncode != 0:
+        return None
+    return parse_cli_version(bytes(buf[:256]).decode("utf-8", "replace"))
+
+
+def _kill_and_reap(proc: subprocess.Popen) -> None:
+    """SIGKILL the child's group (and the child), then reap it with a bounded wait; never hangs."""
+    for kill in (lambda: os.killpg(proc.pid, signal.SIGKILL), lambda: os.kill(proc.pid, signal.SIGKILL)):
+        try:
+            kill()
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=_REAP_TIMEOUT_SECONDS)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+    _LOG.error("codex --version child %d could not be reaped; giving up", proc.pid)
+
+
+_VERSION_CACHE: dict[tuple, tuple[str | None, float | None]] = {}  # key -> (version, expiry for a failure)
+_VERSION_CACHE_MAX = 16
+_VERSION_FAILURE_TTL_SECONDS = 30.0
+_VERSION_CACHE_LOCK = threading.Lock()
+
+
+def cached_cli_version(executable: str, environ: Mapping[str, str], preexec=None) -> str | None:
+    """``cli_version`` cached by the executable's identity; bounded, never raises.
+
+    Key: realpath, device, inode, size, mtime_ns and ctime_ns (an in-place rewrite that restores the mtime still
+    changes the ctime), so a replaced or modified binary is re-checked. A successful result is kept while the key
+    holds; a failed probe (None) only for _VERSION_FAILURE_TTL_SECONDS (monotonic), so a transient failure is retried.
+    A failed stat is never cached.
+    """
+    try:
+        real = os.path.realpath(executable)
+        st = os.stat(real)
+    except OSError:
+        return None
+    key = (real, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    now = time.monotonic()
+    with _VERSION_CACHE_LOCK:
+        hit = _VERSION_CACHE.get(key)
+        if hit is not None and (hit[1] is None or hit[1] > now):
+            return hit[0]
+    version = cli_version(executable, environ, preexec)
+    with _VERSION_CACHE_LOCK:
+        _VERSION_CACHE.pop(key, None)
+        while len(_VERSION_CACHE) >= _VERSION_CACHE_MAX:
+            _VERSION_CACHE.pop(next(iter(_VERSION_CACHE)))
+        _VERSION_CACHE[key] = (version, None if version is not None else time.monotonic() + _VERSION_FAILURE_TTL_SECONDS)
+    return version
 
 
 def parse_cli_version(output: str) -> str | None:
@@ -240,17 +391,19 @@ class CodexCliProvider:
         return ProviderHealth(profile_id, "healthy" if version in VERIFIED_CLI_VERSIONS else "unverified_version")
 
     def _cli_version(self) -> str | None:
-        """Run `<executable> --version` with a scrubbed environment; None on any failure."""
-        env = {k: v for k, v in self._environ.items() if k in _ENV_ALLOWLIST}
+        """Run `<executable> --version` with a scrubbed environment and the spawn's rlimits; None on any failure."""
+        return cli_version(self._profile.executable, self._environ, self._version_preexec())
+
+    def cached_cli_version(self) -> str | None:
+        """``_cli_version`` cached per executable identity; see ``cached_cli_version``. Never raises."""
+        return cached_cli_version(self._profile.executable, self._environ, self._version_preexec())
+
+    def _version_preexec(self):
+        """The same rlimits as an agent spawn (CPU bounded by the probe deadline); None if they cannot be computed."""
         try:
-            done = subprocess.run([self._profile.executable, "--version"], stdin=subprocess.DEVNULL,
-                                  capture_output=True, timeout=_VERSION_TIMEOUT_SECONDS, env=env,
-                                  cwd="/", check=False)
-        except (OSError, subprocess.SubprocessError):
+            return self._preexec(int(_VERSION_TIMEOUT_SECONDS) + 1)
+        except Exception:
             return None
-        if done.returncode != 0:
-            return None
-        return parse_cli_version(done.stdout[:256].decode("utf-8", "replace"))
 
     async def capabilities(self, profile_id: str) -> ProviderCapabilities:
         validate_id(profile_id)

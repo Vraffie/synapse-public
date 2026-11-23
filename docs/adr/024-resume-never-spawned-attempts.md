@@ -27,7 +27,8 @@ keys are random and not tied to attempts.
      written. Such an attempt stays `unknown`, its task `blocked` and its run `recovering`. It is never re-spawned
      and still needs `agent-abandon`, exactly as before. The database has no `starting` attempt state: the mark
      plays that role without widening the attempt state machine.
-   - Migration 0017 marks **every** attempt that exists before it, so a missing mark can only mean "created after
+   - Migration 0017 marks **every** attempt that exists before it (those rows hold the sentinel
+     `marked_at = 'migration-0017'` instead of a timestamp), so a missing mark can only mean "created after
      the upgrade and never handed to a provider". An in-flight attempt from an older daemon is never re-queued.
 3. **Re-queue (`persistence/attempt_resume.requeue_never_spawned`), all or nothing per run, in one transaction.**
    Re-queue happens only if all of these hold. Otherwise nothing changes and today's recovery runs:
@@ -70,7 +71,7 @@ keys are random and not tied to attempts.
   racing the claim) is still treated as unknown. Only attempts left in `running`/`created` are candidates.
 - `daemon_epoch` and stale-write rejection are still future work (ADR 023). Re-queue relies on the daemon ownership
   lock: no previous daemon can write after a restart.
-- Codex runs are not wired into the daemon (ADR 016). The mark lives in the shared agent engine, so it applies once
-  they are.
+- The mark lives in the shared agent engine, so it covers Claude and Codex spawns alike (Codex is wired since ADR 016
+  decision 4 merged).
 - Not verified against real `claude`/`codex` binaries: tests use the fake CLI and copied database and journal images
   for each crash point.

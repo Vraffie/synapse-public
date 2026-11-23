@@ -2,7 +2,9 @@
 
 The ledger is provider-reported and distinguishes coverage per field: a value the provider did not report is
 ``None`` and is shown as "unknown", never as 0. Daemon text is untrusted: ids are cleaned and shortened, counts
-are validated as non-negative integers and the number of rows is bounded.
+are validated as non-negative integers and the number of rows is bounded. The daemon pages observations (the
+desktop asks for one page of MAX_ROWS) while totals and coverage always cover the whole run; when more rows exist
+the pane says so instead of silently showing a truncated list.
 """
 from __future__ import annotations
 
@@ -75,8 +77,9 @@ def sanitize_usage(raw) -> dict | None:
                 totals[field] = None
                 continue
             coverage[field] = (cov["known"], cov["attempts"])
+        more = raw.get("next_cursor") is not None or len(raw["observations"]) > MAX_ROWS
         return {"attempts_total": total, "attempts_with_usage": with_usage, "rows": rows, "rows_total": len(raw["observations"]),
-                "totals": totals, "coverage": coverage}
+                "more": more, "totals": totals, "coverage": coverage}
     except (ValueError, TypeError):
         return None
 
@@ -139,9 +142,10 @@ class UsagePane(QGroupBox):
         if not usage["rows"]:
             self.clear(EMPTY_TEXT + f" Attempts: {usage['attempts_total']}.")
             return
-        extra = usage["rows_total"] - len(usage["rows"])
+        more = usage.get("more", False) or usage["rows_total"] > len(usage["rows"])
         self.status.setText(f"Attempts with reported usage: {usage['attempts_with_usage']} of {usage['attempts_total']}."
-                            + (f" Showing the first {len(usage['rows'])} of {usage['rows_total']} rows." if extra > 0 else ""))
+                            + (f" Showing the first {len(usage['rows'])} rows; more exist (totals cover all rows)."
+                               if more else ""))
         self.table.setVisible(True)
         self.table.setRowCount(len(usage["rows"]))
         for r, row in enumerate(usage["rows"]):
