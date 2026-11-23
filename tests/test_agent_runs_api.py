@@ -913,6 +913,9 @@ def test_per_task_profiles_run_each_task_under_its_own_profile(env):
     by_node = {t["node_id"]: t for t in shown["tasks"]}
     assert by_node["a"]["spec"]["profile"] == "reader" and "profile" not in by_node["b"]["spec"]
     assert by_node["a"]["state"] == by_node["b"]["state"] == "completed"
+    # the effective profile is reported, from the claim and from the attempt (the spec only holds what was requested)
+    assert by_node["a"]["profile_id"] == by_node["a"]["attempt"]["profile_id"] == "reader"
+    assert by_node["b"]["profile_id"] == by_node["b"]["attempt"]["profile_id"] == at.AGENT_PROFILE
     picked = {json.loads(r[0])["task_id"]: json.loads(r[0]) for r in env.db.execute(
         "SELECT payload_json FROM events WHERE type='agent.profile_selected'")}
     assert {p["profile_id"] for p in picked.values()} == {"reader", at.AGENT_PROFILE}

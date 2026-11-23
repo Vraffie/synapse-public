@@ -529,12 +529,13 @@ class AgentRunService:
         specs = at.load_task_specs(self.db, run_id)
         run_state = self.db.execute("SELECT state FROM runs WHERE id=?", (run_id,)).fetchone()[0]
         tasks = []
-        for task_id, node, state in self.db.execute("SELECT id,node_id,state FROM tasks WHERE run_id=? ORDER BY id", (run_id,)).fetchall():
+        for task_id, node, state, assigned in self.db.execute(
+                "SELECT id,node_id,state,assigned_profile_id FROM tasks WHERE run_id=? ORDER BY id", (run_id,)).fetchall():
             spec = specs[node]
             step = spec["approval_step"]
-            attempt = self.db.execute("SELECT id,attempt_no,state FROM task_attempts WHERE task_id=? ORDER BY attempt_no DESC LIMIT 1", (task_id,)).fetchone()
+            attempt = self.db.execute("SELECT id,attempt_no,state,profile_id FROM task_attempts WHERE task_id=? ORDER BY attempt_no DESC LIMIT 1", (task_id,)).fetchone()
             tasks.append({
-                "task_id": task_id, "node_id": node, "state": state,
+                "task_id": task_id, "node_id": node, "state": state, "profile_id": assigned,
                 "spec": {**({"profile": spec["profile_id"]} if spec.get("profile_id") else {}),
                          "repo": spec["repo"], "base_ref": spec["base_ref"], "worktree_head": spec["worktree_head"],
                          "spec_sha256": None if step is None else step["candidate_sha256"],
@@ -542,7 +543,8 @@ class AgentRunService:
                          "timeout_seconds": spec["timeout_seconds"], "prompt_sha256": spec["prompt_sha256"],
                          "prompt_bytes": spec["prompt_bytes"], "worktree_path": spec["worktree"],
                          "approval_step": None if step is None else {k: step[k] for k in ("operation", "target", "ttl_seconds")}},
-                "attempt": None if attempt is None else {"id": attempt[0], "attempt_no": attempt[1], "state": attempt[2]},
+                "attempt": None if attempt is None else {"id": attempt[0], "attempt_no": attempt[1], "state": attempt[2],
+                                                         "profile_id": attempt[3]},
                 "result": self._summary(task_id),
                 "worktree": await self._worktree(run_id, task_id),
             })

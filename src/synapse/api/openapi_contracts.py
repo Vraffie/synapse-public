@@ -50,7 +50,9 @@ MESSAGE = _object({"cursor": INTEGER, "id": STRING, "sender_instance_id": STRING
                    "payload": JSON_OBJECT, "created_at": STRING, "artifact_refs": {"type": "array", "items": STRING}})
 AGENT_WORKTREE = {"anyOf": [{"type": "null"}, _object({"exists": {"type": ["boolean", "null"]}}, required=["exists"])],
                   "description": "exists=true adds clean, head, branch, changed_paths, diff_stat, diff, diff_truncated."}
-AGENT_TASK = _object({"task_id": STRING, "node_id": STRING, "state": STRING, "spec": JSON_OBJECT,
+AGENT_TASK = _object({"task_id": STRING, "node_id": STRING, "state": STRING,
+                      "profile_id": {"type": ["string", "null"], "description": "Profile the task was claimed under; null before the claim."},
+                      "spec": JSON_OBJECT,
                       "attempt": {"anyOf": [{"type": "null"}, JSON_OBJECT]},
                       "result": {"anyOf": [{"type": "null"}, JSON_OBJECT]}, "worktree": AGENT_WORKTREE})
 ERROR = _object({"code": STRING, "message": STRING, "details": JSON_OBJECT, "correlation_id": STRING,
