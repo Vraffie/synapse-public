@@ -5,7 +5,9 @@ not independently measured**, and **unknown is never stored or shown as zero**.
 
 ## What is recorded
 
-For every real agent attempt whose provider result carried usable usage, the engine writes, in one transaction:
+For every real agent attempt whose provider result carried usable usage, the engine writes, in the same
+transaction that records the attempt's terminal state (under a savepoint, so a failed usage write is logged and
+rolled back alone; see `budget-enforcement.md` for why the budget check needs this):
 
 - an `agent.usage_observed` event (payload: `task_id`, `input_tokens`, `output_tokens`, `cache_read_tokens`,
   `cache_write_tokens`, `cost_usd`, `source`), plus its outbox row, and

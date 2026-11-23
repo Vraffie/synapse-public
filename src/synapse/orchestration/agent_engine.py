@@ -15,8 +15,9 @@ differences, all deliberately conservative:
   tool names only, stored as a second artifact; usage is recorded as an event.
   Reduction affects only what is forwarded; the outcome and the verifier never
   depend on it, so mandatory checks cannot be reduced away;
-* with an operator budget policy bound to the run, a budget refusal before
-  scheduling fails the task with a distinct reason and is never retried
+* with an operator budget policy bound to the run, a budget breach before
+  scheduling fails the task with the distinct reason ``budget_exceeded`` and is
+  never retried; unknown usage or an unreadable budget blocks it instead
   (``orchestration.budget_enforcement``, docs/operations/budget-enforcement.md).
 """
 from __future__ import annotations
@@ -40,7 +41,7 @@ from synapse.application.routing_policy import RoutingInput
 from synapse.domain.workflow import State
 from synapse.infrastructure.artifact_blobs import ArtifactBlobStore
 from synapse.orchestration.mock_engine import MockWorkflowEngine, _RunInterrupted
-from synapse.orchestration.budget_enforcement import agent_budget_check, bound_policy_identity, write_budget_failure
+from synapse.orchestration.budget_enforcement import agent_budget_check, bound_policy_identity, write_budget_refusal
 from synapse.persistence.agent_tasks import spec_hash
 from synapse.persistence.artifact_store import publish_artifact
 from synapse.persistence.mock_execution_store import record_verification, set_attempt
@@ -185,10 +186,10 @@ class AgentWorkflowEngine(MockWorkflowEngine):
     _profile_provider = "claude"
     _profile_limits_check = None  # set per instance; None keeps the pre-limits behaviour
     _principal = "agent-engine"
-    # Unbudgeted unless the run has a bound policy (ADR 020); fails closed if the budget cannot be read, and a
-    # refusal fails the task (budget_exceeded / usage_unknown / budget_check_failed), see budget_enforcement.
+    # Unbudgeted unless the run has a bound policy (ADR 020); fails closed if the budget cannot be read. A breach
+    # (budget_exceeded) fails the task; usage_unknown / budget_check_failed block it. See budget_enforcement.
     _budget_check = staticmethod(agent_budget_check)
-    _budget_block_writer = staticmethod(write_budget_failure)
+    _budget_block_writer = staticmethod(write_budget_refusal)
 
     def __init__(self, connection: sqlite3.Connection, router: AgentProviderRouter,
                  blobs: ArtifactBlobStore, specs: Mapping[str, Mapping[str, Any]],
@@ -285,8 +286,8 @@ class AgentWorkflowEngine(MockWorkflowEngine):
         return False
 
     def _block_for_budget(self, run_id: str, task_id: str, version: int, profile_id: str, denied) -> None:
-        """A budget refusal at claim or park fails the READY task (never blocks or retries it), see
-        ``budget_enforcement.write_budget_failure``. A lost race leaves it READY: the next pass re-checks it."""
+        """A budget refusal at claim or park: a breach fails the READY task, other reasons block it; nothing is
+        retried (``budget_enforcement.write_budget_refusal``). A lost race leaves it READY for the next pass."""
         try:
             with self._transaction():
                 self._check_running(run_id)
@@ -342,21 +343,27 @@ class AgentWorkflowEngine(MockWorkflowEngine):
         return True
 
     def _usage_event(self, run_id: str, task_id: str, attempt_id: str, usage: UsageObservation, profile_id: str) -> None:
-        """Record provider-reported usage: the event and the append-only ledger row commit together.
+        """Record provider-reported usage inside the caller's transaction, the one that makes the attempt terminal.
 
+        The event and the append-only ledger row commit together with the terminal attempt state, so a budget
+        check never sees a finished attempt whose usage is still on its way (it would read as unknown). The write
+        runs under a savepoint: if it fails it is logged and rolled back alone, never the attempt's outcome.
         Nothing is recorded when the provider reported nothing usable (unknown is never stored as 0).
         ``confidence='reported'``: provider-reported, not independently measured.
         """
+        if not self.db.in_transaction:
+            raise RuntimeError("usage is recorded in the attempt's terminal transaction")
         known = (usage.input_tokens, usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens, usage.cost_usd)
         if all(v is None for v in known):
             return
-        event = EventEnvelope.create(aggregate_type="task_attempt", aggregate_id=attempt_id,
-            event_type="agent.usage_observed",
-            payload={"task_id": task_id, "input_tokens": usage.input_tokens,
-                     "output_tokens": usage.output_tokens, "cache_read_tokens": usage.cache_read_tokens,
-                     "cache_write_tokens": usage.cache_write_tokens, "cost_usd": usage.cost_usd,
-                     "source": usage.source})
-        with self._transaction():
+        self.db.execute("SAVEPOINT usage_record")
+        try:
+            event = EventEnvelope.create(aggregate_type="task_attempt", aggregate_id=attempt_id,
+                event_type="agent.usage_observed",
+                payload={"task_id": task_id, "input_tokens": usage.input_tokens,
+                         "output_tokens": usage.output_tokens, "cache_read_tokens": usage.cache_read_tokens,
+                         "cache_write_tokens": usage.cache_write_tokens, "cost_usd": usage.cost_usd,
+                         "source": usage.source})
             self.db.execute("INSERT INTO events(id,aggregate_type,aggregate_id,run_id,type,schema_version,payload_json,occurred_at) VALUES(?,?,?,?,?,?,?,?)",
                             (event.id, event.aggregate_type, attempt_id, run_id, event.event_type, event.schema_version,
                              encode_payload(event.payload), event.occurred_at))
@@ -367,6 +374,12 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                             (new_id(), attempt_id, profile_id, usage.source, usage.input_tokens, usage.output_tokens,
                              usage.cache_read_tokens, usage.cache_write_tokens, usage.cost_usd, "reported",
                              event.occurred_at, event.id))
+        except Exception:
+            self.db.execute("ROLLBACK TO SAVEPOINT usage_record")
+            self.db.execute("RELEASE SAVEPOINT usage_record")
+            _LOG.exception("Could not record usage for task %s", task_id)
+            return
+        self.db.execute("RELEASE SAVEPOINT usage_record")
 
     def _publish_summary(self, run_id: str, task_id: str, attempt_id: str, summary: dict) -> tuple[str, dict]:
         artifact_id = new_id()
@@ -557,12 +570,16 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                 with self._transaction():
                     self._check_running(run_id)
                     set_attempt(self.db, attempt_id=attempt_id, before="running", after="unknown", run_id=run_id, task_id=task_id)
+                    if usage is not None:
+                        self._usage_event(run_id, task_id, attempt_id, usage, profile_id)
                     self._change(task_id, State.RUNNING, State.BLOCKED, version)
             else:
                 target = {"succeeded": State.VERIFYING, "cancelled": State.CANCELLED}.get(outcome, State.FAILED)
                 with self._transaction():
                     self._check_running(run_id)
                     set_attempt(self.db, attempt_id=attempt_id, before="running", after=_ATTEMPT_STATE[outcome], run_id=run_id, task_id=task_id)
+                    if usage is not None:
+                        self._usage_event(run_id, task_id, attempt_id, usage, profile_id)
                     self._change(task_id, State.RUNNING, target, version)
             try:
                 reduction = await self._store_raw_and_reduce(run_id, task_id, attempt_id, bytes(raw), raw_capped)
@@ -580,11 +597,6 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                        "tool_names": tools, "tool_use_count": tool_count,
                        "usage": None if usage is None else {"input_tokens": usage.input_tokens,
                                                             "output_tokens": usage.output_tokens, "source": usage.source}}
-            try:
-                if usage is not None:
-                    self._usage_event(run_id, task_id, attempt_id, usage, profile_id)
-            except Exception:
-                _LOG.exception("Could not record usage for task %s", task_id)
             if outcome != "succeeded":
                 try:
                     self._publish_summary(run_id, task_id, attempt_id, summary)

@@ -101,9 +101,10 @@ claim (retry next tick) while any attempt in it is unresolved. A denial leaves n
 `ready -> blocked`, and writes a `budget.exceeded` event and a `budget.denied` audit row with reason
 `budget_exceeded` or `usage_unknown`. Nothing is downgraded or retried.
 
-That is the mock engine's behaviour. The agent engine (real-provider runs) fails the refused task instead of
-blocking it, fails closed with `budget_check_failed` when usage cannot be read, and records the policy version
-with each spawn: see `budget-enforcement.md`.
+That is the mock engine's behaviour. The agent engine (real-provider runs) fails a task refused for a breach
+(`budget_exceeded`) instead of blocking it, blocks with `budget_check_failed` when the budget cannot be read,
+records usage in the attempt's terminal transaction, and logs the policy version per attempt: see
+`budget-enforcement.md`.
 
 Approval-gated steps are checked twice, because an approved step is a real provider run:
 

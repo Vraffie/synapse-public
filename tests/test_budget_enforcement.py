@@ -15,6 +15,7 @@ from synapse.orchestration import agent_engine, budget_enforcement
 from synapse.orchestration.agent_engine import AgentWorkflowEngine
 from synapse.persistence import agent_tasks as at
 from synapse.persistence.agent_tasks import AgentSpecError
+import tests.test_agent_runtime as tar
 from tests.test_agent_runtime import GATE, Env, finish
 
 P = at.AGENT_PROFILE
@@ -78,15 +79,30 @@ def chain3(tmp_path):
     e.close()
 
 
+@pytest.fixture
+def indep(tmp_path, monkeypatch):
+    """Two tasks with no dependency between them (they can be scheduled in the same pass)."""
+    real = tar.publish_workflow
+
+    def nodeps(db, *, nodes, **kw):
+        return real(db, nodes=[{"id": n["id"], "dependencies": []} for n in nodes], **kw)
+    monkeypatch.setattr(tar, "publish_workflow", nodeps)
+    e = Env(tmp_path, nodes=("a", "b"))
+    yield e
+    e.close()
+
+
 def assert_refused(env, node, reason):
-    """The refused task never spawned, has no attempt, ended failed, and the refusal names the reason only."""
+    """The refused task never spawned and has no attempt; a breach ended it failed, anything else blocked it.
+    The refusal names the reason and the decision only."""
+    outcome = "failed" if reason == "budget_exceeded" else "blocked"
     assert env.spawns(node) == []
     assert node_attempts(env, node) == []
-    assert env.states()[1][node] == "failed"
+    assert env.states()[1][node] == outcome
     (event,) = denials(env)
-    assert event["task_id"] == tid(env, node) and event["reason"] == reason and event["outcome"] == "failed"
+    assert event["task_id"] == tid(env, node) and event["reason"] == reason and event["outcome"] == outcome
     (audit,) = audits(env)
-    assert audit["reason"] == reason and audit["outcome"] == "failed"
+    assert audit["reason"] == reason and audit["outcome"] == outcome
     # Only the decision is recorded: no prompt, tool, path or spec field.
     assert set(event) == {"task_id", "reason", "message", "policy_version", "outcome"}
     assert set(audit) == {"allowed", "reason", "policy_version", "scope", "breached", "unknown", "exhausted",
@@ -126,6 +142,12 @@ def test_over_the_run_limit_fails_the_next_task_without_spawning(chain):
     assert audit["breached"] == [{"limit": "max_total_tokens", "limit_value": 6, "observed": 7}]
     assert "max_total_tokens limit 6 observed 7" in event["message"]
     assert [r["task_id"] for r in applied(chain)] == [tid(chain, "a")]    # only the spawned attempt
+    # The claim-then-fail shortcut is marked, so ready -> assigned is never mistaken for a real assignment.
+    steps = [(json.loads(p)["before"], json.loads(p)["after"], json.loads(p)["principal"]) for (p,) in chain.db.execute(
+        "SELECT payload_json FROM events WHERE type='task.state_changed' AND aggregate_id=? ORDER BY rowid", (tid(chain, "b"),))]
+    assert steps[-2:] == [("ready", "assigned", "agent-engine.budget-refusal"),
+                          ("assigned", "failed", "agent-engine.budget-refusal")]
+    assert all(p == "agent-engine" for _, _, p in steps[:-2])
 
 
 def test_attempt_limit_counts_attempts_used(chain):
@@ -140,7 +162,8 @@ def test_attempt_limit_counts_attempts_used(chain):
 def test_unknown_usage_under_a_token_limit_is_never_zero(chain):
     budgeted(chain, per_run={"max_total_tokens": 1000})
     run(chain, {"a": "usage-none", "b": "ok"})
-    assert chain.states() == ("failed", {"a": "completed", "b": "failed"})
+    # Unknown is not a breach: the task is blocked (ADR 020 Q9) and the run goes to recovery for an operator.
+    assert chain.states() == ("recovering", {"a": "completed", "b": "blocked"})
     event, audit = assert_refused(chain, "b", "usage_unknown")
     assert audit["unknown"] == ["max_total_tokens"]
 
@@ -248,7 +271,7 @@ def test_usage_read_failure_fails_closed_with_a_distinct_reason(chain, monkeypat
         raise sqlite3.OperationalError("disk I/O error")
     monkeypatch.setattr(budget_enforcement, "check_claim_budget", broken)
     run(chain, {"a": "ok", "b": "ok"})
-    assert chain.states() == ("failed", {"a": "failed", "b": "cancelled"})
+    assert chain.states() == ("recovering", {"a": "blocked", "b": "waiting_dependencies"})
     assert chain.spawns("a") == [] and chain.spawns("b") == []
     event, audit = assert_refused(chain, "a", "budget_check_failed")
     assert event["policy_version"] == "p1"
@@ -263,7 +286,7 @@ def test_unreadable_binding_fails_closed_not_unbudgeted(env):
         env.db.execute("ALTER TABLE run_budget_bindings RENAME TO gone")   # before the first claim
         await finish(env)
     asyncio.run(go())
-    assert env.states() == ("failed", {"work": "failed"})
+    assert env.states() == ("recovering", {"work": "blocked"})
     event, _ = assert_refused(env, "work", "budget_check_failed")
     assert event["policy_version"] is None
 
@@ -286,3 +309,120 @@ def test_mutation_disabling_the_check_lets_the_over_budget_task_spawn(chain, mon
     budgeted(chain, per_run={"max_total_tokens": 6})
     run(chain, {"a": "ok", "b": "ok"})
     assert chain.spawns("b") == ["ok"] and denials(chain) == []
+
+
+# --- review findings: usage race, refusal recording, capacity, record-only log, resume end to end -----------------
+
+def _slow_raw_store(monkeypatch):
+    """Widen the window between an attempt's terminal state and the rest of its bookkeeping (large output)."""
+    original = AgentWorkflowEngine._store_raw_and_reduce
+
+    async def slow(self, *a, **k):
+        await asyncio.sleep(0.2)
+        return await original(self, *a, **k)
+    monkeypatch.setattr(AgentWorkflowEngine, "_store_raw_and_reduce", slow)
+
+
+@pytest.mark.parametrize("slow", [False, True])
+def test_finished_attempt_usage_is_visible_to_the_next_claim_deny(indep, monkeypatch, slow):
+    """Regression: usage used to be written after the terminal commit, so a claim in between saw 'unknown'."""
+    if slow:
+        _slow_raw_store(monkeypatch)
+    budgeted(indep, per_run={"max_total_tokens": 100000})
+    run(indep, {"a": "ok", "b": "ok"})
+    assert indep.states() == ("succeeded", {"a": "completed", "b": "completed"}), denials(indep)
+    assert denials(indep) == []
+
+
+@pytest.mark.parametrize("slow", [False, True])
+def test_finished_attempt_usage_is_visible_to_the_next_claim_allow(indep, monkeypatch, slow):
+    """Regression: with on_unknown=allow the window let a task spawn although the cap was already exceeded."""
+    if slow:
+        _slow_raw_store(monkeypatch)
+    budgeted(indep, per_run={"max_total_tokens": 6}, on_unknown="allow")    # the first attempt reports 7
+    run(indep, {"a": "ok", "b": "ok"})
+    states = indep.states()[1]
+    first, second = ("a", "b") if states["a"] == "completed" else ("b", "a")
+    assert indep.states() == ("failed", {first: "completed", second: "failed"})
+    assert indep.spawns(second) == []
+    assert [d["reason"] for d in denials(indep)] == ["budget_exceeded"]
+
+
+def test_refusal_that_cannot_be_recorded_rolls_back_and_spawns_nothing(chain, monkeypatch):
+    budgeted(chain, per_run={"max_total_tokens": 6})
+
+    def broken(*a, **k):
+        raise sqlite3.OperationalError("disk I/O error")
+    monkeypatch.setattr(budget_enforcement, "append_audit", broken)
+    run(chain, {"a": "ok", "b": "ok"})
+    run_state, tasks = chain.states()
+    assert tasks == {"a": "completed", "b": "ready"} and run_state != "succeeded"
+    assert chain.spawns("b") == [] and node_attempts(chain, "b") == []
+    assert denials(chain) == [] and audits(chain) == []        # the whole refusal transaction rolled back
+
+
+def test_a_refused_claim_holds_no_capacity(tmp_path):
+    from synapse.application.budget_policy import BudgetDecision, Scope
+    from synapse.persistence.budget_binding import BudgetDenied
+    from synapse.persistence.migrations import apply_migrations, open_database
+    from synapse.persistence.task_claim import claim_task
+    db = open_database(tmp_path / "c.db")
+    try:
+        apply_migrations(db, tar.ROOT / "migrations")
+        db.execute("INSERT INTO workflow_versions VALUES('wf','1','{}','hash','now')")
+        db.execute("INSERT INTO runs VALUES('run','wf','1','running',0,'now','now')")
+        db.execute("INSERT INTO profiles(id,provider,display_name,config_ref,max_concurrency,created_at) "
+                   "VALUES('profile','claude','P','p',1,'now')")       # one slot only
+        for task in ("one", "two"):
+            db.execute("INSERT INTO tasks(id,run_id,node_id,state,created_at,updated_at) VALUES(?,'run',?,'ready','now','now')", (task, task))
+        denied = BudgetDenied(BudgetDecision(False, "budget_exceeded", (), (), (), "p1", Scope("run")), "one")
+        db.execute("BEGIN IMMEDIATE")
+        budget_enforcement.write_budget_refusal(db, principal="agent-engine", run_id="run", task_id="one", version=0,
+                                                before=State.READY, profile_id="profile", denied=denied, max_running=1)
+        db.execute("COMMIT")
+        assert db.execute("SELECT state FROM tasks WHERE id='one'").fetchone() == ("failed",)
+        db.execute("BEGIN IMMEDIATE")
+        claim_task(db, task_id="two", expected_version=0, profile_id="profile", principal="agent-engine", max_running=1)
+        db.execute("COMMIT")
+        assert db.execute("SELECT state FROM tasks WHERE id='two'").fetchone() == ("assigned",)
+    finally:
+        db.close()
+
+
+def test_policy_version_log_failure_never_changes_the_run(chain, monkeypatch):
+    budgeted(chain, per_run={"max_total_tokens": 100})
+
+    def broken(db, run_id):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(agent_engine, "bound_policy_identity", broken)
+    run(chain, {"a": "ok", "b": "ok"})
+    assert chain.states() == ("succeeded", {"a": "completed", "b": "completed"})
+    assert applied(chain) == []
+
+
+def test_gate_resume_refusal_end_to_end_through_the_runtime(indep):
+    """Both tasks gated; approving a first spends 7 tokens, so b's resume (approved later) breaches the cap of 6."""
+    from synapse.application.approval_service import ApprovalService
+    budgeted(indep, per_run={"max_total_tokens": 6})
+
+    def decide(node):
+        aid, bound = indep.db.execute(
+            "SELECT r.id,r.candidate_manifest_sha256 FROM task_approval_gates g JOIN approval_requests r "
+            "ON r.id=g.approval_id WHERE g.task_id=?", (tid(indep, node),)).fetchone()
+        ApprovalService(indep.db, indep.authority).decide(
+            indep.token, approval_id=aid, expected_version=0, decision="approved", operation="agent.run",
+            target="repo", candidate_sha256=bound, policy_version="1", idempotency_key="d-" + node, correlation_id="t")
+
+    async def go():
+        indep.runtime.start(indep.run_id, "s", {n: indep.spec(n, approval_step=GATE) for n in ("a", "b")})
+        await indep.until(lambda: indep.states()[1] == {"a": "awaiting_approval", "b": "awaiting_approval"})
+        decide("a")
+        await indep.until(lambda: indep.states()[1]["a"] == "completed")
+        decide("b")
+        await finish(indep)
+    asyncio.run(go())
+    assert indep.states() == ("failed", {"a": "completed", "b": "failed"})
+    assert indep.spawns("a") == ["ok"] and indep.spawns("b") == []
+    assert node_attempts(indep, "b") == ["completed"]          # only the gate bookkeeping attempt
+    assert [(d["reason"], d["outcome"]) for d in denials(indep)] == [("budget_exceeded", "failed")]
+    assert indep.db.execute("SELECT COUNT(*) FROM audit_entries WHERE action='approval.executed'").fetchone() == (1,)
