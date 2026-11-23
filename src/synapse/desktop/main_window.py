@@ -27,6 +27,8 @@ class MainWindow(RunsMixin, MessagesMixin, ApprovalsMixin, EventsMixin, QMainWin
         self.resize(1280, 860)
         self.health_label = QLabel("Connecting")
         self.connection_detail = QLabel("")
+        self.cursor_notice = QLabel("")
+        self.cursor_notice.setWordWrap(True)
         self.connection_state = "connecting"
         self._last_failures = 0
         self._init_runs_state()
@@ -51,6 +53,7 @@ class MainWindow(RunsMixin, MessagesMixin, ApprovalsMixin, EventsMixin, QMainWin
         layout = QVBoxLayout()
         layout.addWidget(self.health_label)
         layout.addWidget(self.connection_detail)
+        layout.addWidget(self.cursor_notice)
         layout.addWidget(self.views)
         root = QWidget()
         root.setLayout(layout)
@@ -64,6 +67,7 @@ class MainWindow(RunsMixin, MessagesMixin, ApprovalsMixin, EventsMixin, QMainWin
         self.poller.health.connect(self.health_label.setText)
         self.poller.health_info.connect(self.console_status.set_health)
         self.poller.connection.connect(self._connection_changed)
+        self.poller.cursor_notice.connect(self.cursor_notice.setText)
         self.poller.event.connect(self._add_event)
         self._connect_control_center()
         self._connect_runs_poller()

@@ -102,6 +102,12 @@ MockProvider.stream = delayed
             assert all(t["state"] == "completed" for t in snapshot["tasks"])
             events = client.get("/api/v1/events?after=0&limit=1000", headers=headers).json()["events"]
             assert events and events[-1]["sequence"] == snapshot["last_sequence"]
+            # The first desktop persisted its event cursor; the reopened one resumes after it (no replay of
+            # events it already delivered). The run graph is still rebuilt from the daemon's snapshot.
+            from synapse.desktop.cursor_store import cursor_path, read_cursor
+            saved = read_cursor(cursor_path(state))
+            assert saved is not None and saved.sequence < events[-1]["sequence"]
+            events = [event for event in events if event["sequence"] > saved.sequence]
             second = MainWindow(state, poller=Poller(state, interval=.03))
             second.show()
             second.run_id.setText(run_id)
