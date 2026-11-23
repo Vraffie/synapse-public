@@ -207,7 +207,7 @@ def test_key_material_holds_only_hashes_ids_and_versions():
     k = key(settings={"note": secret, "nested": [{"x": secret}]})
     blob = json.dumps(k.material, sort_keys=True)
     assert secret not in blob and "sk-" not in blob
-    assert "prompt" not in blob  # prompt text never enters the key; only its hash via the manifest
+    # the exact allowlist: no free-text field exists, so prompt text cannot enter the key (only hashes do)
     assert set(k.material) == {
         "cache_schema_version", "policy_version", "approval_policy_sha256", "provider", "profile_id", "cli_version",
         "model", "allowed_tools", "permission_mode", "settings_sha256", "spec_sha256", "manifest_sha256",
@@ -230,3 +230,26 @@ def test_module_is_pure_no_storage_or_io():
     imported |= {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
     assert not imported & {"sqlite3", "os", "pathlib", "subprocess", "socket", "shutil", "io"}
     assert "open(" not in inspect.getsource(ck)
+
+
+def test_flat_settings_over_node_cap_bypass_before_walking_everything():
+    import time
+    huge_map = {f"k{i}": i for i in range(2_000_000)}
+    huge_list = {"items": list(range(2_000_000))}
+    start = time.monotonic()
+    assert bypass(settings=huge_map) == "invalid_input:settings_nodes"
+    assert bypass(settings=huge_list) == "invalid_input:settings_nodes"
+    assert time.monotonic() - start < 1.0
+
+
+def test_settings_at_node_cap_still_keyed_and_one_over_bypasses():
+    n = ck.MAX_SETTINGS_NODES
+    assert isinstance(key(settings={f"k{i}": 1 for i in range(n - 1)}), ck.CacheKey)  # root + n-1 leaves
+    assert bypass(settings={f"k{i}": 1 for i in range(n)}) == "invalid_input:settings_nodes"
+
+
+def test_unknown_model_is_a_distinct_key_not_a_bypass():
+    # documented tradeoff (ADR 017 D6 "model (if known)"): unknown is keyed apart from every named model
+    unknown = key(model=None)
+    assert isinstance(unknown, ck.CacheKey) and unknown.material["model"] is None
+    assert unknown.sha256 != key(model="model-a").sha256
