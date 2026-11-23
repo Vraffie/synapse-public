@@ -347,3 +347,12 @@ def test_migration_0017_marks_every_existing_attempt_so_an_upgrade_never_requeue
         assert_as_today(db, rt, env.run_id)  # an attempt from before the upgrade may have run: never re-queued
     finally:
         db.close()
+
+
+def test_open_database_sets_synchronous_full_so_a_committed_mark_is_durable(tmp_path):
+    db = open_database(tmp_path / "d.db")
+    try:
+        assert db.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+        assert db.execute("PRAGMA synchronous").fetchone() == (2,)  # FULL, set explicitly at open (ADR 024)
+    finally:
+        db.close()

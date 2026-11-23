@@ -16,8 +16,9 @@ keys are random and not tied to attempts.
 1. **A durable spawn mark (migration 0017).** The new append-only table `attempt_spawn_marks(attempt_id, marked_at)`
    is guarded by no-update, no-delete and no-replace triggers. The agent engine commits a row in its own transaction
    (`BEGIN IMMEDIATE`, after the run-still-running check) immediately before `provider.execute`, so before the router
-   or provider is asked to start, before the spawn journal `begin` and before any `Popen`. SQLite runs in WAL with
-   `synchronous=FULL` (the default, checked), so a committed mark survives a process crash and a power loss. If the mark cannot be written, the provider
+   or provider is asked to start, before the spawn journal `begin` and before any `Popen`. `open_database` sets
+   WAL and `PRAGMA synchronous = FULL` explicitly (asserted by a test), so a committed mark survives a process crash
+   and a power loss. If the mark cannot be written, the provider
    is never called.
 2. **What the states mean after a crash:**
    - *Never spawned*: an attempt in `running` (task `running`) or `created` (task `assigned`) with **no** mark.
@@ -47,8 +48,16 @@ keys are random and not tied to attempts.
    `resume_parked`. The next attempt is a normal new reservation and passes every normal check: the plan and profile
    (registry, enabled, cooldown, limits), the claim with per-profile concurrency and the budget policy, approval
    re-verification, the worktree HEAD recheck, the profile-selection audit and a new mark.
-4. **Crash before reserve, or right after a re-queue commits.** A `running` run with no in-flight work at all is
-   re-driven the same way, with no event (nothing is re-queued). Repeated restarts are idempotent: the event is
+   **States that qualify for re-drive, stated outright.** Run: only `running` (never `recovering`, `paused`, `queued`,
+   `awaiting_approval` or a terminal state). Task: `completed`, `created`, `waiting_dependencies`, `ready` or
+   `awaiting_approval` with no unresolved attempt; or `running` holding exactly one unmarked `running` attempt; or
+   `assigned` holding exactly one unmarked `created` attempt. Any other task state (`blocked`, `verifying`,
+   `retry_wait`, `changes_required`, `failed`, `cancelled`, `assigned`/`running` without exactly one such attempt) or
+   any `unknown` or marked attempt disqualifies the whole run.
+4. **Behaviour change: a `running` run with nothing in flight is now re-driven.** Before this ADR such a run (a crash
+   before the first claim, between tasks, or right after a re-queue committed) went to `recovering` and needed
+   `agent-abandon`. Now it is re-driven like any other qualifying run, with no event (nothing is re-queued).
+   Repeated restarts are idempotent: the event is
    written once per closed attempt, and a re-queued attempt that crashes again before its own mark is out of budget
    and recovers as before.
 5. **Visibility.** `agent-show` (`GET /api/v1/runs/{id}/agent`) adds `attempts_resumed`, a count only.
