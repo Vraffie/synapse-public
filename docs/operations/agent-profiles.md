@@ -121,8 +121,25 @@ A task that names a registry profile now:
   always `null` until fallback exists, and `reason` is `requested` or `default`. If the event cannot be written the
   task fails closed (`profile_selection_not_recorded`) and nothing is spawned.
 
-Not done (ADR 016 W2 and later): `allow_fallback` and automatic fallback, operator cooldown endpoints,
-`GET /api/v1/profiles`, `profile_id` in the run and usage responses, and Codex as a primary or fallback profile.
+### Profile list and operator cooldowns (A7b W2)
+
+- `GET /api/v1/profiles` (operator bearer) returns `{profiles: [{id, provider, enabled, max_concurrency, load,
+  cooldown_remaining_seconds, position}]}`. `load` is the worker slots the profile occupies now (same rule as
+  `claim_task`; `null` for `default`, which is capped by the run row), `position` is `primary`, `fallback` or `null`.
+  No executable path, credentials or base-profile settings are returned. `probe()` health is not included yet.
+- `POST /api/v1/profiles/{id}/cooldown` with `{"seconds": N}` (0 < N <= 86400) and
+  `DELETE /api/v1/profiles/{id}/cooldown`; `agentctl profiles` and `agentctl profile-cooldown PROFILE --seconds N | --clear`.
+  Only declared profiles qualify (`default` and unknown ids are a 422). They carry no Idempotency-Key: repeating one
+  is harmless (a cooldown only extends, clearing is idempotent) and every call writes its own audit event.
+- Each change writes a `profile.cooldown_set` / `profile.cooldown_cleared` event (aggregate `profile`, with the
+  operator principal) **before** it takes effect; if the event cannot be written the change is refused with a 503,
+  so a cooldown can never be cleared (the permissive direction) without a record.
+- Effect: a task that names a profile in cooldown fails closed before any spawn with `profile_cooling_down`
+  (same as a disabled profile). Nothing waits, retries or reroutes, so a cooldown cannot be used to evade a limit.
+  Cooldowns are in memory: a daemon restart forgets them (the audit events remain).
+
+Not done (ADR 016 later waves): `allow_fallback` and automatic fallback, `profile_id` in the run and usage
+responses, the desktop profiles panel, and Codex as a primary or fallback profile.
 Unless every task names a profile, one run still uses the runtime-wide `max_concurrency` as the global cap.
 
 ## Not in this part

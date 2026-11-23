@@ -97,6 +97,12 @@ RESPONSES = {
     ("/api/v1/runs/{run_id}/agent-cancel", "post"): (202, _object({"run_id": STRING, "state": {"type": "string", "const": "cancellation_requested"}})),
     ("/api/v1/runs/{run_id}/agent-abandon", "post"): (200, _object({"run_id": STRING, "state": {"type": "string", "const": "failed"}, "cancelled_tasks": INTEGER})),
     ("/api/v1/runs/{run_id}/agent-worktree-remove", "post"): (200, _object({"run_id": STRING, "removed": {"type": "boolean"}, "tasks": {"type": "array", "items": _object({"task_id": STRING, "removed": {"type": "boolean"}})}})),
+    ("/api/v1/profiles", "get"): (200, _object({"profiles": {"type": "array", "items": _object({
+        "id": STRING, "provider": STRING, "enabled": {"type": "boolean"}, "max_concurrency": INTEGER,
+        "load": _nullable("integer"), "cooldown_remaining_seconds": {"type": "number"},
+        "position": _nullable()})}})),
+    ("/api/v1/profiles/{profile_id}/cooldown", "post"): (200, _object({"id": STRING, "cooldown_remaining_seconds": {"type": "number"}})),
+    ("/api/v1/profiles/{profile_id}/cooldown", "delete"): (200, _object({"id": STRING, "cooldown_remaining_seconds": {"type": "number"}})),
     ("/api/v1/runs/{run_id}/mock-cancel", "post"): (202, _object({"run_id": STRING, "state": {"type": "string", "const": "cancellation_requested"}})),
 }
 
@@ -110,7 +116,7 @@ def install_openapi_contracts(app):
                 operation = schema["paths"][path][method]
                 headers = {"X-Correlation-ID": {"schema": STRING, "description": "Validated request correlation ID, or a generated ID."},
                            "Cache-Control": {"schema": STRING, "description": "Always no-store."}}
-                if method == "post":
+                if method == "post" and not path.startswith("/api/v1/profiles"):
                     headers["Idempotency-Replayed"] = {"schema": {"type": "string", "enum": ["true", "false"]}}
                 operation["responses"][str(status)] = {"description": "Successful response", "headers": headers,
                                                         "content": {"application/json": {"schema": deepcopy(response_schema)}}}
@@ -124,7 +130,13 @@ def install_openapi_contracts(app):
                     errors.update({404, 503})
                 if path == "/api/v1/approvals" or (path == "/api/v1/runs" and method == "get"):
                     errors.add(503)
-                if method == "post":
+                if path == "/api/v1/profiles":
+                    errors = {401, 500, 503}  # no input to validate
+                elif path.startswith("/api/v1/profiles/"):  # not idempotency-keyed, no state conflicts (see profile_commands)
+                    errors.add(503)
+                    if method == "post":
+                        errors.update({413, 415})
+                elif method == "post":
                     errors.update({400, 409, 503})
                     if path == "/api/v1/approvals/{approval_id}/decision":
                         errors.update({403, 413, 415})

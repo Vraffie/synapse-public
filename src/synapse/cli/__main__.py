@@ -12,6 +12,7 @@ import re
 import socket
 import stat
 import sys
+import uuid
 from urllib.parse import quote, urlencode
 
 from synapse.persistence.migrations import default_migrations_dir
@@ -68,7 +69,8 @@ def _load_token(state_dir: Path) -> str:
 
 def _request(state_dir: Path, endpoint: str, *, body: bytes | None = None,
              idempotency_key: str | None = None, correlation_id: str | None = None,
-             approver_token: str | None = None) -> object:
+             approver_token: str | None = None, plain_method: str | None = None) -> object:
+    """``plain_method``: an operator command without an Idempotency-Key (profile cooldowns), always answered 200."""
     token = _load_token(state_dir)
     path = state_dir / "agentd.sock"
     info = path.lstat()
@@ -77,7 +79,12 @@ def _request(state_dir: Path, endpoint: str, *, body: bytes | None = None,
     connection = UnixConnection(path)
     try:
         headers = {"Authorization": "Bearer " + token, "Accept": "application/json"}
-        if body is None:
+        if plain_method is not None:
+            method, expected = plain_method, 200
+            headers["X-Correlation-ID"] = correlation_id or str(uuid.uuid4())
+            if body is not None:
+                headers["Content-Type"] = "application/json"
+        elif body is None:
             method, expected = "GET", 200
         else:
             method = "POST"
@@ -410,6 +417,28 @@ def _agent_command(args, parser) -> int:
     return 0
 
 
+def _profile_command(args, parser) -> int:
+    try:
+        if args.command == "profiles":
+            result = _request(args.state_dir, "/api/v1/profiles")
+        else:
+            if re.fullmatch(r"[A-Za-z0-9._][A-Za-z0-9._-]{0,63}", args.profile) is None:
+                parser.error("profile ID must be 1-64 characters of [A-Za-z0-9._-]")
+            endpoint = "/api/v1/profiles/" + args.profile + "/cooldown"
+            if args.clear:
+                result = _request(args.state_dir, endpoint, plain_method="DELETE")
+            else:
+                if not 0 < args.seconds <= 86400 or args.seconds != args.seconds:
+                    parser.error("--seconds must be above 0 and at most 86400")
+                result = _request(args.state_dir, endpoint, body=json.dumps({"seconds": args.seconds}).encode("utf-8"),
+                                  plain_method="POST")
+    except (OSError, ValueError, RuntimeError, http.client.HTTPException) as exc:
+        print(f"agentctl: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Inspect the local Synapse daemon")
     parser.add_argument("--state-dir", type=Path, required=True, help="private daemon state directory")
@@ -429,6 +458,12 @@ def main(argv: list[str] | None = None) -> int:
     for query in (threads, messages):
         query.add_argument("--after", type=_integer(0, _MAX_SEQUENCE), default=0)
         query.add_argument("--limit", type=_integer(1, 100), default=100)
+    commands.add_parser("profiles", help="list agent profiles: enabled, cap, load, cooldown")
+    cooldown = commands.add_parser("profile-cooldown", help="set or clear an operator cooldown on a declared profile")
+    cooldown.add_argument("profile", help="profile ID")
+    group = cooldown.add_mutually_exclusive_group(required=True)
+    group.add_argument("--seconds", type=float, help="refuse tasks naming the profile for this long (0 < N <= 86400)")
+    group.add_argument("--clear", action="store_true", help="end the cooldown now")
     approvals = commands.add_parser("approvals", help="list one page of approvals")
     approvals.add_argument("--after", default="", help="last approval ID from previous page")
     approvals.add_argument("--limit", type=_integer(1, 1000), default=100)
@@ -473,6 +508,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "runs":
         return _runs_command(args)
+    if args.command in ("profiles", "profile-cooldown"):
+        return _profile_command(args, parser)
     if args.command in ("agent-start", "agent-show", "agent-cancel", "agent-abandon", "agent-worktree-remove"):
         return _agent_command(args, parser)
     if args.command == "approver-unlock":

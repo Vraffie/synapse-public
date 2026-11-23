@@ -166,3 +166,31 @@ def test_request_accepts_201_and_200_for_start_only():
     finally:
         cli.UnixConnection = orig
         s.close()
+
+
+def test_profiles_and_cooldown_commands_use_plain_requests(calls, capsys):
+    assert run("profiles") == 0
+    assert calls[-1] == ("/api/v1/profiles", {})
+    assert run("profile-cooldown", "reader", "--seconds", "90") == 0
+    endpoint, kw = calls[-1]
+    assert endpoint == "/api/v1/profiles/reader/cooldown" and kw["plain_method"] == "POST"
+    assert json.loads(kw["body"]) == {"seconds": 90.0} and "idempotency_key" not in kw
+    assert run("profile-cooldown", "reader", "--clear") == 0
+    endpoint, kw = calls[-1]
+    assert endpoint == "/api/v1/profiles/reader/cooldown" and kw == {"plain_method": "DELETE"}
+
+
+@pytest.mark.parametrize("args", [
+    ["profile-cooldown", "reader"],                                  # neither --seconds nor --clear
+    ["profile-cooldown", "reader", "--seconds", "5", "--clear"],     # both
+    ["profile-cooldown", "reader", "--seconds", "0"],
+    ["profile-cooldown", "reader", "--seconds", "86401"],
+    ["profile-cooldown", "reader", "--seconds", "nan"],
+    ["profile-cooldown", "../x", "--clear"],
+    ["profile-cooldown", "a/b", "--seconds", "5"],
+    ["profile-cooldown", "--clear", "--", "-x"],                     # an option-like ID
+])
+def test_cooldown_command_refuses_bad_input_before_any_request(calls, args):
+    with pytest.raises(SystemExit):
+        run(*args)
+    assert calls == []
