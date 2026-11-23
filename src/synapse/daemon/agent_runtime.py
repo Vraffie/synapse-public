@@ -14,6 +14,7 @@ every mock-only guard (mock cancel/resume/recovery) refuses to touch it.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import logging
 import sqlite3
@@ -56,13 +57,14 @@ class AgentRuntime:
                  max_concurrency: int = 2, provider_factory=ClaudeCliProvider,
                  approval_policy: ApprovalPolicy | None = None,
                  worktree_check: Callable[[str, str, str], tuple[str, bool]] | None = None,
-                 budget_policy: BudgetPolicy | None = None):
+                 budget_policy: BudgetPolicy | None = None, registry=None):
         if profile is not None and not isinstance(profile, ClaudeCliProfile):
             raise TypeError("profile must be a ClaudeCliProfile")
         if type(max_concurrency) is not int or not 1 <= max_concurrency <= 6:
             raise ValueError("max_concurrency must be between 1 and 6")
         self.db = connection
         self.profile, self._verify, self._factory, self._max_concurrency = profile, verify, provider_factory, max_concurrency
+        self.registry = registry  # ProfileRegistry or None: named profiles resolve here and nowhere else
         self.approval_policy = approval_policy or ApprovalPolicy()
         self.budget_policy = budget_policy  # bound as an immutable copy to each run at start (ADR 020 D2)
         # (run_id, task_id) -> (HEAD sha, tree is clean); blocking, called in a worker thread.
@@ -208,6 +210,16 @@ class AgentRuntime:
                  for t, s in task_specs.items() if s["approval_step"] is not None}
         return task_specs, gates
 
+    def _resolve_profile(self, profile_id: str) -> ClaudeCliProfile:
+        """The operator profile with the registry profile's executable; raises for anything not registered.
+
+        Credentials, state dir and sandbox settings stay the operator's (the registry does not model them).
+        """
+        spec = None if self.registry is None else self.registry.get(profile_id)
+        if spec is None or not spec.enabled or spec.provider != "claude" or self.profile is None:
+            raise ValueError("profile is not available")
+        return replace(self.profile, executable=spec.executable)
+
     def _profile_problem(self, profile_id: str) -> str | None:
         """Spawn-time recheck of a named profile against the profiles table (synced from the registry)."""
         row = self.db.execute("SELECT provider,config_ref,enabled FROM profiles WHERE id=?", (profile_id,)).fetchone()
@@ -244,7 +256,7 @@ class AgentRuntime:
     async def _run(self, run_id: str):
         try:
             task_specs, gates = self._plan(run_id)
-            router = AgentProviderRouter(self.profile, task_specs, self._factory)
+            router = AgentProviderRouter(self.profile, task_specs, self._factory, self._resolve_profile)
             engine = AgentWorkflowEngine(
                 self.db, router, self.blobs, task_specs, self._prompt(task_specs), verify=self._verify,
                 max_concurrency=self._max_concurrency,

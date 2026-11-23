@@ -84,17 +84,36 @@ and `resume_parked()` runs after the sync; that ordering is load-bearing. Specs 
 daemon start, so a profile disabled in the file takes effect for queued runs after a restart; a `default`
 run is never affected.
 
-Not yet done: the per-profile `max_concurrency` is **not** enforced for API-started runs, deliberately.
-`claim_task` enforces it against the profile row the task is *assigned* to, but every agent run is claimed
-under the single built-in `synapse.builtin.agent.claude.v1` row (the engine takes one `profile_id` per run,
-`mock_run_config`, the attempts, usage observations, recovery and `resume_parked` all key on it, and the
-built-in row's cap is the runtime-wide `max_concurrency`). Honouring a named profile's cap would mean
-assigning tasks to the named row, which changes what those stores and recovery filters record and match;
-that is a change to authoritative state semantics (likely a migration or an ADR amendment), not a small safe
-slice. `profile_id` also remains a recorded label for execution: it is rechecked at spawn, but execution
-still goes through the single `--claude-cli-config` profile (every declared profile is a narrower view of it,
-so a run can never exceed the base profile), and `"default"` is never stored (the default is represented by
-absence).
+### Per-task profiles and execution (A7b, ADR 016 W1)
+
+Each entry of `tasks` may carry its own `profile` (same pattern as the request-level one, which stays the default
+for tasks that omit it; an explicit `"default"` on a task overrides a request-level profile). Tools, permission
+mode and timeout of a task are checked against *its* profile's ceilings (422 for unknown or disabled). A task's
+`profile` is part of the idempotency fingerprint only when named, so earlier receipts still replay.
+
+A task that names a registry profile now:
+
+- **claims capacity under that profile's row** (`claim_task` enforces its `max_concurrency` and the budget check
+  uses its id); `tasks.assigned_profile_id`, `task_attempts.profile_id` and the usage ledger carry it. The run itself
+  stays keyed on the built-in row (`mock_run_config`, `recover_interrupted`, `resume_parked` are unchanged, and
+  recovery filters on `provider`, which registry rows share with the built-in row). The engine hook is
+  `MockWorkflowEngine._profile_for`. If the named profile is unknown or disabled at claim time, the task claims under
+  the run's profile instead and the spawn-time recheck above fails it closed, so it can never be stuck unclaimable;
+- **spawns with that profile's `executable`.** `AgentProviderRouter` resolves a named profile through
+  `AgentRuntime.registry` (`_resolve_profile`: the operator `--claude-cli-config` profile with the registry
+  executable substituted). A named profile that cannot be resolved fails the attempt with `start_rejected` and
+  **never** falls back to the default executable. Credentials, `state_dir`, sandbox and the other operator
+  settings still come from the base profile; the registry does not model them, so profiles do not (yet) isolate
+  accounts from each other;
+- **records the selection** before the spawn as an `agent.profile_selected` event on the attempt:
+  `{task_id, profile_id, provider, model, profile_sha256, requested, fell_back_from, reason}`. `model` is always
+  `null` (the adapter does not report one), `requested` is `null` for the default profile, `fell_back_from` is
+  always `null` until fallback exists, and `reason` is `requested` or `default`. If the event cannot be written the
+  task fails closed (`profile_selection_not_recorded`) and nothing is spawned.
+
+Not done (ADR 016 W2 and later): `allow_fallback` and automatic fallback, operator cooldown endpoints,
+`GET /api/v1/profiles`, `profile_id` in the run and usage responses, and Codex as a primary or fallback profile.
+Unless every task names a profile, one run still uses the runtime-wide `max_concurrency` as the global cap.
 
 ## Not in this part
 

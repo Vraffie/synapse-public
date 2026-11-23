@@ -87,6 +87,10 @@ class MockWorkflowEngine:
     def _change(self, task_id: str, before: State, after: State, version: int) -> int:
         return write_task_transition(self.db, StateChange(task_id, before, after, version), principal=self._principal)
 
+    def _profile_for(self, run_id: str, task_id: str, default_profile_id: str) -> str:
+        """The profile a task claims capacity under and runs with; the run's profile unless overridden."""
+        return default_profile_id
+
     def _block_for_budget(self, run_id: str, task_id: str, version: int, profile_id: str, denied: BudgetDenied) -> None:
         """Record a refused claim (ADR 020 D4): the claim rolled back, so nothing was assigned; the task goes
         READY -> BLOCKED (no silent downgrade, no retry) with an event and an audit row naming the reason."""
@@ -174,19 +178,20 @@ class MockWorkflowEngine:
                     resumed = self.gates.resume(run_id=run_id, task_id=task_id, spec=spec, budget_check=self._budget_check)
                     if resumed.status == ResumeStatus.RESUMED:
                         self._reservations[task_id] = (run_id, resumed.attempt_id)
-                        self._active[task_id] = asyncio.create_task(self._execute(run_id, task_id, resumed.attempt_id, profile_id, self._scenario(scenarios[task_id], resumed.attempt_count - 2), resumed.task_version, resumed.attempt_count))
+                        self._active[task_id] = asyncio.create_task(self._execute(run_id, task_id, resumed.attempt_id, self._profile_for(run_id, task_id, profile_id), self._scenario(scenarios[task_id], resumed.attempt_count - 2), resumed.task_version, resumed.attempt_count))
                 for task_id, version, count in self.db.execute("SELECT id,state_version,attempt_count FROM tasks WHERE run_id=? AND state='ready' ORDER BY id", (run_id,)).fetchall():
                     if self._halt or len(self._active) >= self.max_concurrency:
                         break
                     spec = steps.get(task_id)
+                    task_profile = self._profile_for(run_id, task_id, profile_id)
                     if spec is not None:
                         if not self.gates.has_gate(task_id):
                             try:
-                                self.gates.park(run_id=run_id, task_id=task_id, profile_id=profile_id, spec=spec, max_running=self.max_concurrency, budget_check=self._budget_check)
+                                self.gates.park(run_id=run_id, task_id=task_id, profile_id=task_profile, spec=spec, max_running=self.max_concurrency, budget_check=self._budget_check)
                             except StateConflict:
                                 pass
                             except BudgetDenied as denied:
-                                self._block_for_budget(run_id, task_id, version, profile_id, denied)
+                                self._block_for_budget(run_id, task_id, version, task_profile, denied)
                             continue
                         try:
                             # A retry after an approved attempt must still be covered.
@@ -202,7 +207,7 @@ class MockWorkflowEngine:
                             current = self.db.execute("SELECT attempt_count FROM tasks WHERE id=? AND run_id=?", (task_id, run_id)).fetchone()
                             if current is None or current[0] >= self.max_attempts:
                                 continue
-                            version = claim_task(self.db, task_id=task_id, expected_version=version, profile_id=profile_id, principal=self._principal, max_running=self.max_concurrency, budget_check=self._budget_check)
+                            version = claim_task(self.db, task_id=task_id, expected_version=version, profile_id=task_profile, principal=self._principal, max_running=self.max_concurrency, budget_check=self._budget_check)
                             reserve_attempt(self.db, task_id=task_id, attempt_id=attempt_id, expected_task_version=version, principal=self._principal)
                             version += 1
                             self._change(task_id, State.ASSIGNED, State.RUNNING, version)
@@ -210,11 +215,11 @@ class MockWorkflowEngine:
                     except StateConflict:
                         continue
                     except BudgetDenied as denied:
-                        self._block_for_budget(run_id, task_id, version, profile_id, denied)
+                        self._block_for_budget(run_id, task_id, version, task_profile, denied)
                         continue
                     scenario = self._scenario(scenarios[task_id], count - 1 if spec is not None else count)
                     self._reservations[task_id] = (run_id, attempt_id)
-                    self._active[task_id] = asyncio.create_task(self._execute(run_id, task_id, attempt_id, profile_id, scenario, version + 1, count + 1))
+                    self._active[task_id] = asyncio.create_task(self._execute(run_id, task_id, attempt_id, task_profile, scenario, version + 1, count + 1))
                 if self._active:
                     done, _ = await asyncio.wait(self._active.values(), timeout=0.05, return_when=asyncio.FIRST_COMPLETED)
                     for task_id, future in tuple(self._active.items()):

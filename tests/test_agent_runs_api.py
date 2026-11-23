@@ -885,3 +885,35 @@ def test_stored_profile_id_shape_is_checked_on_load(env):
     for bad in ("default", "a b", "", 3, None):
         with pytest.raises(ValueError):
             at._check_shape(node, {**spec, "profile_id": bad})
+
+
+def test_per_task_profiles_run_each_task_under_its_own_profile(env):
+    from synapse.daemon.profile_registry import ProfileRegistry, ProfileSpec
+    reader = ProfileSpec("reader", "claude", str(env.exe), ("Edit", "Read"), 1, True, 60.0, None, "acceptEdits")
+    registry = ProfileRegistry((reader,), primary="reader")
+    env.service.registry = env.runtime.registry = registry
+    env.db.execute("INSERT INTO profiles(id,provider,display_name,config_ref,enabled,max_concurrency,created_at) "
+                   "VALUES('reader','claude','p','registry:abc',1,1,'now')")
+    env.db.commit()
+    tasks = [{"id": "a", "prompt": "ok", "allowed_tools": ["Read"], "profile": "reader"},
+             {"id": "b", "prompt": "ok", "allowed_tools": ["Read"], "depends_on": ["a"]}]
+
+    async def go(c):
+        made = (await c.post("/api/v1/agent-runs", headers=headers("t1"),
+                             json={"repo": str(env.repo), "base_ref": "main", "timeout_seconds": 30, "tasks": tasks})).json()
+        assert "run_id" in made, made
+        await wait_state(env, made["run_id"], {"succeeded", "failed"})
+        bad = await c.post("/api/v1/agent-runs", headers=headers("t2"), json={
+            "repo": str(env.repo), "base_ref": "main", "timeout_seconds": 30,
+            "tasks": [{"id": "a", "prompt": "ok", "allowed_tools": ["Read"], "profile": "nope"}]})
+        shown = (await c.get("/api/v1/runs/%s/agent" % made["run_id"], headers=headers())).json()
+        return made, bad, shown
+    made, bad, shown = drive(env, go)
+    assert bad.status_code == 422 and "nope" not in bad.text
+    by_node = {t["node_id"]: t for t in shown["tasks"]}
+    assert by_node["a"]["spec"]["profile"] == "reader" and "profile" not in by_node["b"]["spec"]
+    assert by_node["a"]["state"] == by_node["b"]["state"] == "completed"
+    picked = {json.loads(r[0])["task_id"]: json.loads(r[0]) for r in env.db.execute(
+        "SELECT payload_json FROM events WHERE type='agent.profile_selected'")}
+    assert {p["profile_id"] for p in picked.values()} == {"reader", at.AGENT_PROFILE}
+    assert env.db.execute("SELECT COUNT(*) FROM events WHERE type='agent.profile_selected'").fetchone() == (2,)

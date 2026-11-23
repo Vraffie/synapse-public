@@ -57,6 +57,7 @@ class TaskRequest(BaseModel):
     timeout_seconds: float | None = Field(default=None, gt=0, le=3600, allow_inf_nan=False)
     depends_on: list[str] = Field(default_factory=list, max_length=6)
     approval_step: ApprovalStepRequest | None = None
+    profile: str | None = Field(default=None, strict=True, pattern=r"^[A-Za-z0-9._-]{1,64}$")
 
 
 class AgentRunRequest(BaseModel):
@@ -120,7 +121,7 @@ def agent_command_router(start: StartAgent | None, read: ReadAgent | None, cance
             for k in ("prompt", "allowed_tools", "approval_step"):
                 data.pop(k, None)
             for task in data["tasks"]:
-                for k in ("permission_mode", "timeout_seconds"):
+                for k in ("permission_mode", "timeout_seconds", "profile"):
                     if task[k] is None:
                         del task[k]  # the service applies the request-level defaults
                 step = task["approval_step"]

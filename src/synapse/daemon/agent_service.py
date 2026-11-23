@@ -132,9 +132,13 @@ class AgentRunService:
             raw = req["tasks"]
             if not isinstance(raw, list) or not 1 <= len(raw) <= MAX_TASKS:
                 raise _bad("tasks must contain 1 to %d entries" % MAX_TASKS)
-            tasks = [self._validate_task(t, default_mode=req.get("permission_mode", spec.permission_mode or "acceptEdits"),
-                                         default_timeout=req.get("timeout_seconds", DEFAULT_TIMEOUT),
-                                         spec=spec) for t in raw]
+            tasks = []
+            for t in raw:
+                # A task may name its own profile (ADR 016): tools, mode and timeout are checked against it.
+                tspec = spec if not isinstance(t, dict) or t.get("profile") is None else self.resolve_profile(t["profile"])
+                tasks.append(self._validate_task(
+                    t, default_mode=req.get("permission_mode", tspec.permission_mode or "acceptEdits"),
+                    default_timeout=req.get("timeout_seconds", DEFAULT_TIMEOUT), spec=tspec))
             self._check_graph(tasks)
             return {"repo": req["repo"], "base_ref": ref, "tasks": tasks, "legacy": False,
                     "profile": self._explicit_profile(spec)}
@@ -194,8 +198,11 @@ class AgentRunService:
             if type(ttl) is not int or not 1 <= ttl <= ms.MAX_TTL_SECONDS:
                 raise _bad("approval_step ttl_seconds is outside the permitted range")
             step = {"operation": step["operation"], "target": step["target"], "ttl_seconds": ttl}
-        return {"id": node, "prompt": prompt, "allowed_tools": sorted(set(tools)), "permission_mode": mode,
-                "timeout_seconds": timeout, "approval_step": step, "depends_on": sorted(deps)}
+        out = {"id": node, "prompt": prompt, "allowed_tools": sorted(set(tools)), "permission_mode": mode,
+               "timeout_seconds": timeout, "approval_step": step, "depends_on": sorted(deps)}
+        if t.get("profile") is not None:
+            out["profile"] = profile.id  # only when named, so requests without it keep their fingerprint
+        return out
 
     @staticmethod
     def _check_graph(tasks: list[dict]) -> None:
@@ -283,8 +290,9 @@ class AgentRunService:
                 spec = {"prompt": task["prompt"], "worktree": paths[node], "allowed_tools": task["allowed_tools"],
                         "permission_mode": task["permission_mode"], "timeout_seconds": task["timeout_seconds"],
                         "repo": req["repo"], "base_ref": req["base_ref"], "worktree_head": recorded[0]}
-                if req.get("profile"):
-                    spec["profile_id"] = req["profile"]
+                named = task["profile"] if "profile" in task else req.get("profile")
+                if named and named != DEFAULT_PROFILE_ID:
+                    spec["profile_id"] = named
                 if task["approval_step"] is not None:
                     spec["approval_step"] = {**task["approval_step"], "policy_version": POLICY_VERSION}
                 specs[node] = spec

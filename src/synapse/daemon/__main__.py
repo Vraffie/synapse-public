@@ -310,7 +310,7 @@ def run(state_dir: Path, migrations: Path, *, enable_mock_mcp_ipc: bool = False,
                 connection, artifacts, profile=claude_profile,
                 approval_policy=None if agent_config is None else agent_config.approval_policy,
                 worktree_check=None if worktrees is None else worktree_checker(worktrees),
-                budget_policy=budget_policy)
+                budget_policy=budget_policy, registry=profile_registry)
             agent_runtime.recover_interrupted()
             if profile_registry is not None:
                 sync_profiles(connection, profile_registry)

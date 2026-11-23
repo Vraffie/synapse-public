@@ -217,3 +217,40 @@ def test_daemon_requires_base_config_and_rejects_codex(env):
     r = run_daemon(state, "--claude-cli-config", str(tmp / "base.json"), "--agent-config", str(codex),
                    "--allow-same-user-agents")
     assert r.returncode != 0 and "disabled until W3" in r.stderr
+
+
+def _tasks(*tasks, **over):
+    return {"repo": "/r", "base_ref": "main", "timeout_seconds": 20, "tasks": list(tasks), **over}
+
+
+def test_task_level_profile_is_checked_against_that_profile_not_the_run_default(env):
+    svc = make_service(env, True, "s")
+    ok = svc.validate(_tasks({"id": "a", "prompt": "p", "allowed_tools": ["Read"], "profile": "reader"},
+                             {"id": "b", "prompt": "p", "allowed_tools": ["Read", "Edit"]}))
+    a, b = ok["tasks"]
+    assert a["profile"] == "reader" and a["permission_mode"] == "plan"  # the profile's mode is its default
+    assert "profile" not in b and b["permission_mode"] == "acceptEdits"  # the default profile is unchanged
+    for task, text in [({"allowed_tools": ["Edit"]}, "subset"), ({"permission_mode": "acceptEdits"}, "exceeds"),
+                       ({"timeout_seconds": 500}, "timeout"), ({"profile": "nope"}, "unknown profile"),
+                       ({"profile": "off"}, "disabled")]:
+        entry_ = {"id": "a", "prompt": "p", "allowed_tools": ["Read"], "profile": "reader", **task}
+        with pytest.raises(AgentRunError, match=text):
+            svc.validate(_tasks(entry_))
+
+
+def test_task_profile_overrides_the_run_level_profile_and_default_is_explicit(env):
+    svc = make_service(env, True, "s")
+    out = svc.validate(_tasks({"id": "a", "prompt": "p", "allowed_tools": ["Read", "Edit"], "profile": "default"},
+                              {"id": "b", "prompt": "p", "allowed_tools": ["Read"]}, profile="reader"))
+    a, b = out["tasks"]
+    assert a["profile"] == "default" and a["permission_mode"] == "acceptEdits" and "profile" not in b
+    assert out["profile"] == "reader"
+
+
+def test_task_profile_only_changes_the_fingerprint_when_named(env):
+    svc = make_service(env, True, "s")
+    plain = svc.validate(_tasks({"id": "a", "prompt": "p", "allowed_tools": ["Read"]}))
+    named = svc.validate(_tasks({"id": "a", "prompt": "p", "allowed_tools": ["Read"], "profile": "reader"}))
+    assert "profile" not in svc._fingerprint(plain)["tasks"][0]  # earlier receipts still replay
+    assert svc._fingerprint(named)["tasks"][0]["profile"] == "reader"
+    assert svc._fingerprint(named) != svc._fingerprint(plain)

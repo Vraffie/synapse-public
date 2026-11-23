@@ -66,8 +66,11 @@ class AgentProviderRouter:
     """
 
     def __init__(self, profile: ClaudeCliProfile, specs: Mapping[str, Mapping[str, Any]],
-                 factory: Callable[[ClaudeCliProfile], ProviderAdapter] = ClaudeCliProvider):
+                 factory: Callable[[ClaudeCliProfile], ProviderAdapter] = ClaudeCliProvider,
+                 profile_resolver: Callable[[str], ClaudeCliProfile] | None = None):
+        # profile_resolver: registry profile id -> the ClaudeCliProfile to spawn with (never invents one).
         self._profile, self._specs, self._factory = profile, specs, factory
+        self._resolver = profile_resolver
         self._providers: dict[tuple, ProviderAdapter] = {}
         self._owner: dict[str, ProviderAdapter] = {}
         self.handles: dict[str, str] = {}
@@ -81,12 +84,18 @@ class AgentProviderRouter:
 
     async def start(self, request: ExecutionRequest) -> str:
         spec = self._specs[request.task_id]
-        key = (tuple(spec["allowed_tools"]), spec["permission_mode"])
+        named = spec.get("profile_id")
+        key = (named, tuple(spec["allowed_tools"]), spec["permission_mode"])
         try:
             provider = self._providers.get(key)
             if provider is None:
+                base = self._profile
+                if named is not None:
+                    if self._resolver is None:
+                        raise ValueError("no resolver for a named profile")  # fail closed: never the default
+                    base = self._resolver(named)
                 provider = self._providers[key] = self._factory(
-                    replace(self._profile, allowed_tools=key[0], permission_mode=key[1]))
+                    replace(base, allowed_tools=key[1], permission_mode=key[2]))
             handle = await provider.start(request)
         except BaseException:
             self.start_failed.add(request.task_id)  # provider.start never spawns: known no process
@@ -126,6 +135,36 @@ class AgentWorkflowEngine(MockWorkflowEngine):
         self.router, self.specs, self._prompts = router, specs, prompts
         self._worktree_check = worktree_check
         self._profile_check = profile_check  # profile_id -> refusal reason or None; only asked for named profiles
+
+    def _profile_for(self, run_id: str, task_id: str, default_profile_id: str) -> str:
+        """A task that named a registry profile claims capacity under it (its own cap, ADR 016).
+
+        If that profile is unknown or disabled the task claims under the run's profile instead, so it is not
+        stuck unclaimable; ``_execute`` then refuses it before any spawn via ``_profile_problem``.
+        """
+        spec = self.specs.get(task_id)
+        named = None if spec is None else spec.get("profile_id")
+        if named is None or self._profile_problem(spec) is not None:
+            return default_profile_id
+        return named
+
+    def _record_profile_selected(self, run_id: str, task_id: str, attempt_id: str, profile_id: str,
+                                 requested: str | None) -> None:
+        """Audit which profile an attempt runs under; recorded before the spawn, fail closed if it cannot be."""
+        row = self.db.execute("SELECT provider,config_ref FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        ref = row[1] if row is not None and isinstance(row[1], str) else ""
+        event = EventEnvelope.create(
+            aggregate_type="task_attempt", aggregate_id=attempt_id, event_type="agent.profile_selected",
+            payload={"task_id": task_id, "profile_id": profile_id, "provider": row[0] if row else None,
+                     "model": None,  # the adapter does not report a model; never claim one
+                     "profile_sha256": ref[len("registry:"):] if ref.startswith("registry:") else None,
+                     "requested": requested, "fell_back_from": None,
+                     "reason": "requested" if requested else "default"})
+        with self._transaction():
+            self.db.execute("INSERT INTO events(id,aggregate_type,aggregate_id,run_id,type,schema_version,payload_json,occurred_at) VALUES(?,?,?,?,?,?,?,?)",
+                            (event.id, event.aggregate_type, attempt_id, run_id, event.event_type, event.schema_version,
+                             encode_payload(event.payload), event.occurred_at))
+            self.db.execute("INSERT INTO outbox(event_id) VALUES(?)", (event.id,))
 
     def _profile_problem(self, spec: Mapping[str, Any]) -> str | None:
         """Fail-closed recheck just before spawn of the profile a task was queued under (absent: default)."""
@@ -275,6 +314,12 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                 # A gated task must carry a recorded HEAD; a missing one fails closed (never skips the recheck).
                 problem = (await self._worktree_problem(run_id, task_id, spec["worktree"], spec["worktree_head"])
                            if isinstance(spec.get("worktree_head"), str) else "worktree_head_missing")
+            if problem is None:
+                try:
+                    self._record_profile_selected(run_id, task_id, attempt_id, profile_id, spec.get("profile_id"))
+                except Exception:
+                    _LOG.exception("Could not record the profile selection for task %s", task_id)
+                    problem = "profile_selection_not_recorded"
             if problem is not None:
                 terminal = ProviderEvent("failed", problem)  # refused before any spawn
             else:
