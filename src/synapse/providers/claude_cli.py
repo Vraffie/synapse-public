@@ -17,6 +17,7 @@ from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -73,6 +74,7 @@ _ALLOWED_EXTRA: Mapping[str, re.Pattern[str]] = {
 # is the headless-friendly credential that needs no file copy.
 _ENV_ALLOWLIST = ("PATH", "LANG", "CLAUDE_CODE_OAUTH_TOKEN")
 # Home-relative secret locations denied to the file tools in the Synapse-owned settings.
+_LOG = logging.getLogger(__name__)
 _DENY_HOME_SUBDIRS = (
     ".ssh", ".gnupg", ".aws", ".kube", ".docker", ".claude", ".codex", ".config", ".netrc", ".local/share",
     ".password-store", ".npmrc", ".pypirc", ".git-credentials", ".mozilla", ".bash_history",
@@ -604,7 +606,11 @@ class ClaudeCliProvider:
                         close_fds=True, start_new_session=True,
                         preexec_fn=self._preexec(plan.cpu_seconds),
                     )
-            except (OSError, ValueError, subprocess.SubprocessError, SandboxUnavailable):
+            except (OSError, ValueError, subprocess.SubprocessError, SandboxUnavailable) as exc:
+                # The run only reports "spawn_failed"; say why in the daemon log. SandboxUnavailable messages are
+                # fixed strings from this package; for anything else log only the type and errno, never paths or text.
+                _LOG.warning("agent spawn failed: %s", str(exc) if isinstance(exc, SandboxUnavailable)
+                             else "%s%s" % (type(exc).__name__, " errno=%s" % exc.errno if isinstance(exc, OSError) and exc.errno else ""))
                 self._cleanup(ex)
                 ex.spawn_failed = True
                 ex.reaped = True
