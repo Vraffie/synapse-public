@@ -5,6 +5,7 @@ Panes never talk to the daemon; they react to this thread's signals.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from threading import Event, Lock
 from urllib.parse import quote, urlencode
@@ -85,6 +86,7 @@ class Poller(QThread):
     agent_usage_error = Signal(str, object, str)  # run id, generation, 'unavailable' | 'failed'
     agent_detail = Signal(str, object, object)  # run id, generation, sanitized detail
     agent_detail_error = Signal(str, object, str)  # run id, generation, 'unavailable' | 'failed'
+    profiles_list = Signal(object)  # raw GET /api/v1/profiles answer for the run-start pickers, or None when the daemon has none
     runs_list = Signal(object)  # recent runs (GET /api/v1/runs) for the Control Center switcher
     run_feed = Signal(str, object, object)  # run id, generation, new messages across the run's threads
     cc_approvals = Signal(object)  # approval rows for the Control Center gate, independent of the Developer tab's page
@@ -272,7 +274,15 @@ class Poller(QThread):
                     outcome, result = 'invalid', None
                 else:
                     outcome = 'accepted'
+                    profile = result.get('profile')
+                    if profile is None:  # the daemon did not echo it: show the account the operator chose (what was sent)
+                        try:
+                            profile = json.loads(body).get('profile')
+                        except ValueError:
+                            profile = None
                     result = {'run_id': result['run_id'][:256], 'state': result['state'][:64]}
+                    if isinstance(profile, str) and re.fullmatch(r'[A-Za-z0-9._-]{1,64}', profile):
+                        result['profile'] = profile
             else:
                 result = self.send(self.state_dir, '/api/v1/runs/' + quote(run_id, safe='') + '/agent-cancel',
                                    body=b"", idempotency_key=key, correlation_id=key)  # the daemon refuses any cancel body
@@ -281,9 +291,11 @@ class Poller(QThread):
         except DaemonHTTPError as exc:
             if action == 'agent-start':
                 outcome = {404: 'unavailable', 503: 'unavailable', 409: 'active', 422: 'rejected'}.get(exc.status, 'failed')
+                if outcome == 'rejected':
+                    result = {'reason': getattr(exc, 'reason', None)}  # the daemon's own refusal text (already sanitized)
             else:
                 outcome = 'unavailable' if exc.status in UNAVAILABLE_STATUSES else 'failed'
-            result = None
+                result = None
         except Exception:
             outcome, result = 'failed', None
         finally:
@@ -342,11 +354,23 @@ class Poller(QThread):
         except Exception:
             self.agent_detail_error.emit(run_id, generation, 'failed')
 
+    def _poll_profiles(self):
+        try:
+            answer = self.fetch(self.state_dir, "/api/v1/profiles")
+            if isinstance(answer, dict) and isinstance(answer.get("profiles"), list):
+                self.profiles_list.emit(answer)
+        except DaemonHTTPError as exc:
+            if exc.status in (404, 503):
+                self.profiles_list.emit(None)
+        except Exception:
+            pass  # keep the pickers as they are
+
     def _poll_control_center(self, run_id, generation, threads):
         """Best-effort reads for the Control Center; any failure is silent (the view keeps its last data)."""
         self._poll_cc_approvals()
         if self._cycle % FEED_EVERY:
             return
+        self._poll_profiles()
         try:
             page = self.fetch(self.state_dir, "/api/v1/runs?limit=25")
             if isinstance(page, dict) and isinstance(page.get("runs"), list):

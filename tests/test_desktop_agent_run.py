@@ -664,3 +664,118 @@ def test_commit_busy_slot_and_message_validation(console, monkeypatch):
     assert agent_form.valid_commit_message('  ') is None and agent_form.valid_commit_message('') is None
     assert agent_form.valid_commit_message('x' * 2000) == 'x' * 2000 and agent_form.valid_commit_message('x' * 2001) is None
     assert agent_form.valid_commit_message(' a\nb ') == 'a\nb'
+
+
+# ---- per-run Claude account (profile) choice: no preselected account, no fallback --------------------------------
+
+PROFILES = {'profiles': [
+    {'id': 'claude-work', 'enabled': True, 'cooldown_remaining_seconds': 0.0},
+    {'id': 'claude-personal', 'enabled': True, 'cooldown_remaining_seconds': 600.0},
+    {'id': 'claude-personal-ios', 'enabled': True, 'cooldown_remaining_seconds': 0.0},
+    {'id': 'old', 'enabled': False, 'cooldown_remaining_seconds': 0.0}]}
+
+
+def pick(form, profile_id):
+    form.profile.setCurrentIndex(form.profile.findData(profile_id))
+
+
+def test_picker_has_no_preselection_and_start_waits_for_a_choice(console, monkeypatch):
+    c = console()
+    c.fill()
+    form = c.form
+    assert not form.profile.isEnabled() and form.submit_button.isEnabled()  # no profiles offered: nothing sent
+    form.set_profiles(PROFILES)
+    assert form.profile.currentData() is None and form.profile.currentText() == agent_form.PROFILE_PROMPT
+    assert not form.submit_button.isEnabled()
+    form.submit()
+    assert c.sent == [] and agent_form.PROFILE_REQUIRED in form.problems.text()
+    pick(form, 'claude-work')
+    assert form.submit_button.isEnabled()
+    form.set_profiles(PROFILES)  # a refresh keeps a still-usable choice
+    assert form.profile.currentData() == 'claude-work'
+
+
+def test_unusable_profiles_are_listed_with_reason_but_not_selectable(console):
+    c = console()
+    form = c.form
+    form.set_profiles(PROFILES)
+    model = form.profile.model()
+    rows = {form.profile.itemData(i): (form.profile.itemText(i), model.item(i).isEnabled()) for i in range(1, form.profile.count())}
+    assert rows['claude-work'] == ('claude-work', True)
+    text, enabled = rows['claude-personal']
+    assert not enabled and 'cooling down' in text and '10 min' in text
+    text, enabled = rows['old']
+    assert not enabled and 'disabled' in text
+    form.profile.setCurrentIndex(form.profile.findData('old'))  # even if forced, the unusable id is still sent only by choice
+    pick(form, 'claude-personal-ios')
+    assert form.profile.currentData() == 'claude-personal-ios'
+    # a chosen profile that starts cooling down on refresh is dropped back to "choose", never replaced by another
+    form.set_profiles({'profiles': [{'id': 'claude-personal-ios', 'enabled': True, 'cooldown_remaining_seconds': 30}]})
+    assert form.profile.currentData() is None and not form.submit_button.isEnabled()
+
+
+def test_chosen_profile_is_sent_in_the_post_and_confirmed(console):
+    c = console(send_script=[{'run_id': 'run-9', 'task_id': 't', 'state': 'queued', 'worktree_path': '/w'}])
+    c.fill()
+    c.form.set_profiles(PROFILES)
+    pick(c.form, 'claude-personal-ios')
+    c.form.submit()
+    spin(c.app, lambda: c.sent)
+    endpoint, kwargs = c.sent[0]
+    assert endpoint == '/api/v1/agent-runs' and json.loads(kwargs['body'])['profile'] == 'claude-personal-ios'
+    assert 'Claude account: claude-personal-ios' in c.confirms[0][1]
+    spin(c.app, lambda: 'account claude-personal-ios' in c.form.status.text())
+
+
+def test_no_profile_key_when_the_daemon_offers_none(console):
+    c = console()
+    c.fill()
+    c.form.set_profiles(None)
+    c.form.submit()
+    spin(c.app, lambda: c.sent)
+    assert 'profile' not in json.loads(c.sent[0][1]['body'])
+
+
+def test_a_422_shows_the_daemons_reason_not_the_generic_text(console):
+    c = console(send_script=[DaemonHTTPError(422, reason='profile is cooling down')])
+    c.fill()
+    c.form.set_profiles(PROFILES)
+    pick(c.form, 'claude-work')
+    c.form.submit()
+    spin(c.app, lambda: 'profile is cooling down' in c.form.status.text())
+    assert agent_form.REJECTED_TEXT not in c.form.status.text() and 'nothing was started' in c.form.status.text().lower()
+
+
+def test_control_center_composer_has_the_same_picker_and_gate(console):
+    c = console()
+    composer = c.window.control_center.composer
+    composer.prompt.setPlainText('do it')
+    composer.repo.setCurrentText('/work/repo')
+    composer.set_profiles(PROFILES)
+    assert composer.profile.currentData() is None and not composer.submit_button.isEnabled()
+    pick(composer, 'claude-work')
+    assert composer.submit_button.isEnabled()
+
+
+def test_poller_profile_feed_reaches_the_pickers(console):
+    c = console()
+    seen = []
+    c.window.poller.profiles_list.connect(seen.append)
+    c.window.poller._poll_profiles()
+    assert seen == []  # the harness answers with a run snapshot: not a profiles list, so nothing is emitted
+    c.window.poller.fetch = lambda _s, endpoint: PROFILES
+    c.window.poller._poll_profiles()
+    assert seen == [PROFILES]
+    c.window.poller.fetch = lambda _s, endpoint: (_ for _ in ()).throw(DaemonHTTPError(404))
+    c.window.poller._poll_profiles()
+    assert seen[-1] is None
+
+
+def test_agent_pane_shows_the_runs_profile_when_present(console):
+    base = {'outcome': 'ok', 'summary_text': 's', 'tool_names': [], 'worktree': None}
+    pane = agent_view.AgentDetailPane()
+    pane.set_detail(agent_view.sanitize_detail({**base, 'profile': 'claude-work'}))
+    assert pane.profile.text() == 'Claude account: claude-work'
+    pane.set_detail(agent_view.sanitize_detail(base))
+    assert pane.profile.text() == ''
+    assert agent_view.sanitize_detail({**base, 'profile': 'bad id\n'})['profile'] is None

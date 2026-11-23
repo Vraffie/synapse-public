@@ -44,7 +44,9 @@ def sanitize_detail(raw) -> dict | None:
         worktree = {"status": clean(worktree.get("status") or "", 200), "head": clean(worktree.get("head") or "", 80),
                     "diff_stat": clean(worktree.get("diff_stat") or "", MAX_DIFF_STAT),
                     "diff": diff[:MAX_DIFF], "truncated": bool(worktree.get("truncated", False)) or len(diff) > MAX_DIFF}
-    return {"outcome": None if outcome is None else clean(outcome, 80),
+    profile = raw.get("profile")  # top-level account id; absent on older daemons
+    profile = profile if isinstance(profile, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", profile) else None
+    return {"profile": profile, "outcome": None if outcome is None else clean(outcome, 80),
             "summary_text": None if summary is None else clean(summary, MAX_SUMMARY),
             "tool_names": [clean(t, 64) for t in tools[:MAX_TOOLS]], "tools_total": len(tools), "worktree": worktree}
 
@@ -75,6 +77,7 @@ class AgentDetailPane(QGroupBox):
         self.banner.setStyleSheet("font-weight: bold;")
         self.approve_button = QPushButton("Approve…")
         self.reject_button = QPushButton("Reject…")
+        self.profile = QLabel("")
         self.outcome = QLabel("")
         self.tools = QLabel("")
         self.tools.setWordWrap(True)
@@ -109,7 +112,7 @@ class AgentDetailPane(QGroupBox):
         layout = QVBoxLayout(self)
         layout.addWidget(self.status)
         layout.addLayout(banner_row)
-        for widget in (self.outcome, self.tools, self.worktree, self.summary, self.diff_note, self.diff, self.cancel_button):
+        for widget in (self.profile, self.outcome, self.tools, self.worktree, self.summary, self.diff_note, self.diff, self.cancel_button):
             layout.addWidget(widget)
         layout.addLayout(ops_row)
         layout.addWidget(self.op_status)
@@ -128,6 +131,7 @@ class AgentDetailPane(QGroupBox):
 
     def clear(self, status: str = "Select a run to see agent details."):
         self.status.setText(status)
+        self.profile.setText("")
         self.outcome.setText("")
         self.tools.setText("")
         self.worktree.setText("")
@@ -144,6 +148,7 @@ class AgentDetailPane(QGroupBox):
 
     def set_detail(self, detail: dict):
         self.status.setText("Agent run details")
+        self.profile.setText("Claude account: " + detail["profile"] if detail.get("profile") else "")
         self.outcome.setText("Outcome: " + (detail["outcome"] or "not finished yet"))
         names = ", ".join(detail["tool_names"])
         extra = detail["tools_total"] - len(detail["tool_names"])

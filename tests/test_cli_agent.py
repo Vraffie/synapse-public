@@ -169,7 +169,7 @@ def test_request_accepts_201_and_200_for_start_only():
 
 
 def test_profiles_and_cooldown_commands_use_plain_requests(calls, capsys):
-    assert run("profiles") == 0
+    assert run("profiles", "--json") == 0
     assert calls[-1] == ("/api/v1/profiles", {})
     assert run("profile-cooldown", "reader", "--seconds", "90") == 0
     endpoint, kw = calls[-1]
@@ -203,3 +203,84 @@ def test_worktree_commit_command(calls):
     assert json.loads(kw["body"]) == {"message": "fix: it"}
     with pytest.raises(SystemExit):  # the message is mandatory
         run("agent-worktree-commit", "run-1")
+
+
+def test_start_sends_profile_only_when_given_and_validates_it(calls, tmp_path, capsys):
+    f = tmp_path / "p.txt"
+    f.write_text("hello")
+    assert run(*START, "--prompt-file", str(f)) == 0
+    assert "profile" not in json.loads(calls[-1][1]["body"])
+    assert run(*START, "--prompt-file", str(f), "--profile", "claude-personal-ios") == 0
+    assert json.loads(calls[-1][1]["body"])["profile"] == "claude-personal-ios"
+    n = len(calls)
+    for bad in ("", "a b", "x" * 65, "../etc", "a/b"):
+        with pytest.raises(SystemExit):
+            run(*START, "--prompt-file", str(f), "--profile", bad)
+    assert len(calls) == n
+
+
+def test_tasks_file_profile_is_passed_per_task_and_validated(calls, tmp_path, capsys):
+    tasks = tmp_path / "t.json"
+    tasks.write_text(json.dumps([{"id": "a", "prompt": "p", "allowed_tools": ["Read"], "profile": "claude-work"}]))
+    assert run("agent-start", "--repo", "/r", "--tasks-file", str(tasks), "--idempotency-key", "k", "--correlation-id", "c") == 0
+    assert json.loads(calls[-1][1]["body"])["tasks"][0]["profile"] == "claude-work"
+    n = len(calls)
+    tasks.write_text(json.dumps([{"id": "a", "prompt": "p", "allowed_tools": ["Read"], "profile": "no good"}]))
+    assert run("agent-start", "--repo", "/r", "--tasks-file", str(tasks), "--idempotency-key", "k", "--correlation-id", "c") == 1
+    assert len(calls) == n
+
+
+def test_start_shows_the_daemons_422_reason_and_exits_nonzero(monkeypatch, tmp_path, capsys):
+    def refuse(*_a, **_k):
+        raise cli.DaemonHTTPError(422, reason="profile is cooling down")
+    monkeypatch.setattr(cli, "_request", refuse)
+    f = tmp_path / "p.txt"
+    f.write_text("hello")
+    assert run(*START, "--prompt-file", str(f), "--profile", "claude-work") == 1
+    err = capsys.readouterr().err
+    assert "422" in err and "profile is cooling down" in err and "hello" not in err
+
+
+class _Resp:
+    def __init__(self, status, body):
+        self.status, self._body = status, body
+
+    def getheader(self, _name):
+        return None
+
+    def read(self, n=None):
+        return self._body[:n]
+
+
+@pytest.mark.parametrize("body,expected", [
+    (b'{"detail": "unknown profile"}', "unknown profile"),
+    (b'{"detail": "bad\\u001b[31m thing"}', "bad[31m thing"),
+    (b'{"detail": [{"msg": "x", "input": "SECRET"}]}', None),
+    (b"not json", None),
+    (b'{"detail": "' + b"x" * 500 + b'"}', "x" * 200),
+])
+def test_refusal_reason_is_string_detail_only_sanitized_and_bounded(body, expected):
+    assert cli._refusal_reason(_Resp(422, body)) == expected
+
+
+def test_profiles_prints_id_enabled_cooldown_and_tolerates_missing_fields(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_request", lambda *a, **k: {"profiles": [
+        {"id": "claude-work", "enabled": True, "cooldown_remaining_seconds": 0.0},
+        {"id": "claude-personal", "enabled": True, "cooldown_remaining_seconds": 90.0},
+        {"id": "claude-personal-ios", "enabled": False}, "junk"]})
+    assert run("profiles") == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[0].split() == ["ID", "ENABLED", "COOLDOWN"]
+    assert out[1].split() == ["claude-work", "yes", "-"]
+    assert out[2].split()[:2] == ["claude-personal", "yes"] and "cooling down 90 s" in out[2]
+    assert out[3].split()[:2] == ["claude-personal-ios", "no"] and len(out) == 4
+
+
+def test_agent_show_prints_profile_when_present_and_tolerates_absence(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_request", lambda *a, **k: {"outcome": "ok", "profile": "claude-work"})
+    assert run("agent-show", "r1") == 0
+    captured = capsys.readouterr()
+    assert "profile: claude-work" in captured.err and json.loads(captured.out)["profile"] == "claude-work"
+    monkeypatch.setattr(cli, "_request", lambda *a, **k: {"outcome": "ok"})
+    assert run("agent-show", "r1") == 0
+    assert "profile" not in capsys.readouterr().err
