@@ -116,3 +116,15 @@ Recorded from the owner's answers to the open questions. They fix the order of w
 2. **Root-owned system install (option A): not yet.** Build the user-scope sandbox (option C) and the passphrase approval first. Revisit option A before agents run against anything that cannot be lost (for example the STAGING deployment path), or if other people or untrusted repositories are involved. Until then the agent runtime keeps requiring the explicit same-user acknowledgement (`--allow-same-user-agents`, PR #116).
 3. **Agent network access:** allowed beyond the model API. The sandbox therefore does not unshare the network namespace by default. Network egress policy stays a non-goal here, and the documentation must say that a network-capable agent can exfiltrate anything it can read.
 4. **Working directories:** agents work in daemon-managed clones (per-run worktrees) only. Working in the owner's checkout in place is allowed only behind an explicit, off-by-default feature flag. In-place mode needs its own safeguards (refuse a dirty tree, bind the approval to the checkout's head, never run it under the sandbox's reduced-exposure assumptions), to be specified before it is built.
+
+## Peer credentials prototype (findings)
+
+Helper: `src/synapse/daemon/peer_credentials.py` (`peer_credentials(sock) -> (pid, uid, gid)` via `SO_PEERCRED`; raises `PeerCredentialsUnavailable` elsewhere). Tests: `tests/test_peer_credentials.py` (socketpair and a real AF_UNIX server). Nothing in the daemon calls it; no behaviour change.
+
+What uvicorn 0.54.0 and starlette 1.10.0 (read in `.venv`) expose:
+
+- `uvicorn/protocols/utils.py::get_remote_addr` calls `socket.getpeername()` and returns it only when it is a tuple; for an AF_UNIX peer that is a str/bytes path (usually empty), so `scope["client"]` is `None`. `get_local_addr` returns `(path, None)` for `scope["server"]`. Starlette's `request.client` just reads `scope["client"]`.
+- The h11 and httptools protocols build the scope (`"server": self.server, "client": self.client`) with no `extensions` entry and no credential field. A grep for `SO_PEERCRED`/`peercred` in uvicorn and starlette finds nothing. So the peer uid is not available in the ASGI scope as shipped.
+- The transport does hold the socket (`transport.get_extra_info("socket")`), which supports `getsockopt`, but only the protocol object sees the transport, not the ASGI app.
+
+Practical options (none implemented): (a) subclass uvicorn's HTTP protocol class (via `uvicorn.Config(http=...)`) to call `peer_credentials` in `connection_made` and add the result to the scope; this couples to uvicorn internals; (b) replace `server.serve` with an asyncio server whose protocol factory records credentials per connection; (c) a pure-ASGI middleware cannot do it alone. Since uid is fixed per connection, a per-connection value computed at `connection_made` avoids races. Because the daemon has one owner uid and the socket is mode 0600, a uid check would only matter once agents run as a different uid. [UNVERIFIED] Whether the custom-protocol route works unchanged with uvloop or a different `http` implementation; not tested.
