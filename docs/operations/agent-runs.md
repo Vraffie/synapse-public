@@ -169,7 +169,7 @@ needs an operator.) `POST /api/v1/runs/{run_id}/agent-abandon` or `agentctl agen
 
 Body: `{"expected_run_version": N, "assertion": "no-agent-process-remains"}` plus the usual `Idempotency-Key` and
 `X-Correlation-ID`. **The assertion is yours:** the child runs in its own session and can outlive a daemon
-crash, and the daemon does not persist process identity, so it cannot verify this. Check (`pgrep`, `ps`) that
+crash, and the daemon cannot always verify this (see the fence below). Check (`pgrep`, `ps`) that
 no agent process for the run is still running or editing its worktree before asserting.
 
 Effects, in one transaction: the run becomes `failed`, its unfinished tasks `cancelled`, and an
@@ -181,11 +181,23 @@ re-spawned. Only a `recovering` run at exactly `expected_run_version` qualifies 
 assertion). Replays with the same key return the original response. This is not a resume: the work is not
 continued.
 
-## Removing a finished run's worktree
+### The startup worker fence and `agent-abandon`
 
-### Getting the edits out: `agent-worktree-commit`
+At daemon start, before recovery, the daemon fences agent processes left by the previous daemon using the spawn
+journal in `<state>/spawn-journal` (ADR 023): provably dead ones are noted, live ones have their whole process group
+killed and checked empty. Each recovering run gets an `agent.worker_fence` event with `verified_dead`, `killed`,
+`unverified` and `all_clear`. The counts cover the whole journal, not just that run.
 
-A sandboxed agent cannot write to the repository's git metadata, so its edits stay as uncommitted changes in
+`unverified` means the daemon could not prove a process dead and did not signal it where that was ambiguous. Treat it
+as "a process may still be editing a worktree": check for stray processes (`pgrep`, `ps`) before `agent-abandon`.
+`all_clear: true` is evidence, but the assertion is still yours and still required: the fence covers the recorded
+process GROUP, not a descendant that left it (`setsid`). Unverified journal entries are kept as `*.unverified` files
+in the journal directory and are counted as unverified at EVERY startup until you delete them after checking.
+
+## Getting the edits out: `agent-worktree-commit`
+
+For a linked worktree (the normal case) the owning repository's `.git` is mounted read-only inside the sandbox, so
+the agent cannot commit; its edits stay as uncommitted changes in
 the run's worktree. `agentctl agent-worktree-commit RUN -m "message"` (operator Bearer; body `{"message"}`, 1-2000
 characters) has the daemon commit them host-side onto each task's own branch `synapse/<run>/<task>`:
 
@@ -223,6 +235,8 @@ reviewed yet.
   `agent.worktree_removed` event with a `forced` flag and the `task_ids` actually removed, including when a
   later task could not be removed (that request answers 409 but the earlier removals stay audited).
   Unknown or non-agent runs give 404.
+
+## Removing a finished run's worktree
 
 ## Verification and caveats
 

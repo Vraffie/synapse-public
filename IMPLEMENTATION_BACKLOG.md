@@ -16,13 +16,13 @@ Progress below describes merged `main` as of 2026-11-21 (through the merge of PR
 | M3 — Local API and native clients | 4 | 10 | 40% |
 | M4 — Real provider adapters and profile isolation | 9 | 16 | 56% |
 | M2/M3 close-out required before M6 (cross-cutting trust work) | 0 | 4 | 0% |
-| M5 — Token optimization and analytics | 4 | 10 | 40% |
+| M5 — Token optimization and analytics | 5 | 10 | 50% |
 | M6 — Git and Domain plugin | 2 | 8 | 25% |
-| M7 — Deployment, packaging and hardening | 2 | 7 | 29% |
-| **Overall** | **39** | **87** | **45%** |
+| M7 — Deployment, packaging and hardening | 3 | 7 | 43% |
+| **Overall** | **41** | **87** | **47%** |
 
 ```text
-Overall  [########------------] 45%  (39/87 checkboxes)
+Overall  [#########-----------] 47%  (41/87 checkboxes)
 ```
 
 Security findings F1-F14: 10 fixed, 4 open (list under M7.5).
@@ -129,7 +129,7 @@ Design: ADR 017 (PR #98, merged). Rules: optimization never bypasses mandatory c
 - [x] M5.2 policy module: budgets per run, task and profile with fail-closed `budget_exceeded` and unknown usage never zero (PR #100, pure, not wired).
 - [ ] M5.2 wiring: check budgets before scheduling and spawn with a policy version; breach fails closed with a distinct reason and never retries. The multi-task scheduling from PR #88 has landed; the budget check before scheduling is not wired.
 - [x] M5.3 Deterministic output reducer: keeps every unique failure, dedupes, returns the raw-output hash, no LLM; golden corpus tests (PR #106, pure, not wired).
-- [ ] M5.3 wiring: store raw output as an artifact and forward the reduced output through the agent path.
+- [x] M5.3 wiring: raw output stored as an artifact (hash recoverable), reduced text clipped by serialised size and forwarded through the agent path (this repo's #1, 2026-11-23).
 - [ ] M5.4 Context manifests (repo SHA, requirement refs, file ranges and hashes, validation results) and exact cache keyed on input hashes, tool version, configuration and policy version; no semantic reuse for edits or reviews; invalidation tests.
 - [x] M5.5 routing policy module: tier decision with confidence and downgrade rules, reviews and approval-gated steps never downgrade (PR #100, pure, not wired).
 - [ ] M5.5 wiring: log each pick and estimated cost difference, deterministic rules in dry-run mode first; add an LLM judge only if data justifies it, under its own budget and through the hardened adapter. Needs M5.1 data in real runs.
@@ -155,7 +155,7 @@ Existing base: hash, policy and expiry binding with execution-time recheck; syst
 - [ ] M7.1 STAGING adapter behind PolicyPort (blocked: transport still open); bind approvals to environment, target and exact manifest hash with recheck immediately before acting (environment binding exists as an unwired library, ADR-022, PR #148); same pattern for remote push and protected refs; production deployment stays denied.
 - [ ] M7.2 Reconciliation, not replay: intent record before every external effect, outcome after; ambiguous effects become `UNKNOWN` for an operator; authoritative smoke checks with evidence stored as artifacts.
 - [x] M7.3 Arch package: PKGBUILD, packaged user unit and runbook (PR #102, `docs/operations/arch-package.md`).
-- [ ] M7.3 Remaining operations: lingering decision, backup of database plus artifact blobs with verify and restore runbook, upgrade rehearsal and rollback guidance.
+- [x] M7.3 Remaining operations: lingering decision, blob backup with verify and restore, upgrade rehearsal and rollback guidance (this repo's #2, 2026-11-23).
 - [x] M7.4 Fault-injection tests for recovery invariants (PR #104): kill points, disk full, migrations, backup and restore.
 - [ ] M7.4 Fault-injection harness against the mock provider asserting the ten ARCHITECTURE.md §13 invariants after each scenario (worker kill, restart with parked approvals, corrupted output, lease expiry, duplicate events, disk full, lock contention). PR #107 landed the harness (`tests/invariants.py`, fault scenarios including a SIGKILLed daemon); its description lists docs, a full-suite run and a stability run as not done, so coverage of all ten invariants stays unverified.
 - [ ] M7.5 Security review and release gates: close same-user credential exposure and denied-approval auditing; choose a license (blocked: owner decision); documented threat model.
@@ -185,8 +185,8 @@ M4-A first. M4-B, the trust close-out and M5.1/M5.2 can proceed in parallel bran
 ## Open PRs (snapshot 2026-11-23, checked with `gh pr list` on the public repository)
 This repository is a single squashed snapshot (`3eb4143`). PR numbers #1-#162 quoted elsewhere in the backlog, in `AUTONOMOUS_PROGRESS.md` and in the docs belong to the earlier private history; `ticket/*` branches named before this date are not in this repository either.
 Merged here: #4 (A7b W1 per-task profiles), #6 (A7b W2 profile list, audited cooldowns, `agentctl profiles`/`profile-cooldown`), #10 (MCP IPC size-bound tests).
-- #1 M5.3 reducer wiring [B]: changes requested (a large reduction can overflow the 64 KiB summary store; independent review posted on the PR)
-- #2 M7.3 blob backup, rehearsal, lingering decision [B]: changes requested (unescaped SQLite URI path makes backup verify fail open; rehearsal rollback point in /tmp; untested claim)
-- #3 M5.4 context manifest [B], #5 M5.5 routing dry run [B]: stacked on #1, held behind it
-- #7 M7.4 invariant coverage map [B]: independent review pending
+- #1 M5.3 reducer wiring [B]: merged (after A's review found a non-ASCII clip overflow, fixed).
+- #2 M7.3 blob backup, rehearsal, lingering decision [B]: merged after fixes.
+- #3 M5.4 context manifest record [B]: merged (record only; the exact cache is not done). #5 M5.5 routing dry run [B]: open, waiting on CI. #16 M6.3 plugins [B] and #17 `agentctl events --follow` [B]: changes requested by A's review. #23 invariant 7 map [B]: approved, needs a rebase.
+- #7, #15, #19, #21 (M7.4 invariant coverage map, hardened checker, invariants 10 and 6): merged. Also merged by A today: #18 (log why a sandboxed spawn failed), #20 (`agent-worktree-commit`), #22 (`scripts/synapse_up.py`).
 - Still unstarted here: M5.6 compaction, M5.7 analytics, M3 close-out, M6.x.

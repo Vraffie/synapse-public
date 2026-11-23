@@ -104,8 +104,9 @@ injection through the controlling tty):
   resolve to `<allowlisted repo>/.git/worktrees/<name>`, otherwise the run is refused
   (`SandboxUnavailable`, fail closed). A worktree with a real `.git` directory needs no
   extra mount.
-  So repository writes inside the sandbox (commit, index refresh) fail; the daemon
-  performs those operations host-side.
+  So for a linked worktree (the normal case: the worktree manager creates only those) repository
+  writes inside the sandbox (commit, index refresh) fail; the daemon commits host-side via
+  `agent-worktree-commit`. A worktree with its own `.git` directory is writable inside the sandbox.
 - Mounted read-write: the run's worktree and the per-run scratch dir, both at their host
   paths (so the worktree's absolute `.git` pointer and the settings paths stay valid; the
   ADR sketch used `/work`). Nothing else from the host filesystem is mounted: the state

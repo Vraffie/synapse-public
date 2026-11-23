@@ -38,6 +38,8 @@ Flags: `--headless` (no window; approves through `agentctl` and prints the run s
 QT_QPA_PLATFORM=offscreen uv run --extra test --extra desktop --with-editable . python -m pytest -q
 ```
 
+For a real, sandboxed Claude run on your own repository, see [install](docs/operations/install.md) ("One-command local start") and [agent runs](docs/operations/agent-runs.md).
+
 To run the pieces by hand, see [install](docs/operations/install.md), [local API operations](docs/operations/local-api.md), [CLI](docs/operations/agentctl.md), [desktop](docs/operations/desktop.md) and [the demo](docs/operations/demo.md). The daemon must not be exposed to agents; its operator token does not establish human identity. See [progress](AUTONOMOUS_PROGRESS.md) for current validation and limitations. Do not enable real provider execution or deployment based on these partial components.
 
 ## Status and licensing

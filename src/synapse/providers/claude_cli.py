@@ -28,11 +28,13 @@ import signal
 import stat
 import subprocess
 import tempfile
+import uuid
 import threading
 import time
 from uuid import uuid4
 
 from synapse.domain.contracts import validate_id
+from synapse.infrastructure.spawn_journal import SpawnJournal
 from synapse.infrastructure.mock_process_identity import (
     ProcessIdentity, ProcessStatus, capture_mock_child, stop_mock_child_group,
 )
@@ -246,6 +248,7 @@ class _Execution:
     reaped: bool = False
     stop_status: ProcessStatus | None = None
     spawn_failed: bool = False
+    journal_key: str | None = None
     returncode: int | None = None
     streaming: bool = False
     finished: bool = False
@@ -290,13 +293,15 @@ class ClaudeCliProvider:
     optional), max_output_bytes (int, optional). One execution is one process.
     """
 
-    def __init__(self, profile: ClaudeCliProfile, *, environ: Mapping[str, str] | None = None) -> None:
+    def __init__(self, profile: ClaudeCliProfile, *, environ: Mapping[str, str] | None = None,
+                 spawn_journal: SpawnJournal | None = None) -> None:
         if not isinstance(profile, ClaudeCliProfile):
             raise TypeError("profile must be a ClaudeCliProfile")
         self._profile = profile
         self._environ = os.environ if environ is None else environ
         self._executions: dict[str, _Execution] = {}
         self._finish_counter = 0
+        self._journal = spawn_journal  # durable pid record so a restart can fence orphans (ADR 023)
 
     # --- contract surface -------------------------------------------------
     async def probe(self, profile_id: str) -> ProviderHealth:
@@ -599,6 +604,9 @@ class ClaudeCliProvider:
                 argv = [*plan.argv, "--settings", os.path.join(root, "settings.json"), *plan.tail]
                 if self._profile.sandbox:
                     argv = self._sandboxed(argv, plan, root)
+                if self._journal is not None:
+                    ex.journal_key = uuid.uuid4().hex
+                    self._journal.begin(ex.journal_key)  # intent first: cannot journal means cannot spawn
                 with open(os.path.join(root, "prompt.txt"), "rb") as stdin:
                     process = subprocess.Popen(
                         argv, cwd=plan.cwd, env=env, shell=False,
@@ -612,13 +620,16 @@ class ClaudeCliProvider:
                 _LOG.warning("agent spawn failed: %s", str(exc) if isinstance(exc, SandboxUnavailable)
                              else "%s%s" % (type(exc).__name__, " errno=%s" % exc.errno if isinstance(exc, OSError) and exc.errno else ""))
                 self._cleanup(ex)
+                self._journal_finish(ex)  # no process was created
                 ex.spawn_failed = True
                 ex.reaped = True
                 return
             ex.process = process
             try:
                 ex.identity = capture_mock_child(process)
-            except ValueError:
+                if self._journal is not None and ex.journal_key is not None:
+                    self._journal.record(ex.journal_key, ex.identity)
+            except (ValueError, OSError):
                 ex.stop_status = ProcessStatus.UNKNOWN
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
@@ -627,6 +638,8 @@ class ClaudeCliProvider:
                     pass
                 ex.reaped = True
                 self._cleanup(ex)
+                if process.returncode is not None:
+                    self._journal_finish(ex)  # killed and reaped; otherwise the entry stays for the next startup
 
     def _sandboxed(self, argv: list[str], plan: _Plan, root: str) -> list[str]:
         """Wrap the child argv in bwrap (raises SandboxUnavailable, which fails the spawn closed)."""
@@ -658,8 +671,18 @@ class ClaudeCliProvider:
             ex.returncode = ex.process.returncode
             self._close(ex)
 
+    def _journal_finish(self, ex: _Execution) -> None:
+        key, ex.journal_key = ex.journal_key, None
+        if self._journal is not None and key is not None:
+            try:
+                self._journal.finish(key)
+            except OSError:
+                _LOG.warning("spawn journal entry could not be removed; the next startup will fence it")
+
     def _close(self, ex: _Execution) -> None:
         self._cleanup(ex)
+        if ex.stop_status != ProcessStatus.UNKNOWN:  # UNKNOWN: the process may still run, keep the entry
+            self._journal_finish(ex)
         try:
             if ex.process is not None and ex.process.stdout is not None:
                 ex.process.stdout.close()
