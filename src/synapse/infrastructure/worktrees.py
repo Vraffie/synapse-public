@@ -123,7 +123,7 @@ def _git_env() -> dict[str, str]:
 _HARDEN = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
            "-c", "core.pager=cat", "-c", "gc.auto=0", "-c", "protocol.ext.allow=never",
            "-c", "core.attributesFile=/dev/null", "-c", "diff.external=",
-           "-c", "core.untrackedCache=false")
+           "-c", "core.untrackedCache=false", "-c", "core.excludesFile=/dev/null")
 # Prefix for every git call that reads a working tree: attributes come from an empty tree
 # (the work tree's .gitattributes is ignored). $GIT_DIR/info/attributes cannot be overridden
 # and is refused by ``_refuse_unsafe_repo`` instead.

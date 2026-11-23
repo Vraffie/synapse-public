@@ -151,6 +151,11 @@ session and worktree) **and** a reviewer role that is read-only and valid. Revie
 deployment verifier cannot approve anything: agents never approve, and approval decisions stay with a human
 through the separate approver token (see [approver-identity](approver-identity.md)).
 
+The engine-side enforcement lives in `synapse.orchestration.review_independence` (ADR 025): review nodes,
+identity checks (task, attempt, session, optionally profile), a verdict bound to the exact candidate SHA-256,
+and fail-closed blocking with an audit trail. It does not import this catalog. `reviewer_is_independent` stays
+as the pure catalog-level rule. A same-model reviewer is **not** model-independent; see the ADR.
+
 ## Catalog and API shape
 
 `RoleCatalog(roles, enabled)` validates every role, rejects duplicate `(id, version)` and refuses to enable an
@@ -172,7 +177,7 @@ error messages never echo the output. A valid result is exactly the `tasks` list
 ## What is not done
 
 - No engine, API, CLI or desktop wiring: roles are not yet turned into task specs, `GET /api/v1/agents` does
-  not exist, there is no desktop role picker, and the scheduler does not yet call `reviewer_is_independent`.
+  not exist, there is no desktop role picker, and the scheduler does not call `reviewer_is_independent` (the engine has its own ADR 025 review gate, which is not yet wired into the daemon).
 - The Domain roles are drafts: nothing about the real catalog layout, Catalog Validator or STAGING has been verified.
 - Prompts are untested against real models; their output contracts are guidance, not enforced schemas (only the
   planner has a strict parser).
