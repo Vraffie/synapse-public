@@ -64,6 +64,7 @@ class AgentDetailPane(QGroupBox):
     reject_clicked = Signal()
     abandon_clicked = Signal()
     remove_clicked = Signal()
+    commit_clicked = Signal()
 
     def __init__(self, parent=None):
         super().__init__("Agent", parent)
@@ -92,12 +93,13 @@ class AgentDetailPane(QGroupBox):
         self.cancel_button.setEnabled(False)
         self.abandon_button = QPushButton("Abandon recovering run…")
         self.remove_button = QPushButton("Remove worktree…")
+        self.commit_button = QPushButton("Commit changes…")
         self.op_status = QLabel("")
         self.op_status.setWordWrap(True)
-        for button in (self.abandon_button, self.remove_button):
+        for button in (self.abandon_button, self.remove_button, self.commit_button):
             button.setEnabled(False)
         ops_row = QHBoxLayout()
-        for button in (self.abandon_button, self.remove_button):
+        for button in (self.abandon_button, self.commit_button, self.remove_button):
             ops_row.addWidget(button)
         ops_row.addStretch(1)
         banner_row = QHBoxLayout()
@@ -116,6 +118,7 @@ class AgentDetailPane(QGroupBox):
         self.reject_button.clicked.connect(self.reject_clicked)
         self.abandon_button.clicked.connect(self.abandon_clicked)
         self.remove_button.clicked.connect(self.remove_clicked)
+        self.commit_button.clicked.connect(self.commit_clicked)
         self.set_awaiting_approval(False)
         self.clear()
 
@@ -132,7 +135,7 @@ class AgentDetailPane(QGroupBox):
         self.diff.setPlainText("")
         self.diff_note.setText("")
         self.cancel_button.setEnabled(False)
-        for button in (self.abandon_button, self.remove_button):
+        for button in (self.abandon_button, self.remove_button, self.commit_button):
             button.setEnabled(False)
         self.op_status.setText("")
 

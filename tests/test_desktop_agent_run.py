@@ -576,3 +576,78 @@ def test_usage_hardening(console):
     gen = c.window._active_generation
     c.window._agent_detail_error(c.window._active_run, gen, 'unavailable')
     assert pane.table.rowCount() == 0 and pane.totals.text() == ''
+
+
+# --- commit changes in a finished run's worktrees ---
+
+COMMIT_OK = {'run_id': 'run-1', 'tasks': [{'task_id': 't1', 'branch': 'synapse/run-1/t1', 'head': 'a' * 40, 'paths': ['x.py']}]}
+
+
+def _commit_console(console, monkeypatch, message='fix: it\n\nbody', script=None, state='succeeded', status='dirty'):
+    asked = []
+    monkeypatch.setattr(agent_form, 'ask_commit_message', lambda parent: asked.append(1) or message)
+    detail = dict(DETAIL, outcome='succeeded', worktree=dict(DETAIL['worktree'], status=status))
+    c = console(agent=detail, run_state=state, send_script=script if script is not None else [COMMIT_OK])
+    select(c)
+    return c, c.window.agent_pane, asked
+
+
+def test_commit_button_needs_finished_run_and_dirty_worktree(console, monkeypatch):
+    c, pane, _ = _commit_console(console, monkeypatch, state='running')
+    spin(c.app, lambda: 'succeeded' in pane.outcome.text())
+    assert not pane.commit_button.isEnabled()
+    d, pane, _ = _commit_console(console, monkeypatch, status='clean')
+    spin(d.app, lambda: pane.remove_button.isEnabled())
+    assert not pane.commit_button.isEnabled()
+    e, pane, _ = _commit_console(console, monkeypatch)
+    spin(e.app, lambda: pane.commit_button.isEnabled())
+
+
+def test_commit_cancelled_dialog_sends_nothing_and_success_shows_branch_and_short_head(console, monkeypatch):
+    c, pane, asked = _commit_console(console, monkeypatch, message=None)
+    spin(c.app, lambda: pane.commit_button.isEnabled())
+    pane.commit_button.click()
+    settle(c)
+    assert c.sent == [] and asked
+    monkeypatch.setattr(agent_form, 'ask_commit_message', lambda parent: 'fix: it\n\nbody')
+    pane.commit_button.click()
+    spin(c.app, lambda: 'synapse/run-1/t1' in pane.op_status.text())
+    text = pane.op_status.text()
+    assert 'a' * 12 in text and 'a' * 13 not in text and 'not touched' in text and 'nothing was pushed' in text
+    endpoint, kw = c.sent[0]
+    assert endpoint == '/api/v1/runs/run-1/agent-worktree-commit'
+    assert json.loads(kw['body']) == {'message': 'fix: it\n\nbody'}
+    assert kw['idempotency_key'] and kw['correlation_id']
+    c.settings.sync()
+    assert 'fix: it' not in text and (not os.path.exists(c.settings.fileName()) or 'fix: it' not in open(c.settings.fileName()).read())
+
+
+@pytest.mark.parametrize('status, expect', [(409, '409'), (422, '422'), (404, '404/503'), (500, 'failed or the response was lost')])
+def test_commit_errors_are_fixed_text_and_leak_nothing(console, monkeypatch, status, expect):
+    c, pane, _ = _commit_console(console, monkeypatch, message='my private message', script=[DaemonHTTPError(status)])
+    spin(c.app, lambda: pane.commit_button.isEnabled())
+    pane.commit_button.click()
+    spin(c.app, lambda: expect in pane.op_status.text())
+    assert 'private' not in pane.op_status.text()
+
+
+def test_commit_transport_error_and_odd_response_do_not_leak(console, monkeypatch):
+    c, pane, _ = _commit_console(console, monkeypatch, script=[OSError('secret path'), {'run_id': 'run-1', 'tasks': 'nope'}])
+    spin(c.app, lambda: pane.commit_button.isEnabled())
+    pane.commit_button.click()
+    spin(c.app, lambda: 'failed or the response was lost' in pane.op_status.text())
+    assert 'secret' not in pane.op_status.text()
+    spin(c.app, lambda: pane.commit_button.isEnabled())
+    pane.commit_button.click()
+    spin(c.app, lambda: 'unexpected response' in pane.op_status.text())
+
+
+def test_commit_busy_slot_and_message_validation(console, monkeypatch):
+    c, pane, _ = _commit_console(console, monkeypatch)
+    spin(c.app, lambda: pane.commit_button.isEnabled())
+    c.window.poller.request_agent_commit = lambda *a, **k: False
+    pane.commit_button.click()
+    assert 'Another command is in progress' in pane.op_status.text()
+    assert agent_form.valid_commit_message('  ') is None and agent_form.valid_commit_message('') is None
+    assert agent_form.valid_commit_message('x' * 2000) == 'x' * 2000 and agent_form.valid_commit_message('x' * 2001) is None
+    assert agent_form.valid_commit_message(' a\nb ') == 'a\nb'

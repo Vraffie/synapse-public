@@ -4,6 +4,7 @@ RunsMixin is mixed into MainWindow; it owns the run selection state and the widg
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from uuid import uuid4
@@ -33,6 +34,7 @@ REMOVE_TEXT = (
     "Removed: each task's git worktree directory and its branch.\n"
     "Not removed: the run, its events and its artifacts.\n"
     "If any task's worktree has uncommitted changes (including untracked files) the daemon refuses. Forced removal is not offered here.")
+COMMIT_OK = ("Committed on each task's own branch (your checkout was not touched, nothing was pushed):\n{rows}")
 _COMMON = {'unavailable': "Not available: the daemon does not know this agent run or agent runs are not configured (404/503). Nothing changed.",
            'rejected': "Refused by the daemon (422). Nothing changed.",
            'invalid': "The daemon sent an unexpected response; check the run's audit trail and refresh before retrying."}
@@ -44,6 +46,10 @@ OP_MESSAGES = {
                    failed="The request failed or the response was lost. It can be retried.",
                    conflict="Removal refused or incomplete (409): the run is not finished, or a worktree has uncommitted changes. "
                             "Some task worktrees may already have been removed; check the run's audit trail and refresh."),
+    'commit': dict(_COMMON, accepted="Committed (your checkout was not touched, nothing was pushed).",
+                   failed="The request failed or the response was lost. It can be retried.",
+                   conflict="Nothing was committed (409): there are no changes to commit, the run is not finished, or the daemon refused.",
+                   rejected="The commit message was refused (422). Nothing was committed."),
 }
 BUSY_TEXT = "Another command is in progress, try again."
 CHANGED_TEXT = "The run changed while you were confirming; nothing was sent."
@@ -72,6 +78,7 @@ class RunsMixin:
         self.agent_pane.cancel_clicked.connect(self._cancel_agent)
         self.agent_pane.abandon_clicked.connect(self._abandon_agent)
         self.agent_pane.remove_clicked.connect(self._remove_worktree)
+        self.agent_pane.commit_clicked.connect(self._commit_changes)
         self.usage_pane = UsagePane()
         self.agent_pane.approve_clicked.connect(lambda: self._agent_decide("approved"))
         self.agent_pane.reject_clicked.connect(lambda: self._agent_decide("rejected"))
@@ -163,6 +170,7 @@ class RunsMixin:
         self._agent_op_keys = {}
         self._agent_op_last = {}  # run id -> (action, outcome) of the latest finished request
         self._agent_op_pending = None  # (action, run id)
+        self._commit_rows = {}  # run id -> [(branch, short head)] of the latest commit
         self._agent_op_results = {}  # (action, run id) -> outcome
 
     def _connect_runs_poller(self):
@@ -175,6 +183,7 @@ class RunsMixin:
         self.poller.agent_started.connect(self._agent_started)
         self.poller.agent_cancel_finished.connect(self._agent_cancel_finished)
         self.poller.agent_op_finished.connect(self._agent_op_finished)
+        self.poller.agent_commit_done.connect(self._agent_commit_done)
         self.poller.agent_usage.connect(self._agent_usage_shown)
         self.poller.agent_usage_error.connect(self._agent_usage_error)
         self.poller.agent_detail.connect(self._agent_detail_shown)
@@ -260,11 +269,16 @@ class RunsMixin:
         removed = self._agent_op_results.get(('remove', run_id)) == 'accepted'
         pane.abandon_button.setEnabled(bool(recovering and idle and not abandoned))
         pane.remove_button.setEnabled(bool(finished and idle and not removed))
+        dirty = bool(detail is not None and detail.get('worktree') and detail['worktree'].get('status') == 'dirty')
+        pane.commit_button.setEnabled(bool(finished and idle and not removed and dirty))
         if self._agent_op_pending and self._agent_op_pending[1] == run_id:
             pane.op_status.setText("Sending request to the daemon…")
             return
         last = self._agent_op_last.get(run_id)
-        pane.op_status.setText(OP_MESSAGES[last[0]][last[1]] if last else "")
+        text = OP_MESSAGES[last[0]][last[1]] if last else ""
+        if last == ('commit', 'accepted') and self._commit_rows.get(run_id):
+            text = COMMIT_OK.format(rows="\n".join(f"{branch}  {head}" for branch, head in self._commit_rows[run_id]))
+        pane.op_status.setText(text)
 
     def _agent_op_key(self, action, run_id, version=None):
         return self._agent_op_keys.setdefault((action, run_id, version), str(uuid4()))
@@ -299,6 +313,27 @@ class RunsMixin:
             self._update_agent_pane()
         else:
             self.agent_pane.op_status.setText(BUSY_TEXT)
+
+    def _commit_changes(self):
+        if not self.agent_pane.commit_button.isEnabled():
+            return
+        run_id = self._active_run
+        message = agent_form.ask_commit_message(self)
+        if message is None:
+            return
+        if run_id != self._active_run or self._known_run_state not in ('succeeded', 'failed', 'cancelled'):
+            self.agent_pane.op_status.setText(CHANGED_TEXT)
+            return
+        # the key depends on a digest of the message so a lost-response retry of the same text is idempotent; the text is not kept
+        digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
+        if self.poller.request_agent_commit(run_id, self._agent_op_key('commit', run_id, digest), message):
+            self._agent_op_pending = ('commit', run_id)
+            self._update_agent_pane()
+        else:
+            self.agent_pane.op_status.setText(BUSY_TEXT)
+
+    def _agent_commit_done(self, run_id, rows):
+        self._commit_rows[run_id] = list(rows or [])
 
     def _agent_op_finished(self, action, run_id, outcome):
         if self._agent_op_pending != (action, run_id):
