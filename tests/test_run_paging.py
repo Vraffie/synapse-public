@@ -2,7 +2,9 @@
 import base64
 from contextlib import closing
 import json
+import math
 from pathlib import Path
+import sqlite3
 
 from fastapi.testclient import TestClient
 import pytest
@@ -11,7 +13,7 @@ from synapse.api.app import create_app
 from synapse.cli import __main__ as cli
 from synapse.persistence.migrations import apply_migrations, open_database
 from synapse.persistence.paging import (
-    MAX_PAGE_LIMIT, InvalidPageCursor, decode_page_cursor, encode_page_cursor, page_scope,
+    MAX_PAGE_LIMIT, InvalidPageCursor, UnpageableKey, decode_page_cursor, encode_page_cursor, page_scope,
 )
 from synapse.persistence.run_snapshot import RunNotFound, read_run_tasks
 from synapse.persistence.usage_query import read_run_usage
@@ -167,21 +169,33 @@ def test_cursor_round_trip_and_limits():
     assert decode_page_cursor(cursor, "s" * 16, 2) == ["2026-11-20T00:00:00+00:00", "0" * 36]
     with pytest.raises(InvalidPageCursor):
         decode_page_cursor(cursor, "t" * 16, 2)
-    with pytest.raises(ValueError):
-        encode_page_cursor("s", "x" * 257)
-    with pytest.raises(ValueError):  # never issue a cursor the decoder would refuse
-        encode_page_cursor("s", "\U0001F600" * 256)
+    for key in ("", "x" * 257, "\U0001F600" * 256):  # never issue a cursor the decoder would refuse
+        with pytest.raises(UnpageableKey) as info:
+            encode_page_cursor("s", key)
+        assert isinstance(info.value, InvalidPageCursor)  # typed: the API reports it as 422, never 500
+
+
+def test_unpageable_key_is_a_422_not_a_500(path):
+    with closing(open_database(path)) as db:
+        add_tasks(db, ["\U0001F600" * 256, "\U0001F601" * 256], attempts=0)
+        with pytest.raises(UnpageableKey):
+            read_run_tasks(db, "run", limit=1)
+        assert not db.in_transaction
+        assert len(read_run_tasks(db, "run")["tasks"]) == 2  # a single last page needs no cursor
+    with _client(path) as client:
+        r = client.get("/api/v1/runs/run/tasks", params={"limit": 1}, headers=HEADERS)
+    assert r.status_code == 422 and "Invalid cursor" in r.text
 
 
 # ------------------------------------------------------------------ usage reader
 def _seed_usage(db):
     add_tasks(db, ["t1", "t2"], attempts=2)
     add_tasks(db, ["f1"], run="other")
-    observe(db, "o3", "t1-a1", "2026-11-20T00:00:02+00:00", input_tokens=5, cost_usd=0.25)
+    observe(db, "o3", "t1-a1", "2026-11-20T00:00:02+00:00", input_tokens=5, cost_usd=0.1)
     observe(db, "o1", "t1-a1", "2026-11-20T00:00:01+00:00", input_tokens=1)
     observe(db, "o2", "t1-a2", "2026-11-20T00:00:01+00:00", input_tokens=2, output_tokens=0)
     observe(db, "o4", "t2-a1", "2026-11-20T00:00:03+00:00")
-    observe(db, "o5", "t2-a1", "2026-11-20T00:00:04+00:00", input_tokens=3, cost_usd=0.5)
+    observe(db, "o5", "t2-a1", "2026-11-20T00:00:04+00:00", input_tokens=3, cost_usd=0.2)
     observe(db, "f", "f1-a1", "2026-11-20T00:00:00+00:00", input_tokens=1000, cache_read_tokens=7)
 
 
@@ -201,7 +215,7 @@ def test_usage_totals_are_whole_run_on_every_page_and_only_observations_page(db)
         for key in ("run_id", "attempts_total", "attempts_with_usage", "totals", "coverage"):
             assert page[key] == unpaged[key], key
     assert unpaged["totals"] == {"input_tokens": 11, "output_tokens": 0, "cache_read_tokens": None,
-                                 "cache_write_tokens": None, "cost_usd": 0.75}
+                                 "cache_write_tokens": None, "cost_usd": math.fsum([0.1, 0.2])}
     assert unpaged["attempts_total"] == 4 and unpaged["attempts_with_usage"] == 3
     assert unpaged["coverage"]["input_tokens"] == {"known": 3, "attempts": 4}
     assert unpaged["coverage"]["output_tokens"] == {"known": 1, "attempts": 4}
@@ -210,13 +224,51 @@ def test_usage_totals_are_whole_run_on_every_page_and_only_observations_page(db)
     assert all(o4[f] is None for f in FIELDS)  # unknown stays unknown per observation, never 0
 
 
-def test_usage_totals_match_python_sum_of_all_observations(db):
+def test_usage_totals_match_exact_sums_of_all_observations(db):
     _seed_usage(db)
+    costs = [0.1, 0.2, 0.3]  # with the seeded 0.1 and 0.2: 0.9000000000000001 left to right, 0.9 exactly rounded
+    for n, cost in enumerate(costs):
+        observe(db, "c%02d" % n, "t2-a2", "2026-11-21T00:00:00+00:00", cost_usd=cost)
+    naive = 0.0
+    for cost in [0.1, 0.2, *costs]:
+        naive += cost
+    assert naive != math.fsum([0.1, 0.2, *costs])  # these values do expose a left-to-right rounding difference
     every = read_run_usage(db, "run", limit=MAX_PAGE_LIMIT)
     for field in FIELDS:
         known = [o[field] for o in every["observations"] if o[field] is not None]
-        assert every["totals"][field] == (sum(known) if known else None)
+        expected = (math.fsum(known) if field == "cost_usd" else sum(known)) if known else None
+        assert every["totals"][field] == expected and type(every["totals"][field]) is type(expected)
         assert every["coverage"][field]["known"] == len({o["attempt_id"] for o in every["observations"] if o[field] is not None})
+    # Paging never changes totals, whatever page size is used.
+    assert read_run_usage(db, "run", limit=1)["totals"] == every["totals"]
+
+
+def test_usage_token_totals_beyond_int64_stay_exact_and_do_not_fail(db):
+    """Providers accept counts up to 2**63-1; SQLite SUM() would raise "integer overflow" and 500 every page."""
+    add_tasks(db, ["t1"], attempts=2)
+    observe(db, "big1", "t1-a1", "2026-11-20T00:00:01+00:00", input_tokens=2 ** 62, output_tokens=2 ** 63 - 1)
+    observe(db, "big2", "t1-a2", "2026-11-20T00:00:02+00:00", input_tokens=2 ** 62, output_tokens=2 ** 63 - 1)
+    with pytest.raises(sqlite3.OperationalError, match="integer overflow"):  # what an SQL SUM() would do
+        db.execute("SELECT SUM(input_tokens) FROM usage_observations").fetchone()
+    for limit in (1, 200):
+        usage = read_run_usage(db, "run", limit=limit)
+        assert usage["totals"]["input_tokens"] == 2 ** 63 and type(usage["totals"]["input_tokens"]) is int
+        assert usage["totals"]["output_tokens"] == 2 * (2 ** 63 - 1)
+        assert usage["totals"]["cost_usd"] is None and usage["totals"]["cache_read_tokens"] is None
+    assert not db.in_transaction
+
+
+def test_usage_route_survives_int64_overflowing_totals(path):
+    with closing(open_database(path)) as db:
+        add_tasks(db, ["t1"], attempts=2)
+        observe(db, "big1", "t1-a1", "2026-11-20T00:00:01+00:00", input_tokens=2 ** 62)
+        observe(db, "big2", "t1-a2", "2026-11-20T00:00:02+00:00", input_tokens=2 ** 62)
+    with _client(path) as client:
+        first = client.get("/api/v1/runs/run/usage", params={"limit": 1}, headers=HEADERS)
+        assert first.status_code == 200 and first.json()["totals"]["input_tokens"] == 2 ** 63
+        second = client.get("/api/v1/runs/run/usage", params={"limit": 1, "cursor": first.json()["next_cursor"]},
+                            headers=HEADERS)
+        assert second.status_code == 200 and second.json()["totals"] == first.json()["totals"]
 
 
 def test_usage_empty_run_keeps_unknown_none_and_unknown_run_raises(db):
@@ -306,6 +358,16 @@ def test_cli_passes_limit_and_cursor_and_flags_more_pages(monkeypatch, capsys, c
     for bad in ("0", "501"):
         with pytest.raises(SystemExit):
             cli.main(["--state-dir", "/s", command, "r1", "--limit", bad])
+
+
+@pytest.mark.parametrize("command", ["tasks", "usage"])
+@pytest.mark.parametrize("cursor", ["", "c" * 1025])
+def test_cli_empty_or_oversized_cursor_is_a_usage_error(monkeypatch, command, cursor):
+    seen = []
+    monkeypatch.setattr(cli, "_request", lambda state_dir, endpoint, **kw: seen.append(endpoint) or {})
+    with pytest.raises(SystemExit) as info:
+        cli.main(["--state-dir", "/s", command, "r1", "--cursor", cursor])
+    assert info.value.code == 2 and seen == []  # never silently fetches page 1
 
 
 def test_cli_last_page_prints_no_hint(monkeypatch, capsys):

@@ -1,13 +1,16 @@
 """Opaque keyset cursors for per-run pages (run tasks, run usage observations).
 
 A cursor is base64url (no padding) of a JSON list of strings: a scope tag followed by the keyset values of the
-last row on the previous page. The scope tag is a short SHA-256 digest of the page kind and the run ID, so a
-cursor issued for one run (or for the other route) is rejected instead of being applied to a different run; the
-SQL also always filters by run, so a forged cursor can at most skip rows of the requested run, never show rows
-of another run.
+last row on the previous page. The cursor is NOT signed or encrypted: it is opaque only by convention. The scope
+tag is a short, public SHA-256 digest of the page kind and the run ID, so a cursor issued for one run (or for the
+other route) is rejected instead of being applied to a different run. Anyone can re-encode a well-formed cursor
+with the right scope and any key; that is accepted and harmless, because the SQL always filters by the requested
+run, so such a cursor can only choose where in THAT run's rows the page starts, never show rows of another run.
+Rejected (InvalidPageCursor): malformed, non-ASCII, oversized, wrong-arity or wrong-scope cursors.
 
 Keys are daemon-generated UUIDs and ISO timestamps, so issued cursors stay far below the 1024-character limit.
-``encode_page_cursor`` refuses to issue a cursor the decoder would reject rather than hand out a dead one.
+``encode_page_cursor`` refuses to issue a cursor the decoder would reject (``UnpageableKey``, which the API maps to
+422 like any cursor problem) rather than hand out a dead one or fail with a 500.
 """
 import base64
 import binascii
@@ -21,7 +24,12 @@ MAX_ITEM_LENGTH = 256
 
 
 class InvalidPageCursor(ValueError):
-    """Malformed, tampered, oversized or foreign pagination cursor."""
+    """Malformed, non-ASCII, oversized, wrong-arity or foreign (other run or route) pagination cursor."""
+
+
+class UnpageableKey(InvalidPageCursor):
+    """A row's keyset value cannot be carried in a valid cursor (empty, over 256 characters, or too long once
+    encoded). Unreachable with daemon-generated UUID keys; typed so it is reported as 422, never as a 500."""
 
 
 def check_page_limit(limit: int) -> int:
@@ -41,11 +49,11 @@ def _valid_items(items) -> bool:
 def encode_page_cursor(scope: str, *keys: str) -> str:
     items = [scope, *keys]
     if not _valid_items(items):
-        raise ValueError("Page cursor key out of range")
+        raise UnpageableKey("Page cursor key out of range")
     raw = json.dumps(items, ensure_ascii=True, separators=(",", ":")).encode("ascii")
     cursor = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
     if len(cursor) > MAX_CURSOR_LENGTH:
-        raise ValueError("Page cursor would exceed the cursor size limit")
+        raise UnpageableKey("Page cursor would exceed the cursor size limit")
     return cursor
 
 

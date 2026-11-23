@@ -153,6 +153,12 @@ def _command_header(value: str) -> str:
     return value
 
 
+def _page_cursor(value: str) -> str:
+    if not 1 <= len(value) <= 1024:
+        raise argparse.ArgumentTypeError("must be 1-1024 characters (the previous next_cursor)")
+    return value
+
+
 def _integer(minimum: int, maximum: int):
     def parse(value: str) -> int:
         try:
@@ -503,7 +509,7 @@ def main(argv: list[str] | None = None) -> int:
         query.add_argument("run_id", help="run identifier")
         if command != "run":
             query.add_argument("--limit", type=_integer(1, 500), default=200)
-            query.add_argument("--cursor", help="opaque next_cursor from the previous page")
+            query.add_argument("--cursor", type=_page_cursor, help="opaque next_cursor from the previous page")
     threads = commands.add_parser("threads", help="list one page of run threads")
     threads.add_argument("run_id", help="run identifier")
     messages = commands.add_parser("messages", help="list one page of thread messages")
@@ -591,7 +597,7 @@ def main(argv: list[str] | None = None) -> int:
         endpoint = "/api/v1/runs/" + quote(args.run_id, safe="")
         if args.command in ("tasks", "usage"):
             endpoint += "/" + args.command + "?" + urlencode(
-                {"limit": args.limit, **({"cursor": args.cursor} if args.cursor else {})})
+                {"limit": args.limit, **({"cursor": args.cursor} if args.cursor is not None else {})})
         elif args.command in ("mock-start", "mock-cancel", "mock-resume"):
             endpoint += "/" + args.command
         elif args.command in ("threads", "messages"):

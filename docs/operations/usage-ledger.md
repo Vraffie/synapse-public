@@ -57,7 +57,7 @@ new usage is recorded in between:
 ```
 
 - A field an observation did not report is `null` in that observation.
-- A total sums only the known values; if no observation knows a field, that total is `null`, not `0`.
+- A total sums only the known values; if no observation knows a field, that total is `null`, not `0`. Token totals are exact integers (no 64-bit overflow, summed in Python rather than SQLite `SUM()`); the cost total is `math.fsum` of the known costs, correctly rounded and independent of row order or SQLite version.
 - **Coverage is per field.** `coverage.<field>.known` is the number of attempts that reported that field and
   `coverage.<field>.attempts` the run's attempt count (attempts that crashed, ended `unknown` or carried no usage
   count in `attempts` and contribute nothing). A total is a **lower bound exactly when `known < attempts`** for
