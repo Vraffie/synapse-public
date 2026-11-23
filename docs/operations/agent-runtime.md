@@ -140,7 +140,8 @@ shared `recover_mock_run(provider_kind="claude")`. Nothing is re-spawned.
 ### Startup worker fence (ADR 023)
 
 Every real spawn is journaled under `<state>/spawn-journal` (intent before `Popen`, pid, start ticks and boot id right
-after, removed once reaped unless the stop status was `unknown`). Before recovery, startup fences each leftover entry:
+after, removed once reaped unless the stop status was `unknown`). The Claude and Codex providers journal identically; the
+Codex provider is not wired into the daemon yet, so daemon runs today are Claude spawns. Before recovery, startup fences each leftover entry:
 provably dead (other boot, no such pid and empty group, zombies only) or its whole process group is killed and checked
 empty. Anything it cannot prove (begin-only entry, malformed file, reused pid with a live group, a group that will not
 die) is `unverified` and is never signalled when ambiguous. Recovery then proceeds as above.

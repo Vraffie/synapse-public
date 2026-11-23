@@ -28,6 +28,12 @@ from the daemon's environment (OpenAI/Codex variables, operator tokens, ...) is 
 including the credential copy, is removed after the run. Output is read line by line with a per-line and a total
 cap; cancel and timeout send TERM to the group, then KILL after the grace period; leftover descendants are killed.
 
+Given a `spawn_journal` (ADR 023), the adapter journals each spawn exactly like the Claude adapter: intent before
+`Popen` (if it cannot be written, nothing is spawned), pid, start ticks and boot id right after, removed once reaped
+unless the stop status was `unknown`. Entries carry no prompt, argv, path or credential. Because the adapter is not
+wired into the daemon, no daemon run passes a journal to it today; the behaviour is covered by
+`tests/test_codex_spawn_journal.py`.
+
 Event mapping (schema observed on 0.170.0, see Verified): `item.completed` of an `agent_message` -> `output`;
 `item.started` of any non-message item -> `tool_use` with **the item type only** (for example
 `command_execution`; never the command line, output or paths); `turn.completed` -> success and usage

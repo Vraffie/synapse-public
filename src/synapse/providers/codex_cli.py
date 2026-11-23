@@ -37,6 +37,7 @@ from synapse.domain.contracts import validate_id
 from synapse.infrastructure.mock_process_identity import (
     ProcessIdentity, ProcessStatus, capture_mock_child, stop_mock_child_group,
 )
+from synapse.infrastructure.spawn_journal import SpawnJournal
 from synapse.providers.claude_cli import validate_worktree
 from synapse.providers.credential_sweep import write_marker
 from synapse.providers.contracts import (
@@ -206,6 +207,7 @@ class _Execution:
     usage: UsageObservation | None = None
     scratch: str | None = None  # per-run private HOME/CODEX_HOME root, removed after the run
     credentials_copy: bytes | None = None  # what was placed, to notice an in-scratch token refresh
+    journal_key: str | None = None  # spawn journal entry for this process (ADR 023)
 
 
 class CodexCliProvider:
@@ -215,11 +217,13 @@ class CodexCliProvider:
     max_output_bytes (int, optional). One execution is one process.
     """
 
-    def __init__(self, profile: CodexCliProfile, *, environ: Mapping[str, str] | None = None) -> None:
+    def __init__(self, profile: CodexCliProfile, *, environ: Mapping[str, str] | None = None,
+                 spawn_journal: SpawnJournal | None = None) -> None:
         if not isinstance(profile, CodexCliProfile):
             raise TypeError("profile must be a CodexCliProfile")
         self._profile = profile
         self._environ = os.environ if environ is None else environ
+        self._journal = spawn_journal  # durable pid record so a restart can fence orphans (ADR 023)
         self._executions: dict[str, _Execution] = {}
         self._finish_counter = 0
 
@@ -482,6 +486,9 @@ class CodexCliProvider:
                 self._check_repo_config(plan.cwd)  # re-check: the worktree may change after start()
                 root, home, codex_home = self._make_scratch(ex)
                 env = {**plan.env, "HOME": home, "CODEX_HOME": codex_home, "TMPDIR": os.path.join(root, "tmp")}
+                if self._journal is not None:
+                    ex.journal_key = uuid4().hex
+                    self._journal.begin(ex.journal_key)  # intent first: cannot journal means cannot spawn
                 with open(os.path.join(root, "prompt.txt"), "rb") as stdin:
                     process = subprocess.Popen(
                         list(plan.argv), cwd=plan.cwd, env=env, shell=False,
@@ -491,6 +498,7 @@ class CodexCliProvider:
                     )
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 self._cleanup(ex)
+                self._journal_finish(ex)  # no process was created
                 ex.spawn_failed = True
                 if isinstance(exc, RepoConfigRefused):
                     # The text can carry a repo-controlled relative path: escape control characters, cap the length.
@@ -500,7 +508,9 @@ class CodexCliProvider:
             ex.process = process
             try:
                 ex.identity = capture_mock_child(process)
-            except ValueError:
+                if self._journal is not None and ex.journal_key is not None:
+                    self._journal.record(ex.journal_key, ex.identity)
+            except (ValueError, OSError):
                 ex.stop_status = ProcessStatus.UNKNOWN
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
@@ -509,6 +519,8 @@ class CodexCliProvider:
                     pass
                 ex.reaped = True
                 self._cleanup(ex)
+                if process.returncode is not None:
+                    self._journal_finish(ex)  # killed and reaped; otherwise the entry stays for the next startup
 
     def _terminate(self, ex: _Execution) -> None:
         """TERM the group, bounded grace, KILL, reap exactly once."""
@@ -524,9 +536,19 @@ class CodexCliProvider:
             ex.returncode = ex.process.returncode
             self._close(ex)
 
+    def _journal_finish(self, ex: _Execution) -> None:
+        key, ex.journal_key = ex.journal_key, None
+        if self._journal is not None and key is not None:
+            try:
+                self._journal.finish(key)
+            except OSError:
+                _LOG.warning("spawn journal entry could not be removed; the next startup will fence it")
+
     def _close(self, ex: _Execution) -> None:
         self._note_credential_refresh(ex)
         self._cleanup(ex)
+        if ex.stop_status != ProcessStatus.UNKNOWN:  # UNKNOWN: the process may still run, keep the entry
+            self._journal_finish(ex)
         try:
             if ex.process is not None and ex.process.stdout is not None:
                 ex.process.stdout.close()
