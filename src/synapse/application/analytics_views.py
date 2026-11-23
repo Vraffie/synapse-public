@@ -136,8 +136,10 @@ class RunAnalytics:
 
 
 # ------------------------------------------------------------------ quantities
-def _count(n: int) -> Quantity:
-    """An exact count of the daemon's own records: always known, so never a lower bound."""
+def _count(n: int, ignored: int = 0) -> Quantity:
+    """A count of the daemon's own records: exact, unless a replay ignored events (then a lower bound, reduced coverage)."""
+    if ignored:
+        return Quantity(Kind.MEASURED, n, "count", "daemon_record", n, n + ignored, True)
     return Quantity(Kind.MEASURED, n, "count", "daemon_record", n, n, False)
 
 
@@ -165,10 +167,20 @@ def _usage(observations: list[dict[str, Any]], of: int) -> dict[str, Quantity]:
     return out
 
 
+_MAX_TOKENS = 2**63 - 1  # the largest integer SQLite can store; anything bigger is hostile, not a measurement
+
+
 def _clean(value: Any, name: str) -> int | float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or not math.isfinite(value):
+    """A usage value as a number, or None (unknown) for anything not a non-negative finite number. Never raises."""
+    try:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            return None
+        if name == "cost_usd":
+            value = float(value)  # OverflowError for a huge int
+            return value if math.isfinite(value) else None
+        return value if isinstance(value, int) and value <= _MAX_TOKENS else None
+    except (OverflowError, ValueError, TypeError):
         return None
-    return float(value) if name == "cost_usd" else (value if isinstance(value, int) else None)
 
 
 # ------------------------------------------------------------------ pure builder shared by both paths
@@ -193,23 +205,24 @@ def _build(run_id: str, source: str, facts: _Facts, limit: int, after: str | Non
     for o in facts.observations:
         obs_by_attempt.setdefault(o["attempt_id"], []).append(o)
 
+    reduced = facts.ignored or 0  # replay ignored events: its daemon_record counts may be missing some
+
+    def count(n: int) -> Quantity:
+        return _count(n, reduced)
+
     def mix(attempts: list[dict[str, Any]]) -> dict[str, Quantity]:
         counts: dict[str, int] = {}
         for a in attempts:
             counts[a["state"]] = counts.get(a["state"], 0) + 1
-        return {s: _count(n) for s, n in sorted(counts.items())}
+        return {s: count(n) for s, n in sorted(counts.items())}
 
     def usage_of(attempts: list[dict[str, Any]]) -> dict[str, Quantity]:
         return _usage([o for a in attempts for o in obs_by_attempt.get(a["attempt_id"], ())], len(attempts))
 
-    tasks = []
-    for task_id in sorted(by_task):
-        if after is not None and task_id <= after:
-            continue
-        group = by_task[task_id]
-        tasks.append(TaskAnalytics(task_id, _count(len(group)), _count(len(group) - 1), mix(group), usage_of(group)))
-    page = tuple(tasks[:limit])
-    next_cursor = encode_cursor(_CURSOR_MARK, page[-1].task_id) if len(tasks) > limit else None
+    remaining = [t for t in sorted(by_task) if after is None or t > after]
+    page = tuple(TaskAnalytics(t, count(len(by_task[t])), count(len(by_task[t]) - 1), mix(by_task[t]), usage_of(by_task[t]))
+                 for t in remaining[:limit])  # per-task work only for the page
+    next_cursor = encode_cursor(_CURSOR_MARK, page[-1].task_id) if len(remaining) > limit else None
 
     total_attempts = len(facts.attempts)
     estimated: dict[str, dict[str, Quantity]] = {}
@@ -227,21 +240,22 @@ def _build(run_id: str, source: str, facts: _Facts, limit: int, after: str | Non
             groups.setdefault(a["profile_id"] or "<unknown>", []).append(a)
         names = sorted(groups)
         truncated = len(names) > MAX_PROFILES
-        per_profile = {p: ProfileAnalytics(_count(len(groups[p])), usage_of(groups[p])) for p in names[:MAX_PROFILES]}
+        per_profile = {p: ProfileAnalytics(count(len(groups[p])), usage_of(groups[p])) for p in names[:MAX_PROFILES]}
 
     d = facts.deliveries
     messages = MessageAnalytics(
-        sent=_count(facts.sent),
-        deliveries_created=_count(len(d)) if facts.deliveries_known else _unknown_count(),
-        claimed=_count(sum(1 for _, c in d if c > 0)),
-        redeliveries=_count(sum(max(c - 1, 0) for _, c in d)),
-        acknowledged=_count(sum(1 for s, _ in d if s == "acknowledged")),
-        dead_lettered=_count(sum(1 for s, _ in d if s == "dead_letter")))
+        sent=count(facts.sent),
+        deliveries_created=count(len(d)) if facts.deliveries_known else _unknown_count(),
+        claimed=count(sum(1 for _, c in d if c > 0)),
+        redeliveries=count(sum(max(c - 1, 0) for _, c in d)),
+        acknowledged=count(sum(1 for s, _ in d if s == "acknowledged")),
+        dead_lettered=count(sum(1 for s, _ in d if s == "dead_letter")))
     not_repro = () if source == "tables" else NOT_REPRODUCIBLE_FROM_EVENTS
     return RunAnalytics(
-        run_id=run_id, source=source, attempts=_count(total_attempts),
-        retries=_count(sum(len(g) - 1 for g in by_task.values())), outcome_mix=mix(facts.attempts),
-        usage=usage_of(facts.attempts), attempts_with_any_usage=len({o["attempt_id"] for o in facts.observations}),
+        run_id=run_id, source=source, attempts=count(total_attempts),
+        retries=count(sum(len(g) - 1 for g in by_task.values())), outcome_mix=mix(facts.attempts),
+        usage=usage_of(facts.attempts), attempts_with_any_usage=len({o["attempt_id"] for o in facts.observations
+                                     if any(o[n] is not None for n in USAGE_FIELDS)}),
         estimated=estimated, messages=messages, tasks=page, next_cursor=next_cursor, per_profile=per_profile,
         per_profile_truncated=truncated, not_reproducible=not_repro, replay_ignored_events=facts.ignored,
         ignored_estimate_events=facts.ignored_estimates)
@@ -310,7 +324,7 @@ def read_run_analytics(connection: sqlite3.Connection, run_id: str, *, limit: in
         raise
     facts = _Facts(
         attempts=[dict(attempt_id=r[0], task_id=r[1], attempt_no=r[2], state=r[3], profile_id=r[4]) for r in attempts],
-        observations=[dict(attempt_id=r[0], **dict(zip(USAGE_FIELDS, r[1:]))) for r in obs],
+        observations=[dict(attempt_id=r[0], **{n: _clean(v, n) for n, v in zip(USAGE_FIELDS, r[1:])}) for r in obs],
         estimates=[], sent=sent, deliveries=[(r[0], r[1]) for r in deliveries], deliveries_known=True,
         profiles_known=True)
     # Estimates have no table yet (ADR 017 D3); the event is their only record, read identically on both paths.
@@ -324,8 +338,8 @@ def _estimates(payloads: list[str], attempt_ids: set[str]) -> tuple[list[dict[st
         p = _payload(raw)
         value = p.get("est_tokens")
         method = p.get("method")
-        if (p.get("attempt_id") not in attempt_ids or not isinstance(method, str) or not method
-                or isinstance(value, bool) or not isinstance(value, int) or value < 0):
+        if (not isinstance(p.get("attempt_id"), str) or p["attempt_id"] not in attempt_ids or not isinstance(method, str) or not method
+                or isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= _MAX_TOKENS):
             ignored += 1  # unattributable or malformed: counted, never summed
             continue
         out.append({"attempt_id": p["attempt_id"], "method": method, "est_tokens": value})
@@ -333,11 +347,17 @@ def _estimates(payloads: list[str], attempt_ids: set[str]) -> tuple[list[dict[st
 
 
 def _payload(raw: str) -> dict[str, Any]:
+    value = _payload_or_none(raw)
+    return {} if value is None else value
+
+
+def _payload_or_none(raw: Any) -> dict[str, Any] | None:
+    """The payload as a dict, or None when it is not valid JSON, not an object, or hostile (deep, huge). Never raises."""
     try:
         value = json.loads(raw)
-    except (TypeError, ValueError):
-        return {}
-    return value if isinstance(value, dict) else {}
+    except (TypeError, ValueError, RecursionError, OverflowError, MemoryError):
+        return None
+    return value if isinstance(value, dict) else None
 
 
 # ------------------------------------------------------------------ path 2: replay of the event log
@@ -363,6 +383,13 @@ def replay_run_analytics(connection: sqlite3.Connection, run_id: str, *, limit: 
     usage_payloads: list[tuple[str, dict[str, Any]]] = []
     estimate_payloads: list[str] = []
     for kind, aggregate_id, raw in rows:
+        if kind == "agent.usage_observed":
+            parsed = _payload_or_none(raw)
+            if parsed is None:  # unparseable, non-object or hostile: counted, never read
+                ignored += 1
+            else:
+                usage_payloads.append((aggregate_id, parsed))
+            continue
         p = _payload(raw)
         if kind == "task.attempt_reserved":
             attempt_id = p.get("attempt_id")
@@ -376,8 +403,6 @@ def replay_run_analytics(connection: sqlite3.Connection, run_id: str, *, limit: 
                 attempts[aggregate_id]["state"] = p["after"]
             else:
                 ignored += 1
-        elif kind == "agent.usage_observed":
-            usage_payloads.append((aggregate_id, p))
         elif kind == "optimization.estimated":
             estimate_payloads.append(raw)
         elif kind == "message.created":

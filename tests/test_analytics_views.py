@@ -223,3 +223,73 @@ def test_hard_caps_refuse_instead_of_truncating(populated, path, cap, monkeypatc
     with pytest.raises(AnalyticsTooLarge):
         path(populated, "run")
     assert not populated.in_transaction
+
+
+def _raw_usage_event(db, attempt, raw):
+    db.execute("INSERT INTO events(id,aggregate_type,aggregate_id,run_id,type,schema_version,payload_json,occurred_at) "
+               "VALUES(?,?,?,?,?,?,?,?)", (f"raw{db.total_changes}", "task_attempt", attempt, "run", "agent.usage_observed", 1, raw, "now"))
+
+
+@pytest.mark.parametrize("raw", ['{"input_tokens": 1' + "0" * 400 + "}", "[" * 100_000, "[1,2]", "7", "null", "not json",
+                                 '{"input_tokens": NaN, "cost_usd": Infinity}'])
+def test_hostile_usage_payload_never_raises_and_is_counted(populated, raw):
+    clean = replay_run_analytics(populated, "run")
+    _raw_usage_event(populated, "a3", raw)
+    for path in (read_run_analytics, replay_run_analytics):
+        v = path(populated, "run")  # must not raise (OverflowError / RecursionError)
+        assert v.usage["input_tokens"].value == 31
+    v = replay_run_analytics(populated, "run")
+    if raw.startswith('{"input_tokens"'):  # a parseable object: its values are unknown, the attempt contributes nothing
+        assert v.replay_ignored_events == 0 and v.attempts_with_any_usage == 2
+    else:
+        assert v.replay_ignored_events == clean.replay_ignored_events + 1
+
+
+def test_hostile_estimate_payloads_never_raise(populated):
+    for raw in ("[" * 100_000, '{"attempt_id": [], "method": "x", "est_tokens": 1}', '{"attempt_id":"a1","method":"x","est_tokens":1' + "0" * 400 + "}"):
+        populated.execute("INSERT INTO events(id,aggregate_type,aggregate_id,run_id,type,schema_version,payload_json,occurred_at) "
+                          "VALUES(?,?,?,?,?,?,?,?)", (f"e{populated.total_changes}", "task_attempt", "a1", "run", "optimization.estimated", 1, raw, "now"))
+    for path in (read_run_analytics, replay_run_analytics):
+        v = path(populated, "run")
+        assert v.ignored_estimate_events == 3 and "x" not in v.estimated
+
+
+def test_hostile_table_values_are_unknown_on_both_paths_and_paths_agree(populated):
+    # The schema has no CHECK on token columns, so a probe (or a buggy writer) can store TEXT or negatives.
+    observe(populated, "t2", "a3", "p2", input_tokens="lots", output_tokens=-5, cache_read_tokens=3, cost_usd="free")
+    tables, replay = read_run_analytics(populated, "run"), replay_run_analytics(populated, "run")
+    assert reproducibility_diff(tables, replay) == []
+    assert tables.usage == replay.usage and tables.tasks == replay.tasks
+    assert tables.usage["input_tokens"].value == 31 and tables.usage["output_tokens"].value == 7
+    assert tables.usage["cache_read_tokens"].value == 3 and tables.attempts_with_any_usage == 3
+    # Corrupt an existing row directly, the way a probe would, after dropping the append-only trigger.
+    populated.execute("DROP TRIGGER usage_observations_no_update")
+    populated.execute("UPDATE usage_observations SET input_tokens='x', cost_usd='y' WHERE attempt_id='a1'")
+    v = read_run_analytics(populated, "run")
+    assert v.usage["input_tokens"].value == 21 and v.usage["cost_usd"].value == pytest.approx(0.5)  # a1's cost is now unknown; a2's two stay
+
+
+def test_observation_with_every_field_null_is_not_counted_as_usage(populated):
+    observe(populated, "t2", "a3", "p2")  # all NULL
+    for path in (read_run_analytics, replay_run_analytics):
+        assert path(populated, "run").attempts_with_any_usage == 2
+
+
+def test_replay_counts_are_lower_bounds_when_events_were_ignored(populated):
+    healthy = replay_run_analytics(populated, "run")
+    assert healthy.attempts.lower_bound is False and healthy.attempts.known == healthy.attempts.of
+    _raw_usage_event(populated, "a1", "[" * 1000)
+    v = replay_run_analytics(populated, "run")
+    assert v.replay_ignored_events == 1
+    for q in (v.attempts, v.retries, v.messages.sent, v.messages.claimed, v.tasks[0].attempts, *v.outcome_mix.values()):
+        assert q.kind is Kind.MEASURED and q.lower_bound is True and q.known < q.of
+    assert v.attempts.value == 3  # the value itself is unchanged; only its coverage is reduced
+    assert read_run_analytics(populated, "run").attempts.lower_bound is False
+
+
+def test_task_page_computes_only_the_page(populated, monkeypatch):
+    seen = []
+    real = av._usage
+    monkeypatch.setattr(av, "_usage", lambda observations, of: seen.append(of) or real(observations, of))
+    v = read_run_analytics(populated, "run", limit=1)
+    assert [t.task_id for t in v.tasks] == ["t1"] and v.next_cursor

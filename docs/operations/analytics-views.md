@@ -24,15 +24,32 @@ missing method, a negative or non-integer `est_tokens`, or an attempt not in the
 
 As in `usage_query.py`, coverage is per field: `known` = distinct attempts that reported the field, `of` = attempts in
 scope (run, task or profile). `lower_bound` is true exactly when a value exists and `known < of`: the total omits the
-unknown attempts. An unknown total is not a lower bound (`lower_bound=False`). Counts of daemon records are exact
-(`known == of`). Cost is summed with `math.fsum` so the result does not depend on row order.
+unknown attempts. An unknown total is not a lower bound (`lower_bound=False`). On the table path, counts of daemon
+records are exact (`known == of`). On a replay that ignored events (`replay_ignored_events > 0`) they are not: every
+`daemon_record` count (attempts, retries, outcome mix, per-task counts, message counts) is reported with
+`lower_bound=True` and `of = value + replay_ignored_events` (reduced coverage: ignored events may have belonged to any of
+them). The `value` is unchanged; only the claim of exactness is withdrawn. Cost is summed with `math.fsum` so the result does not depend on row order.
 
 ## What is in a view
 
 Run level: `attempts`, `retries` (attempts beyond the first per task), `outcome_mix` (final attempt state),
-`usage` (five ledger fields), `attempts_with_any_usage`, `estimated`, and `messages`: `sent`, `deliveries_created`,
+`usage` (five ledger fields), `attempts_with_any_usage` (distinct attempts with at least one non-unknown usage field), `estimated`, and `messages`: `sent`, `deliveries_created`,
 `claimed` ("delivered": leased to a recipient at least once), `redeliveries` (claims beyond the first), `acknowledged`,
 `dead_lettered`. Per task (paged): attempts, retries, outcome mix, usage. Per profile (tables only): attempts and usage.
+
+`attempts_with_any_usage` is NOT the same as `attempts_with_usage` in `usage_query.py`: that one counts attempts having
+any observation row, including a row whose five fields are all NULL. This one counts attempts where at least one field is
+known after sanitising (below), so an all-NULL observation does not make an attempt look measured. The name is kept
+because it is a public field.
+
+## Hostile and corrupt values
+
+The schema has no CHECK on the token columns and event payloads are free-form JSON, so both paths sanitise usage values
+the same way (`_clean`) before building: anything that is not a non-negative finite number (TEXT, bytes, booleans,
+negatives, NaN/Infinity, tokens above 2^63-1, floats for token fields, a cost too large for a float) becomes unknown,
+never an error. A replay counts an `agent.usage_observed` event whose payload is not valid JSON, not an object, or too
+deep/large to parse in `replay_ignored_events`. Neither path raises on such data; estimate events are handled likewise
+(`ignored_estimate_events`).
 
 ## Reproducibility rule
 
