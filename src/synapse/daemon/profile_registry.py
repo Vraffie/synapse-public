@@ -64,6 +64,7 @@ class ProfileSpec:
     max_timeout_seconds: float = DEFAULT_MAX_TIMEOUT_SECONDS
     model: str | None = None
     permission_mode: str | None = None  # ceiling and default mode (agent-config profiles); None: no extra limit
+    claude_config_dir: str | None = None  # agent-config claude profiles: the account's config dir (path only)
 
 
 @dataclass(frozen=True, slots=True)

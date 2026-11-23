@@ -1,9 +1,9 @@
 # Agent profiles (`--agent-config`)
 
-ADR 016, wave W1, part 1 (config and registry). This adds the file and the registry plumbing. There is no API
-or router change yet: a run still executes through the single `--claude-cli-config` profile. The registry is
-used for validation (`AgentRunService.resolve_profile` / `validate(req, profile_id)`); A7b exposes `profile`
-on the API and routes execution.
+ADR 016. The file declares named profiles; a run picks one with `profile` on `POST /api/v1/agent-runs` (it
+applies to every task of the run unless a task names its own), and a claude profile can point at its own Claude
+config directory so each profile runs as a different Claude account. See
+[Three Claude accounts, one per run](#three-claude-accounts-one-per-run) for a worked setup.
 
 ## Backward compatibility
 
@@ -17,7 +17,7 @@ before. Existing receipts, specs and the built-in `synapse.builtin.agent.claude.
 the same file checks: a user-owned regular file, not a symlink, **not group/world writable**, at most 64 KiB,
 no duplicate keys, no `NaN`/`Infinity`. The file holds narrower views of the base profile; the executable,
 sandbox, repos, worktree root and approval policy always come from the base file, so the file contains no
-paths and no secrets.
+secrets and no paths other than a codex `executable` and an optional `claude_config_dir`.
 
 ```json
 {
@@ -41,6 +41,7 @@ paths and no secrets.
 | `max_timeout_seconds` | optional, above 0 and at most the base profile's value (default: the base value) |
 | `max_concurrency` | optional integer 1 to 6 (default 1); enforced by `claim_task` through the profile row |
 | `executable` | **codex only, required**: absolute, normalized path of the `codex` binary (checked to exist and be executable only when `enabled`). Refused on a claude entry |
+| `claude_config_dir` | **claude only, optional**: the Claude config directory of the account this profile runs as (the directory you would pass as `CLAUDE_CONFIG_DIR` to log in). Path only; see [Per-profile Claude config directories](#per-profile-claude-config-directories). Refused on a codex entry |
 
 Unknown keys are rejected; keys that look like credentials (`key`, `token`, `secret`, `password`,
 `credential`, `auth`) get a specific "credentials do not belong" error. At most 3 profiles can be declared
@@ -57,8 +58,8 @@ is disabled. A declared id that collides with a row not created by the registry 
 
 ## Validation
 
-`resolve_profile(id)` returns the registry profile; an unknown or disabled id is a 422 (`unknown profile`,
-`profile is disabled`). `allowed_tools`, `timeout_seconds` and `permission_mode` of every task are then
+`resolve_profile(id)` returns the registry profile; an unknown, disabled or cooling-down id is a 422 (`unknown
+profile`, `profile is disabled`, `profile is cooling down`), before any run, worktree or process exists. `allowed_tools`, `timeout_seconds` and `permission_mode` of every task are then
 checked against that profile's ceilings.
 
 ## `profile` on `POST /api/v1/agent-runs` (A7b-1)
@@ -70,7 +71,12 @@ idempotency fingerprint, so reusing a key with a different profile is a 409.
 
 A named profile's id is recorded in the task spec as `profile_id` (A7b-2) and, only when set, is part of the
 spec hash an approval binds, so default-profile specs and their hashes are unchanged. The approver subject and
-`GET /api/v1/runs/{id}/agent` show it as `profile`. Spawn-time recheck (A7b-3): before spawning a task whose spec carries a `profile_id`, the engine asks the
+`GET /api/v1/runs/{id}/agent` show it as `profile` on each task's `spec`. The run-level choice is recorded when
+the run starts, in the same transaction, as an `agent.run_profile_selected` event (aggregate `run`, ids only):
+`{run_id, profile_id, requested, task_profiles: {node: profile id}, fallback: null, principal}`. `profile_id` is
+`default` when none was named, `requested` is the named id or `null`, and `task_profiles` gives each task's
+requested profile after per-task overrides. `GET /api/v1/runs/{id}/agent` (and so `agentctl agent-show`) shows it
+as the top-level `profile` (`null` for runs started before this event existed). Spawn-time recheck (A7b-3): before spawning a task whose spec carries a `profile_id`, the engine asks the
 runtime to recheck that id against the `profiles` table (the table the registry syncs into). A missing row
 fails the task closed with detail `profile_unknown`, a row with `enabled = 0` with `profile_disabled`; no process
 is spawned, the attempt is recorded as failed and the reason appears in the agent summary. A failing or absent
@@ -105,8 +111,8 @@ A task that names a registry profile now:
   `AgentRuntime.registry` (`_resolve_profile`: the operator `--claude-cli-config` profile with the registry
   executable substituted). A named profile that cannot be resolved fails the attempt with `start_rejected` and
   **never** falls back to the default executable. Credentials, `state_dir`, sandbox and the other operator
-  settings still come from the base profile; the registry does not model them, so profiles do not (yet) isolate
-  accounts from each other. `--agent-config` currently sets every declared profile's executable to the base
+  settings still come from the base profile, except the account: a profile with `claude_config_dir` runs with
+  that directory's login and nothing else (see below); a profile without one uses the base credential handling. `--agent-config` currently sets every declared profile's executable to the base
   executable, so in the daemon the substitution is a no-op today and only the cap, budget scope, audit and
   limits above differ per profile; the registry `model` is not passed to the adapter. A `per_profile` budget written
   for the built-in profile id does not cover tasks that name a registry profile (their ledger rows carry the
@@ -141,7 +147,95 @@ A task that names a registry profile now:
   Cooldowns are in memory: a daemon restart forgets them (the audit events remain).
 
 Not done (ADR 016 later waves): `allow_fallback` and automatic fallback, `profile_id` in the run and usage
-responses, the desktop profiles panel, and Codex as a primary or fallback profile (refused by registry validation).
+responses, the desktop profiles panel and profile picker, an `agentctl agent-start --profile` flag (today the
+profile goes in the request body or in `--tasks-file` entries), and Codex as a primary or fallback profile (refused
+by registry validation).
+
+## Per-profile Claude config directories
+
+`claude_config_dir` names the Claude config directory of the account a claude profile runs as. It is a path only:
+**the daemon never opens, reads or copies a file in it.**
+
+Checks at daemon start (startup fails on any of them) and again before every spawn (the spawn is refused):
+
+- an absolute, normalized path with no symlink in it;
+- a directory owned by the daemon's user with mode `0700` or stricter (no group or other bits), checked with
+  `lstat`;
+- not the same as, inside, or containing the state dir (and its `codex-run` scratch), the Claude scratch base
+  (`<tmp>/synapse-agent-<uid>`), the `worktree_root`, any allowlisted repo, or the task's worktree;
+- distinct per profile: two profiles may not name the same directory or nested directories (one account each);
+- if `.credentials.json` exists it must be a regular file (not a symlink) owned by the user with mode `0600` or
+  stricter (`lstat` only). At spawn it must exist; there is **no fallback** to `$CLAUDE_CONFIG_DIR` or `~/.claude`,
+  and the daemon's `CLAUDE_CODE_OAUTH_TOKEN` is not passed to such a child (it would override the account): it runs
+  as its account or not at all.
+
+How the child gets the login: the child still gets the private per-run scratch `HOME`/`CLAUDE_CONFIG_DIR` (so the
+account's own `settings.json`, hooks, `CLAUDE.md`, history and MCP config are never loaded). In that scratch
+config dir, `.credentials.json` is
+
+- unsandboxed: a **symlink** to `<claude_config_dir>/.credentials.json` (the CLI follows it);
+- sandboxed (`"sandbox": true`): a **read-only single-file bind** of that file on top of a scratch placeholder.
+  Nothing else of the directory is mounted, and every other profile's directory is unmounted.
+
+Protection from agents: every registry profile's directory (for every task, including `default` ones) is added to
+the Synapse-owned `Read`/`Edit` deny rules and to the sandbox's forbidden paths, so no worktree, git dir, scratch or
+executable mount can expose one. As ADR 019 notes, a child must hold its own model credential to work, so this
+protects other profiles' accounts and the rest of the directory, not the running profile's own token from its own
+agent. Unsandboxed children run as the same OS user and can read anything that user can; use the sandbox for the
+kernel boundary.
+
+The path is never returned by the API, never written to events or audit (the `profile_sha256` in
+`agent.profile_selected` covers it), and `GET /api/v1/profiles` does not show it.
+
+Unverified against a real Claude CLI (tests use fake CLIs only): how the CLI refreshes an expiring OAuth token
+through the symlink (it may write through to the account's file, or replace the symlink in scratch, which would
+leave the account's stored refresh token stale) and under the read-only bind (a refresh cannot be written back, so
+a long run may fail once the access token expires). Log in again with that config dir if a profile stops
+authenticating.
+
+## Three Claude accounts, one per run
+
+Three accounts (`claude-work`, `claude-personal`, `claude-personal-ios`), each with its own config directory, chosen
+per run, with no automatic fallback. Paths below are placeholders.
+
+1. Log each account in once, interactively, with its own directory (outside the state dir, the worktree root and
+   the repos), and keep it private:
+
+   ```sh
+   CLAUDE_CONFIG_DIR=/path/to/claude-work-config claude          # then /login
+   chmod 700 /path/to/claude-work-config
+   chmod 600 /path/to/claude-work-config/.credentials.json
+   ```
+
+   Repeat for `/path/to/claude-personal-config` and `/path/to/claude-personal-ios-config`.
+
+2. Declare the profiles in the `--agent-config` file (three declared profiles plus the implicit `default` is the
+   registry maximum of four):
+
+   ```json
+   {
+     "profiles": [
+       {"id": "claude-work", "provider": "claude", "allowed_tools": ["Read", "Edit"],
+        "permission_mode": "acceptEdits", "enabled": true,
+        "claude_config_dir": "/path/to/claude-work-config"},
+       {"id": "claude-personal", "provider": "claude", "allowed_tools": ["Read", "Edit"],
+        "permission_mode": "acceptEdits", "enabled": true,
+        "claude_config_dir": "/path/to/claude-personal-config"},
+       {"id": "claude-personal-ios", "provider": "claude", "allowed_tools": ["Read", "Edit"],
+        "permission_mode": "acceptEdits", "enabled": true,
+        "claude_config_dir": "/path/to/claude-personal-ios-config"}
+     ]
+   }
+   ```
+
+   `allowed_tools` must be a subset of the base `--claude-cli-config` allowlist. Start `agentd` with
+   `--claude-cli-config BASE.json --agent-config PROFILES.json`; a bad directory stops startup with a fixed message
+   (the path is not echoed).
+
+3. Pick the profile per run with `"profile": "claude-personal"` in the `POST /api/v1/agent-runs` body (or per task
+   in `tasks[].profile`; `"default"` on a task opts it back to the base login). An unknown, disabled or cooling-down
+   profile is a 422 and nothing is created. A task that fails is never retried under another profile.
+   `agentctl profiles` lists them; `agentctl agent-show RUN` shows the run's `profile` and each task's `profile_id`.
 Unless every task names a profile, one run still uses the runtime-wide `max_concurrency` as the global cap.
 
 ## Codex profiles

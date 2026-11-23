@@ -117,6 +117,55 @@ def _cost(value: object) -> float | None:
     return None
 
 
+CREDENTIALS_NAME = ".credentials.json"
+
+
+def _clean_abs(value: object) -> bool:
+    return (isinstance(value, str) and "\x00" not in value and os.path.isabs(value)
+            and os.path.normpath(value) == value and value != os.sep)
+
+
+def _within(a: str, b: str) -> bool:
+    """True when a and b are the same path or one contains the other."""
+    return a == b or a.startswith(b.rstrip(os.sep) + os.sep) or b.startswith(a.rstrip(os.sep) + os.sep)
+
+
+def check_claude_config_dir(path: str, *, avoid: tuple[str, ...] = ()) -> str:
+    """Vet a per-profile Claude config dir with ``lstat`` only (no file in it is ever opened or read).
+
+    It must be a normalized absolute path without symlinks, a directory owned by the current user with mode 0700
+    or stricter (no group/other bits), and it must not be, contain or lie inside any ``avoid`` path (the state
+    dir, worktree root, repos, a worktree, the adapters' scratch bases). If ``.credentials.json`` exists it must be
+    a regular file (not a symlink) owned by the user with no group/other bits; its contents are never read.
+    Returns the credentials path. Raises ValueError with a fixed message (never the path).
+    """
+    if not _clean_abs(path) or os.path.realpath(path) != path:
+        raise ValueError("claude_config_dir must be a normalized absolute path without symlinks")
+    try:
+        info = os.lstat(path)
+    except OSError:
+        raise ValueError("claude_config_dir does not exist") from None
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError("claude_config_dir must be a directory owned by the current user with mode 0700")
+    for other in avoid:
+        if other and (_within(path, other) or _within(path, os.path.realpath(other))):
+            raise ValueError("claude_config_dir must not overlap the state directory, worktrees, repos or scratch")
+    creds = os.path.join(path, CREDENTIALS_NAME)
+    try:
+        cinfo = os.lstat(creds)
+    except FileNotFoundError:
+        return creds
+    except OSError:
+        raise ValueError("claude_config_dir credentials file cannot be inspected") from None
+    if not stat.S_ISREG(cinfo.st_mode) or cinfo.st_uid != os.getuid() or cinfo.st_mode & 0o077:
+        raise ValueError("claude_config_dir credentials must be a regular file owned by the current user, mode 0600")
+    return creds
+
+
+def claude_scratch_base() -> str:
+    return os.path.join(os.path.realpath(tempfile.gettempdir()), f"synapse-agent-{os.getuid()}")
+
+
 KEEP_FINISHED = 64  # finished executions retained for usage()/cancel() after the stream ends
 
 
@@ -154,6 +203,12 @@ class ClaudeCliProfile:
     sandbox: bool = False  # opt-in bubblewrap launcher (ADR 019 C2); fail closed, never a fallback
     sandbox_bwrap: str | None = None  # absolute bwrap path override (tests); default: fixed system dirs
     git_repos: tuple[str, ...] = ()  # operator-allowlisted repos: the only source of the sandbox's read-only .git mount
+    # Per-profile Claude config directory (``--agent-config`` ``claude_config_dir``). When set, the daemon never opens
+    # a file in it: the child reaches ``<dir>/.credentials.json`` through a symlink in its scratch config dir (or a
+    # read-only single-file bind under the sandbox), and nothing else of the directory. See check_claude_config_dir.
+    claude_config_dir: str | None = None
+    # Every profile's config dir in the registry: denied to the file tools and never mountable in the sandbox.
+    protected_config_dirs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.executable, str) or "\x00" in self.executable or not os.path.isabs(self.executable):
@@ -201,6 +256,10 @@ class ClaudeCliProfile:
         if not isinstance(self.git_repos, tuple) or any(
                 not isinstance(r, str) or "\x00" in r or not os.path.isabs(r) for r in self.git_repos):
             raise ValueError("git_repos must be a tuple of absolute paths")
+        if self.claude_config_dir is not None and not _clean_abs(self.claude_config_dir):
+            raise ValueError("claude_config_dir must be a normalized absolute path")
+        if not isinstance(self.protected_config_dirs, tuple) or not all(map(_clean_abs, self.protected_config_dirs)):
+            raise ValueError("protected_config_dirs must be a tuple of normalized absolute paths")
         if type(self.sandbox) is not bool:
             raise ValueError("sandbox must be a bool")
         if self.sandbox_bwrap is not None and (
@@ -434,6 +493,9 @@ class ClaudeCliProvider:
         )
         tail = ("--allowedTools", *p.allowed_tools)
         env = {k: self._environ[k] for k in _ENV_ALLOWLIST if k in self._environ}
+        if p.claude_config_dir is not None:
+            # The daemon-wide token would override the profile's own login: the run must be that account or nothing.
+            env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
         if p.api_key is not None:
             env["ANTHROPIC_API_KEY"] = p.api_key
         cpu = int(min(float(timeout) + p.term_grace_seconds + 60, 86_400 + 90))
@@ -491,6 +553,8 @@ class ClaudeCliProvider:
         p = self._profile
         if p.api_key is not None:
             return None
+        if p.claude_config_dir is not None:
+            return self._profile_credentials(cwd)
         src = p.credentials_file
         if src is None:
             cfg = self._environ.get("CLAUDE_CONFIG_DIR")
@@ -528,11 +592,31 @@ class ClaudeCliProvider:
             raise ValueError("credentials source is too large")
         return data
 
+    def _profile_credentials(self, cwd: str | None) -> str:
+        """The vetted ``<claude_config_dir>/.credentials.json`` path (lstat only: never opened by the daemon).
+
+        No fallback to ``$CLAUDE_CONFIG_DIR`` or ``~/.claude``: a profile that names a directory uses that account
+        or does not run. A missing credentials file refuses the spawn.
+        """
+        p = self._profile
+        avoid = (p.state_dir, claude_scratch_base(), *((cwd,) if cwd is not None else ()))
+        creds = check_claude_config_dir(p.claude_config_dir, avoid=avoid)
+        if not os.path.lexists(creds):
+            raise ValueError("claude_config_dir has no credentials file (log in with that config dir first)")
+        return creds
+
     def _place_credentials(self, config: str, cwd: str | None = None) -> None:
         src = self._credential_source(cwd)
         if src is None:
             return
-        self._write_private(os.path.join(config, ".credentials.json"), self._read_credentials(src))
+        dest = os.path.join(config, CREDENTIALS_NAME)
+        if self._profile.claude_config_dir is not None:
+            if self._profile.sandbox:
+                self._write_private(dest, b"")  # mount point for the read-only single-file bind (see _sandboxed)
+            else:
+                os.symlink(src, dest)  # the child follows it; the daemon never opens the file
+            return
+        self._write_private(dest, self._read_credentials(src))
 
     def _settings(self, root: str) -> dict:
         """Synapse-owned settings: no hooks, secret locations denied to the file tools."""
@@ -543,6 +627,7 @@ class ClaudeCliProvider:
             paths += [os.path.join(real_home, sub) for sub in _DENY_HOME_SUBDIRS]
         if cfg:
             paths.append(cfg)
+        paths += self._config_dirs()
         deny: list[str] = []
         for path in dict.fromkeys(paths):
             if not os.path.isabs(path) or re.search(r"[()\x00-\x1f*?\[\]]", path):
@@ -651,11 +736,28 @@ class ClaudeCliProvider:
         if not os.path.isfile(exe):
             raise SandboxUnavailable("sandbox executable must be an existing regular file")
         homes = sandbox_homes(self._environ.get("HOME"))
-        forbidden = [os.path.realpath(p.state_dir), *forbidden_home_paths(homes, _DENY_HOME_SUBDIRS)]
+        forbidden = [os.path.realpath(p.state_dir), *forbidden_home_paths(homes, _DENY_HOME_SUBDIRS),
+                     *self._config_dirs()]
+        ro_files = ()
+        if p.claude_config_dir is not None and p.api_key is None:
+            # Only the active profile's credentials file, read-only, on top of the scratch placeholder. The rest of
+            # its config dir and every other profile's dir stay unmounted (and forbidden to every other mount).
+            ro_files = ((self._profile_credentials(plan.cwd),
+                         os.path.join(os.path.realpath(root), "config", CREDENTIALS_NAME)),)
         return build_bwrap_argv(
             bwrap, worktree=plan.cwd, scratch=os.path.realpath(root), executable=exe,
             inner=[exe, *argv[1:]], forbidden=forbidden,
-            extra_ro_dirs=git_readonly_dirs(plan.cwd, p.git_repos), no_ancestor=homes)
+            extra_ro_dirs=git_readonly_dirs(plan.cwd, p.git_repos), no_ancestor=homes, ro_files=ro_files)
+
+    def _config_dirs(self) -> list[str]:
+        """Every registry profile's config dir (lexical and resolved): never readable by tools, never mountable."""
+        p = self._profile
+        out: list[str] = []
+        for d in (*p.protected_config_dirs, *((p.claude_config_dir,) if p.claude_config_dir else ())):
+            for path in (d, os.path.realpath(d)):
+                if path not in out:
+                    out.append(path)
+        return out
 
     def _terminate(self, ex: _Execution) -> None:
         """TERM the group, bounded grace, KILL, reap exactly once."""

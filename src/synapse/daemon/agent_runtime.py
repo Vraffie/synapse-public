@@ -70,6 +70,11 @@ class AgentRuntime:
         if type(max_concurrency) is not int or not 1 <= max_concurrency <= 6:
             raise ValueError("max_concurrency must be between 1 and 6")
         self.db = connection
+        dirs = tuple(sorted({s.claude_config_dir for s in getattr(registry, "profiles", ())
+                             if getattr(s, "claude_config_dir", None)}))
+        if profile is not None and dirs:
+            # Every child (default profile included) gets every profile's config dir denied and unmountable.
+            profile = replace(profile, protected_config_dirs=dirs)
         self.profile, self._verify, self._max_concurrency = profile, verify, max_concurrency
         self._journal = spawn_journal
         self.fence_report: FenceReport | None = None  # result of the startup fence, None until it ran
@@ -99,7 +104,7 @@ class AgentRuntime:
         return ((self._active is not None and not self._active.done())
                 or (self._cancelling is not None and not self._cancelling.done()))
 
-    def start(self, run_id: str, key: str, task_specs: dict):
+    def start(self, run_id: str, key: str, task_specs: dict, *, run_profile: str | None = None):
         """Validate, store immutably, then run the queued run's tasks with the real provider.
 
         ``task_specs`` is ``{node: {prompt, worktree, allowed_tools, permission_mode,
@@ -107,6 +112,8 @@ class AgentRuntime:
         and must name exactly the run's nodes. Raises ``AgentDisabled`` without an
         enabled operator profile and ``AgentSpecError`` (a ValueError) for any
         invalid spec, in both cases before any state change. Replays are receipts.
+        ``run_profile`` is the run-level profile the request named (None: the default); it is recorded, ids only,
+        in an ``agent.run_profile_selected`` event in the same transaction as the run's start.
         """
         validate_id(run_id)
         profile = self.profile
@@ -139,6 +146,7 @@ class AgentRuntime:
             db.execute("INSERT INTO mock_run_config(run_id,profile_id,fixture) VALUES(?,?,?)", (run_id, at.AGENT_PROFILE, ms.FIXED_KIND))
             tasks = {node: {**spec, "prompt_artifact_id": artifact_ids[node]} for node, spec in parsed.specs.items()}
             at.record_task_specs(db, run_id, tasks, parsed.prompts, artifact_ids, datetime.now(timezone.utc).isoformat())
+            self._record_run_profile(db, run_id, run_profile, parsed.specs)
             if self.budget_policy is not None:
                 bind_run(db, run_id, self.budget_policy)
             write_run_transition(db, RunChange(RunId(run_id), RunState.QUEUED, RunState.RUNNING, row[1]), principal="local-operator")
@@ -148,6 +156,19 @@ class AgentRuntime:
         if not result.replayed:
             self._launch(run_id)
         return result
+
+    @staticmethod
+    def _record_run_profile(db, run_id: str, run_profile: str | None, specs: dict) -> None:
+        """Audit the profile chosen for the run and each task's requested profile (ids only, no paths)."""
+        event = EventEnvelope.create(
+            aggregate_type="run", aggregate_id=run_id, event_type="agent.run_profile_selected",
+            payload={"run_id": run_id, "profile_id": run_profile or "default", "requested": run_profile,
+                     "task_profiles": {node: spec.get("profile_id") or "default" for node, spec in sorted(specs.items())},
+                     "fallback": None, "principal": "local-operator"})
+        db.execute("INSERT INTO events(id,aggregate_type,aggregate_id,run_id,type,schema_version,payload_json,occurred_at) "
+                   "VALUES(?,?,?,?,?,?,?,?)", (event.id, event.aggregate_type, run_id, run_id, event.event_type,
+                                               event.schema_version, encode_payload(event.payload), event.occurred_at))
+        db.execute("INSERT INTO outbox(event_id) VALUES(?)", (event.id,))
 
     def _launch(self, run_id: str) -> None:
         self._cancel_requested = None
@@ -249,7 +270,9 @@ class AgentRuntime:
                                    max_line_bytes=base.max_line_bytes, term_grace_seconds=base.term_grace_seconds)
         if spec.provider != "claude":
             raise ValueError("profile is not available")
-        return replace(self.profile, executable=spec.executable)
+        # The profile's own config dir, or None: the base credential handling. Never another profile's dir.
+        return replace(self.profile, executable=spec.executable,
+                       claude_config_dir=getattr(spec, "claude_config_dir", None))
 
     def _codex_allowed(self) -> bool:
         """Codex runs only when the base profile is explicitly unsandboxed.
