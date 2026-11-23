@@ -55,7 +55,7 @@ def stubs():
     threads = [{**THREAD, "cursor": n} for n in range(1, 8)]
     messages = [{**MESSAGE, "cursor": n} for n in range(1, 8)]
     approvals = [{**APPROVAL, "id": "a%d" % n} for n in range(1, 8)]
-    agent = {"run_id": "r1", "run_state": "running", "cancellation_requested": False, "outcome": None,
+    agent = {"run_id": "r1", "run_state": "running", "cancellation_requested": False, "attempts_resumed": 0, "outcome": None,
              "summary_text": None, "tool_names": [], "worktree": None, "tasks": []}
 
     def read_run(run_id):

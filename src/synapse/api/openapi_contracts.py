@@ -92,6 +92,7 @@ RESPONSES = {
     ("/api/v1/agent-runs", "post"): (201, _object({"run_id": STRING, "task_id": STRING, "state": {"type": "string", "const": "running"},
                                                    "worktree_path": STRING, "repo": STRING, "base_ref": STRING})),
     ("/api/v1/runs/{run_id}/agent", "get"): (200, _object({"run_id": STRING, "run_state": STRING, "cancellation_requested": {"type": "boolean"},
+                                                           "attempts_resumed": INTEGER,
                                                            "outcome": _nullable(), "summary_text": _nullable(),
                                                            "tool_names": {"type": "array", "items": STRING},
                                                            "worktree": {"anyOf": [{"type": "null"}, _object({"status": STRING, "head": STRING, "diff_stat": STRING, "diff": STRING, "truncated": {"type": "boolean"}})]},

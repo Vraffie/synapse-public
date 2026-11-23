@@ -135,7 +135,20 @@ cancellation, an `unknown` attempt is **not** discarded: such a run goes to
 
 `recover_interrupted()` (after the daemon lock is held) marks every in-flight
 attempt `unknown`, blocks its task and moves the run to `recovering` via the
-shared `recover_mock_run(provider_kind="claude")`. Nothing is re-spawned.
+shared `recover_mock_run(provider_kind="claude")`. Nothing that may have run is re-spawned.
+
+### Never-spawned attempts are re-queued (ADR 024)
+
+Right before handing an attempt to the provider, the engine commits an `attempt_spawn_marks` row (migration 0017).
+An attempt with no mark was provably never spawned. At startup, a `running` run whose only in-flight work is such
+attempts is re-driven instead of recovered: each attempt is closed `cancelled`, its task goes back to `ready`, an
+`agent.attempt_resumed` event (ids only) is written, and the next attempt is a new reservation that passes every
+normal check (profile, cooldown, per-profile concurrency, budget, approval, worktree HEAD). This needs the spawn
+journal and an `all_clear` fence, no cancellation request, at most 3 re-queues per run, and room in the task's
+attempt budget (2, so a gated task, which spends one attempt on its approval, is never re-queued). Anything with a
+mark (mark written, journal `begin`, pid recorded, mid-run, finished but not yet written) recovers exactly as
+above. A `running` run with no in-flight work at all (a crash before any claim) is re-driven the same way, with no
+event. `agent-show` reports the count as `attempts_resumed`.
 
 ### Startup worker fence (ADR 023)
 
@@ -162,7 +175,8 @@ processes. Linux `/proc` only; with the sandbox off an agent can edit these file
 - A child is started in its own session and **can outlive a daemon crash**. After a
   restart the attempt is `unknown` precisely because that process may still be
   running and editing the worktree; the operator must check before doing anything.
-- There is no operator *resume* of `recovering` agent runs (`mock-resume` is fixed-fixture only). The only
+- There is no operator *resume* of `recovering` agent runs (`mock-resume` is fixed-fixture only); only
+  provably never-spawned work is re-queued automatically, before a run ever reaches `recovering`. The only
   exit is abandonment, which fails the run; see [agent-runs](agent-runs.md#abandoning-a-recovering-run).
 - The task's own prompt and transcript may contain sensitive text; summaries are
   artifacts, not events. The prompt text is never logged.
