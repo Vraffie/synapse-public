@@ -498,8 +498,12 @@ def main(argv: list[str] | None = None) -> int:
     events.add_argument("--interval", type=float, default=1.0, help="seconds between polls when idle (--follow)")
     events.add_argument("--stop-when-idle", action="store_true", help="with --follow: exit once caught up")
     for command in ("run", "tasks", "usage"):
-        query = commands.add_parser(command, help=f"show run {command} details")
+        query = commands.add_parser(command, help=f"show run {command} details" + (
+            "" if command == "run" else " (one page; follow next_cursor with --cursor)"))
         query.add_argument("run_id", help="run identifier")
+        if command != "run":
+            query.add_argument("--limit", type=_integer(1, 500), default=200)
+            query.add_argument("--cursor", help="opaque next_cursor from the previous page")
     threads = commands.add_parser("threads", help="list one page of run threads")
     threads.add_argument("run_id", help="run identifier")
     messages = commands.add_parser("messages", help="list one page of thread messages")
@@ -586,7 +590,8 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("run ID must be a nonempty path segment up to 256 characters")
         endpoint = "/api/v1/runs/" + quote(args.run_id, safe="")
         if args.command in ("tasks", "usage"):
-            endpoint += "/" + args.command
+            endpoint += "/" + args.command + "?" + urlencode(
+                {"limit": args.limit, **({"cursor": args.cursor} if args.cursor else {})})
         elif args.command in ("mock-start", "mock-cancel", "mock-resume"):
             endpoint += "/" + args.command
         elif args.command in ("threads", "messages"):
@@ -669,6 +674,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"agentctl: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     print(json.dumps(result, ensure_ascii=False))
+    if args.command in ("tasks", "usage") and isinstance(result, dict) and result.get("next_cursor") is not None:
+        # stdout stays one JSON document; the hint that more pages exist goes to stderr so it is never missed.
+        cursor = result["next_cursor"]
+        shown = cursor if isinstance(cursor, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,1024}", cursor) else "(invalid)"
+        print(f"agentctl: more {args.command} exist; next page: --cursor {shown}", file=sys.stderr)
     return 0
 
 

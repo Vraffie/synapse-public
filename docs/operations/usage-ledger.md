@@ -37,8 +37,11 @@ should not be presented as spend. Quota is not recorded (it stays unknown; no re
 
 ## Reading it
 
-`GET /api/v1/runs/{run_id}/usage` (operator Bearer) or `agentctl usage RUN`; 404 for an unknown run. One SQLite
-read snapshot:
+`GET /api/v1/runs/{run_id}/usage` (operator Bearer) or `agentctl usage RUN [--limit N] [--cursor C]`; 404 for an
+unknown run. One SQLite read snapshot per request. `observations` is one page (`limit` 1-500, default 200, ordered
+by `(observed_at, id)`; follow `next_cursor` until it is null), while `totals`, `coverage`, `attempts_total` and
+`attempts_with_usage` are computed over the whole run on every page, so they do not change from page to page unless
+new usage is recorded in between:
 
 ```json
 {"run_id": "...", "attempts_total": 3, "attempts_with_usage": 2,
@@ -49,7 +52,8 @@ read snapshot:
             "cost_usd": 0.0131914},
  "coverage": {"input_tokens": {"known": 2, "attempts": 3}, "output_tokens": {"known": 2, "attempts": 3},
               "cache_read_tokens": {"known": 1, "attempts": 3}, "cache_write_tokens": {"known": 1, "attempts": 3},
-              "cost_usd": {"known": 1, "attempts": 3}}}
+              "cost_usd": {"known": 1, "attempts": 3}},
+ "next_cursor": null}
 ```
 
 - A field an observation did not report is `null` in that observation.
