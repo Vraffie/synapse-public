@@ -37,6 +37,9 @@ from synapse.application.routing_policy import RoutingInput
 from synapse.domain.workflow import State
 from synapse.infrastructure.artifact_blobs import ArtifactBlobStore
 from synapse.orchestration.mock_engine import MockWorkflowEngine, _RunInterrupted
+from synapse.orchestration.review_independence import (
+    REVIEW_VERIFIER_ID, ReviewGate, ReviewNode, ReviewRefused, ReviewTicket, record_review_refusal,
+    record_review_verdict, review_context)
 from synapse.persistence.budget_binding import check_claim_budget
 from synapse.persistence.agent_tasks import spec_hash
 from synapse.persistence.artifact_store import publish_artifact
@@ -192,7 +195,8 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                  profile_check: Callable[[str], str | None] | None = None,
                  profile_limits_check: Callable[[Mapping[str, Any]], str | None] | None = None,
                  raw_blobs: ArtifactBlobStore | None = None,
-                 routing_dry_run: RoutingDryRunConfig | None = RoutingDryRunConfig()):
+                 routing_dry_run: RoutingDryRunConfig | None = RoutingDryRunConfig(),
+                 review_nodes: Mapping[str, ReviewNode] | None = None):
         # max_attempts=2: a gated task spends one attempt on the approval wait.
         super().__init__(connection, router, blobs, verify, verifier_id=verifier_id,
                          max_concurrency=max_concurrency, max_attempts=2, approval_requester=approval_requester)
@@ -204,6 +208,26 @@ class AgentWorkflowEngine(MockWorkflowEngine):
         # Raw provider output may exceed the summary blob bound; same directory, larger limit.
         self._routing_dry_run = routing_dry_run  # None disables the log; it never changes what runs
         self.raw_blobs = raw_blobs if raw_blobs is not None else blobs.with_max_bytes(_PROVIDER_OUTPUT_CAP)
+        # Independent review enforcement (ADR 025); None keeps the pre-review behaviour for every task.
+        self._reviews = ReviewGate(connection, blobs, review_nodes, specs) if review_nodes else None
+
+    def _verifier_id_for(self, task_id: str) -> str:
+        """A pluggable verifier may name itself per task (e.g. evidence for opted-in nodes only)."""
+        pick = getattr(self.verify, "verifier_id_for", None)
+        return self.verifier_id if pick is None else pick(task_id)
+
+    def _block_review(self, run_id: str, task_id: str, attempt_id: str, version: int, refusal: ReviewRefused,
+                      *, before: State, ticket: ReviewTicket | None) -> None:
+        """Fail closed: the review task is BLOCKED with a distinct reason, an event and an audit row (ids only)."""
+        node = self._reviews.nodes[task_id]
+        with self._transaction():
+            self._check_running(run_id)
+            if before == State.RUNNING:
+                set_attempt(self.db, attempt_id=attempt_id, before="running", after="failed", run_id=run_id, task_id=task_id)
+            self._change(task_id, before, State.BLOCKED, version)
+            record_review_refusal(self.db, principal=self._principal, run_id=run_id, task_id=task_id,
+                                  attempt_id=attempt_id, node=node, reason=refusal.reason,
+                                  author=None if ticket is None else ticket.author)
 
     def _profile_for(self, run_id: str, task_id: str, default_profile_id: str) -> str:
         """A task that named a registry profile claims capacity under it (its own cap, ADR 016).
@@ -478,6 +502,13 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                 # Capacity, attempt row and budget were charged to another row than the one we would spawn
                 # under (e.g. the profile was disabled when the task was claimed, enabled again since).
                 problem = "profile_assignment_mismatch"
+            ticket: ReviewTicket | None = None
+            if problem is None and self._reviews is not None and task_id in self._reviews.nodes:
+                try:
+                    ticket = self._reviews.preflight(run_id, task_id, attempt_id)
+                except ReviewRefused as refusal:  # refused before any spawn
+                    self._block_review(run_id, task_id, attempt_id, version, refusal, before=State.RUNNING, ticket=None)
+                    return
             if problem is None:
                 try:
                     self._record_profile_selected(run_id, task_id, attempt_id, profile_id, spec.get("profile_id"))
@@ -487,8 +518,11 @@ class AgentWorkflowEngine(MockWorkflowEngine):
             if problem is not None:
                 terminal = ProviderEvent("failed", problem)  # refused before any spawn
             else:
+                prompt = self._prompts(task_id).decode("utf-8")
+                if ticket is not None:
+                    prompt += review_context(ticket)  # the verified candidate only, never the author transcript
                 request = ExecutionRequest(profile_id, task_id, {
-                    "prompt": self._prompts(task_id).decode("utf-8"), "worktree": spec["worktree"],
+                    "prompt": prompt, "worktree": spec["worktree"],
                     "timeout_seconds": spec["timeout_seconds"], "max_output_bytes": _PROVIDER_OUTPUT_CAP})
                 try:
                     await self.provider.execute(request, emit)
@@ -545,6 +579,8 @@ class AgentWorkflowEngine(MockWorkflowEngine):
             except Exception:
                 _LOG.exception("Could not record usage for task %s", task_id)
             if outcome != "succeeded":
+                if self._reviews is not None:
+                    self._reviews.forget(attempt_id)
                 try:
                     self._publish_summary(run_id, task_id, attempt_id, summary)
                 except Exception:
@@ -552,14 +588,31 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                 return
             artifact_id, ref = self._publish_summary(run_id, task_id, attempt_id, summary)
             candidate = self.blobs.read(ref["sha256"])
+            decision = None
+            if ticket is not None:
+                try:
+                    decision = self._reviews.evaluate(run_id, task_id, attempt_id, candidate)
+                except ReviewRefused as refusal:
+                    self._block_review(run_id, task_id, attempt_id, version + 1, refusal, before=State.VERIFYING,
+                                       ticket=ticket)
+                    return
             approved = await self.verify(task_id, candidate)
             if type(approved) is not bool:
                 raise ValueError("Verifier must return bool")
+            if decision is not None:
+                approved = approved and decision.approved  # the process check AND the bound verdict
             with self._transaction():
                 self._check_running(run_id)
                 record_verification(self.db, run_id=run_id, task_id=task_id, task_version=version + 1,
-                    candidate_sha256=ref["sha256"], artifact_id=artifact_id, verifier_id=self.verifier_id, approved=approved)
+                    candidate_sha256=ref["sha256"], artifact_id=artifact_id,
+                    verifier_id=REVIEW_VERIFIER_ID if decision is not None else self._verifier_id_for(task_id),
+                    approved=approved)
+                if decision is not None:
+                    record_review_verdict(self.db, principal=self._principal, decision=decision, approved=approved,
+                                          review_candidate_sha256=ref["sha256"])
         except BaseException as exc:
+            if self._reviews is not None:
+                self._reviews.forget(attempt_id)  # a ticket is single use; an aborted attempt never keeps one
             state = self.db.execute("SELECT state,state_version FROM tasks WHERE id=?", (task_id,)).fetchone()
             with self._transaction():
                 if state[0] == State.RUNNING:
