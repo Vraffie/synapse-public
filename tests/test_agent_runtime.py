@@ -1181,9 +1181,26 @@ def test_routing_log_failure_or_disabled_does_not_affect_the_attempt(env, monkey
     assert env.db.execute("SELECT count(*) FROM optimization_decisions").fetchone()[0] == 0
 
 
+def test_routing_log_failure_after_the_event_insert_rolls_the_whole_write_back(env):
+    # The failure is real SQL inside the same transaction: the event and outbox rows are already
+    # inserted when the decision insert aborts, so only a rollback leaves nothing behind.
+    env.db.execute("CREATE TEMP TRIGGER fail_decision BEFORE INSERT ON optimization_decisions "
+                   "BEGIN SELECT RAISE(ABORT, 'decision insert failed'); END")
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(prompt="ok"))
+        await finish(env)
+    asyncio.run(go())
+    assert env.states() == ("succeeded", {"work": "completed"}) and env.spawns() == ["ok"]
+    assert env.db.execute("SELECT count(*) FROM events WHERE type='optimization.decision_recorded'").fetchone()[0] == 0
+    assert env.db.execute("SELECT count(*) FROM outbox o JOIN events e ON e.id=o.event_id WHERE e.type='optimization.decision_recorded'").fetchone()[0] == 0
+    assert env.db.execute("SELECT count(*) FROM optimization_decisions").fetchone()[0] == 0
+    assert not env.db.in_transaction
+
+
 def test_routing_dry_run_none_disables_the_log_and_writes_nothing(env, monkeypatch):
-    from synapse.orchestration.agent_engine import AgentWorkflowEngine
-    monkeypatch.setitem(AgentWorkflowEngine.__init__.__kwdefaults__, "routing_dry_run", None)
+    import functools
+    import synapse.daemon.agent_runtime as ar
+    monkeypatch.setattr(ar, "AgentWorkflowEngine", functools.partial(ar.AgentWorkflowEngine, routing_dry_run=None))
     async def go():
         env.runtime.start(env.run_id, "s", env.specs(prompt="ok"))
         await finish(env)
