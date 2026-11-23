@@ -1,6 +1,6 @@
 # Context manifests (M5.4, record only)
 
-`synapse.application.context_manifest` builds and records what the daemon assembled for one agent attempt (ADR 017 D5). It is a **record**, not a gate: nothing about what an agent is given, or whether it runs, depends on it. It exists so a later exact cache and the analytics views can bind to an exact input set. No cache exists yet (second half of M5.4).
+`synapse.application.context_manifest` builds and records what the daemon assembled for one agent attempt (ADR 017 D5). It is a **record**, not a gate: nothing about what an agent is given, or whether it runs, depends on it. It exists so a later exact cache and the analytics views can bind to an exact input set. No cache exists yet: the key and cacheability rules are in [exact-cache-key](exact-cache-key.md) (M5.4 cache 1/2, no storage).
 
 ## What is recorded
 
@@ -21,5 +21,5 @@ The manifest hash is the SHA-256 of sorted-key compact JSON (`canonical_request_
 ## Not done yet
 
 - **No immutability triggers or unique index** on `context_manifests`. They need a migration (ADR 017 asks for the 0012/0014 pattern). Migration numbering has to be agreed with A first, because the loader requires contiguous numbers. Until then immutability is enforced only by `record_manifest`, not by the database.
-- The exact result cache (`result_cache`, `cache.lookup`/`cache.stored` events, invalidation tests) is the second half of M5.4.
+- The exact result cache storage (`result_cache`, `cache.lookup`/`cache.stored` events, stored-entry invalidation) is M5.4 cache 2/2; the key and rules exist ([exact-cache-key](exact-cache-key.md)).
 - Manifest-driven prompt changes and deduplication: none. Manifests do not change what is sent.
