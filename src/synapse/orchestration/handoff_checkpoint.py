@@ -18,7 +18,6 @@ from dataclasses import dataclass
 import hashlib
 import json
 import re
-import unicodedata
 from typing import Any
 
 SCHEMA_VERSION = 1
@@ -74,7 +73,9 @@ def _clean_text(v: object, limit: int) -> bool:
         return False
     if "<<<" in v or ">>>" in v:
         return False
-    return all(unicodedata.category(c) not in ("Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp") for c in v)
+    # Explicit allowlist (ASCII printable, U+0020..U+007E): independent of any Unicode database, so the
+    # accept/reject decision is identical on every Python version and interpreter.
+    return all(" " <= c <= "~" for c in v)
 
 
 def _int(v: object) -> bool:
@@ -167,6 +168,8 @@ def build_checkpoint(
         raw = {"hard_requirements": hard_requirements, "unresolved_issues": unresolved_issues, "decisions": decisions}
         items = {n: _check_items(n, raw[n], cites) for n in _CATEGORIES}
         ids = [i["id"] for n in _CATEGORIES for i in items[n]]
+        if not ids:
+            raise _Reject("empty_checkpoint")  # compacting to nothing must never look like a handoff
         if len(set(ids)) != len(ids):
             raise _Reject("invalid_input", "id")
 
@@ -205,6 +208,9 @@ class TriggerDecision:
     used_tokens: int | None = None
     context_limit: int | None = None
     ratio_bp: int | None = None
+    # True when some token count was unknown, so used_tokens only counts the known parts and the real
+    # usage is >= used_tokens. Never True together with a "none" action.
+    used_is_lower_bound: bool = False
 
 
 def _count(v: object) -> bool:
@@ -213,8 +219,9 @@ def _count(v: object) -> bool:
 
 def should_checkpoint(usage: object, context_limit: object, policy: TriggerPolicy | None = None) -> TriggerDecision:
     """``usage`` is ``(input_tokens, output_tokens)`` with ``None`` for unknown (the shape of
-    ``UsageObservation``). ``context_limit=None`` means unknown and is never guessed. Unknown output
-    tokens make usage a lower bound: it can still trigger, but cannot prove "none"."""
+    ``UsageObservation``). ``context_limit=None`` means unknown and is never guessed. Any unknown
+    count (input or output) makes usage a lower bound (``used_is_lower_bound=True``): it can still
+    trigger, since real usage is only higher, but never yields "none"."""
     try:
         policy = policy or TriggerPolicy()
         if (type(policy) is not TriggerPolicy or type(policy.recommend_bp) is not int
@@ -226,19 +233,25 @@ def should_checkpoint(usage: object, context_limit: object, policy: TriggerPolic
         if (inp is not None and not _count(inp)) or (out is not None and not _count(out)):
             return TriggerDecision("invalid", "invalid_usage")
         if context_limit is None:
-            return TriggerDecision("unknown_limit", "context_limit unknown; no limit is guessed", None if inp is None else inp + (out or 0))
+            known = inp is not None or out is not None
+            return TriggerDecision("unknown_limit", "context_limit unknown; no limit is guessed",
+                                   (inp or 0) + (out or 0) if known else None,
+                                   used_is_lower_bound=known and (inp is None or out is None))
         if type(context_limit) is not int or not 0 < context_limit <= 10**12:
             return TriggerDecision("invalid", "invalid_context_limit")
-        if inp is None:
-            return TriggerDecision("unknown_usage", "input_tokens unknown", None, context_limit)
-        used = inp + (out or 0)
+        if inp is None and out is None:
+            return TriggerDecision("unknown_usage", "input_tokens and output_tokens unknown", None, context_limit)
+        lower = inp is None or out is None
+        used = (inp or 0) + (out or 0)
         ratio = used * 10000 // context_limit
         if used * 10000 >= context_limit * policy.require_bp:
-            return TriggerDecision("required", "at_or_above_require_threshold", used, context_limit, ratio)
+            return TriggerDecision("required", "at_or_above_require_threshold", used, context_limit, ratio, lower)
         if used * 10000 >= context_limit * policy.recommend_bp:
-            return TriggerDecision("recommended", "at_or_above_recommend_threshold", used, context_limit, ratio)
+            return TriggerDecision("recommended", "at_or_above_recommend_threshold", used, context_limit, ratio, lower)
+        if inp is None:
+            return TriggerDecision("unknown_usage", "input_tokens unknown; usage is a lower bound", used, context_limit, ratio, True)
         if out is None:
-            return TriggerDecision("unknown_usage", "output_tokens unknown; usage is a lower bound", used, context_limit, ratio)
+            return TriggerDecision("unknown_usage", "output_tokens unknown; usage is a lower bound", used, context_limit, ratio, True)
         return TriggerDecision("none", "below_thresholds", used, context_limit, ratio)
     except Exception:
         return TriggerDecision("invalid", "malformed_input")

@@ -74,16 +74,89 @@ def test_hard_requirements_never_dropped_at_boundary():
 
 
 def test_exact_boundary_fits_and_one_byte_less_fails():
-    hard = [item(1)]
-    r = build(hard_requirements=hard, unresolved_issues=[], decisions=[])
-    n = len(r.canonical_json)
     # policy minimum is 256, so pad hard requirements until the document is above it
     hard = [item(i, label="z" * 100) for i in range(5)]
     r = build(hard_requirements=hard, unresolved_issues=[], decisions=[])
     n = len(r.canonical_json)
+    assert n > 256
     assert isinstance(build(hard_requirements=hard, unresolved_issues=[], decisions=[], policy=CheckpointPolicy(n)), CheckpointBuilt)
     out = build(hard_requirements=hard, unresolved_issues=[], decisions=[], policy=CheckpointPolicy(n - 1))
     assert out == CheckpointRejected("hard_requirements_exceed_bound")
+
+
+def _digest(ids):
+    return hashlib.sha256("\n".join(sorted(ids)).encode("ascii")).hexdigest()
+
+
+def test_omitted_digest_value_stable_and_shuffle_independent():
+    unres = [item(i, "u", label="y" * 150) for i in range(60)]
+    hard = [item(i, label="x" * 150) for i in range(40)]
+    base = build(hard_requirements=hard, unresolved_issues=unres, decisions=[])
+    kept = {i["id"] for i in base.checkpoint["unresolved_issues"]}
+    omitted = [i["id"] for i in unres if i["id"] not in kept]
+    assert omitted and base.checkpoint["omitted_count"] == len(omitted)
+    assert base.checkpoint["omitted_digest"] == _digest(omitted)
+    rng = random.Random(7)
+    for _ in range(3):
+        u = unres[:]
+        rng.shuffle(u)
+        assert build(hard_requirements=hard, unresolved_issues=u, decisions=[]).checkpoint["omitted_digest"] == base.checkpoint["omitted_digest"]
+    # nothing omitted: digest of the empty list
+    full = build()
+    assert full.complete and full.checkpoint["omitted_count"] == 0
+    assert full.checkpoint["omitted_digest"] == _digest([])
+
+
+def test_citations_not_referenced_by_kept_items_are_pruned():
+    cites = [cite(1), cite(2), cite(3)]
+    r = build(citations=cites, hard_requirements=[item(1, cites=("c1",))],
+              unresolved_issues=[item(1, "u", cites=("c1",))], decisions=[item(1, "d", cites=("c1",))])
+    assert r.complete and [c["id"] for c in r.checkpoint["citations"]] == ["c1"]
+    # a citation used only by an omitted item is pruned too
+    unres = [item(i, "u", label="y" * 150, cites=("c2",)) for i in range(60)]
+    hard = [item(i, label="x" * 150) for i in range(40)]
+    r = build(citations=cites, hard_requirements=hard, unresolved_issues=unres, decisions=[])
+    assert not r.complete
+    kept_refs = {c for i in r.checkpoint["unresolved_issues"] for c in i["citations"]}
+    assert [c["id"] for c in r.checkpoint["citations"]] == sorted({"c1"} | kept_refs)
+    assert all(i["citations"] == ["c1"] for i in r.checkpoint["hard_requirements"])
+
+
+def test_prefix_rule_stops_at_first_misfit_across_unresolved_to_decisions_boundary():
+    tiny = lambda i, p: item(i, p, label="x")
+    # Size limit that holds hard + u001 but leaves little more than ~60 bytes of slack.
+    base = build(unresolved_issues=[tiny(1, "u")], decisions=[])
+    limit = len(base.canonical_json) + 60
+    pol = CheckpointPolicy(limit)
+    # A tiny decision alone would fit...
+    assert build(unresolved_issues=[tiny(1, "u")], decisions=[tiny(1, "d")], policy=pol).complete
+    # ...but after a too-big unresolved issue (u002) it is NOT added: adding stops at the first misfit.
+    big_u = item(2, "u", label="y" * 150)
+    r = build(unresolved_issues=[tiny(1, "u"), big_u], decisions=[tiny(1, "d")], policy=pol)
+    assert not r.complete
+    assert [i["id"] for i in r.checkpoint["unresolved_issues"]] == ["u001"]
+    assert r.checkpoint["decisions"] == []
+    assert r.checkpoint["omitted_count"] == 2 and r.checkpoint["omitted_digest"] == _digest(["u002", "d001"])
+    # Within decisions: a big d001 stops a tiny d002 that would have fit.
+    r = build(unresolved_issues=[tiny(1, "u")], decisions=[item(1, "d", label="z" * 150), tiny(2, "d")], policy=pol)
+    assert [i["id"] for i in r.checkpoint["unresolved_issues"]] == ["u001"] and r.checkpoint["decisions"] == []
+    assert r.checkpoint["omitted_count"] == 2
+    assert len(r.canonical_json) <= limit
+
+
+def test_all_empty_input_is_rejected_not_a_successful_handoff():
+    assert build(hard_requirements=[], unresolved_issues=[], decisions=[]) == CheckpointRejected("empty_checkpoint")
+    assert build(hard_requirements=[], unresolved_issues=[], decisions=[], citations=[]) == CheckpointRejected("empty_checkpoint")
+    assert isinstance(build(hard_requirements=[], unresolved_issues=[item(1, "u")], decisions=[]), CheckpointBuilt)
+
+
+def test_label_allowlist_is_ascii_printable_and_version_independent():
+    # Unassigned, as of any Python: U+0378. Plus other non-ASCII that must be rejected on every version.
+    for bad in ("a\u0378b", "caf\u00e9", "a\u00a0b", "a\u2028b", "\U0010ffff", "a\x7fb", "a\tb"):
+        assert build(hard_requirements=[item(1, label=bad)]) == CheckpointRejected("invalid_input", "hard_requirements.label")
+    every = "".join(chr(c) for c in range(0x20, 0x7F))
+    assert every.strip() != "" and isinstance(build(hard_requirements=[item(1, label=every.strip().replace("<<<", "").replace(">>>", ""))]), CheckpointBuilt)
+    assert "unicodedata" not in inspect.getsource(hc)
 
 
 def test_oversize_hard_requirements_explicit_failure():
@@ -163,6 +236,33 @@ def test_output_tokens_counted_and_unknown_output_is_lower_bound():
     assert should_checkpoint((100, None), 10_000).action == "unknown_usage"
     assert should_checkpoint((9500, None), 10_000).action == "required"
     assert should_checkpoint((None, 5), 10_000).action == "unknown_usage"
+    assert should_checkpoint((None, None), 10_000) == hc.TriggerDecision("unknown_usage", "input_tokens and output_tokens unknown", None, 10_000)
+
+
+def test_lower_bound_flag_set_whenever_a_count_is_unknown():
+    d = should_checkpoint((9500, None), 10_000)
+    assert (d.action, d.used_tokens, d.ratio_bp, d.used_is_lower_bound) == ("required", 9500, 9500, True)
+    d = should_checkpoint((100, None), 10_000)
+    assert d.action == "unknown_usage" and d.used_tokens == 100 and d.used_is_lower_bound
+    d = should_checkpoint((9500, None), None)
+    assert d.action == "unknown_limit" and d.used_tokens == 9500 and d.used_is_lower_bound
+    assert not should_checkpoint((9500, 0), None).used_is_lower_bound
+    assert not should_checkpoint((9500, 0), 10_000).used_is_lower_bound
+    assert not should_checkpoint((1, 0), 10_000).used_is_lower_bound
+    # never "none" while a count is unknown
+    for usage in ((0, None), (None, 0), (None, None), (1, None), (None, 1)):
+        assert should_checkpoint(usage, 10_000).action != "none"
+
+
+def test_unknown_input_with_known_output_triggers_as_lower_bound():
+    d = should_checkpoint((None, 9000), 10_000)
+    assert (d.action, d.used_tokens, d.ratio_bp, d.used_is_lower_bound) == ("required", 9000, 9000, True)
+    d = should_checkpoint((None, 7500), 10_000)
+    assert d.action == "recommended" and d.used_is_lower_bound
+    d = should_checkpoint((None, 7499), 10_000)
+    assert d.action == "unknown_usage" and d.used_tokens == 7499 and d.used_is_lower_bound
+    # symmetric with unknown output
+    assert should_checkpoint((9000, None), 10_000).action == should_checkpoint((None, 9000), 10_000).action
 
 
 def test_custom_policy_and_invalid_inputs():
