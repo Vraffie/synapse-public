@@ -33,13 +33,14 @@ paths and no secrets.
 | key | rule |
 | --- | --- |
 | `id` | required, `[A-Za-z0-9._-]{1,64}`, unique; `default` and the `synapse.builtin.` prefix are reserved |
-| `provider` | required, `claude` only. `codex` is refused with "disabled until W3" |
+| `provider` | required, `claude` or `codex`. A `codex` profile is described in [Codex profiles](#codex-profiles) |
 | `allowed_tools` | required, 1 to 64 unique tool names, a **subset** of the base allowlist (the ceiling) |
 | `permission_mode` | required, one of `plan`, `manual`, `acceptEdits`, `dontAsk`. The most privileged mode a task may ask for (ranked in that order) and the default when the request gives none. `bypassPermissions` is never allowed |
 | `enabled` | required boolean; a disabled profile is refused at validation |
 | `model` | optional alias, `[A-Za-z0-9._:-]{1,64}`. Recorded only for now (the router will pass it in A7b) |
 | `max_timeout_seconds` | optional, above 0 and at most the base profile's value (default: the base value) |
 | `max_concurrency` | optional integer 1 to 6 (default 1); enforced by `claim_task` through the profile row |
+| `executable` | **codex only, required**: absolute, normalized path of the `codex` binary (checked to exist and be executable only when `enabled`). Refused on a claude entry |
 
 Unknown keys are rejected; keys that look like credentials (`key`, `token`, `secret`, `password`,
 `credential`, `auth`) get a specific "credentials do not belong" error. At most 3 profiles can be declared
@@ -74,7 +75,8 @@ runtime to recheck that id against the `profiles` table (the table the registry 
 fails the task closed with detail `profile_unknown`, a row with `enabled = 0` with `profile_disabled`; no process
 is spawned, the attempt is recorded as failed and the reason appears in the agent summary. A failing or absent
 check fails closed too (`profile_check_failed`, `profile_check_unavailable`). The row must also be registry-owned
-(`provider = 'claude'` and `config_ref` starting `registry:`), otherwise the task fails with `profile_not_registry`, so the
+(`provider` `claude` or `codex` and `config_ref` starting `registry:`; the row's provider must also match the
+registry entry, else `profile_provider_mismatch`), otherwise the task fails with `profile_not_registry`, so the
 built-in agent row or a mock profile id cannot satisfy a named `profile_id`; any other checker result is refused as
 `profile_check_invalid`. A gated task refused this way ends `failed` with its approval consumed and nothing spawned
 (the same as a worktree refusal). In `__main__.py`, `recover_interrupted()` runs before `sync_profiles` but never spawns,
@@ -139,13 +141,53 @@ A task that names a registry profile now:
   Cooldowns are in memory: a daemon restart forgets them (the audit events remain).
 
 Not done (ADR 016 later waves): `allow_fallback` and automatic fallback, `profile_id` in the run and usage
-responses, the desktop profiles panel, and Codex as a primary or fallback profile.
+responses, the desktop profiles panel, and Codex as a primary or fallback profile (refused by registry validation).
 Unless every task names a profile, one run still uses the runtime-wide `max_concurrency` as the global cap.
+
+## Codex profiles
+
+A `codex` entry (ADR 016 decision 4) makes the [Codex adapter](codex-cli-provider.md) available to tasks that
+**name** it; it is never the primary or a fallback (registry validation refuses both, and `default` is always the
+primary), so nothing moves a task from Claude to Codex or back. Codex stays off unless the operator declares an entry
+with `"enabled": true`.
+
+```json
+{"profiles": [
+  {"id": "codex-edit", "provider": "codex", "executable": "/usr/local/bin/codex",
+   "allowed_tools": ["Read", "Glob", "Grep", "Edit", "Write"], "permission_mode": "acceptEdits", "enabled": true}
+]}
+```
+
+- **Restriction model.** Codex has no tool allowlist. A task's `allowed_tools` and `permission_mode` only select a
+  sandbox through a fixed table: `plan` -> `-s read-only`; `acceptEdits` -> `-s workspace-write` when `Edit` or
+  `Write` is requested, else `read-only`. Inside either sandbox the agent can run **any shell command**; the list is
+  not a tool restriction, it is stored verbatim (and bound by an approval) only because it is what was asked for.
+- **Eligibility (422 at validation, `codex_ineligible` at spawn).** Every tool must be one of `Read`, `Glob`,
+  `Grep`, `Edit`, `Write` (any `Bash(...)` pattern or other tool is refused, never widened); `dontAsk` and `manual`
+  are refused (no Codex equivalent); `Edit`/`Write` with `plan` is refused. The entry's own `allowed_tools` /
+  `permission_mode` ceiling must pass the same rule at startup. The tools must also be in the base allowlist.
+- **What the entry cannot set.** No `model` (refused: `CodexCliProfile` has none, so `agent.profile_selected`
+  records `model: null`), no extra arguments, no state dir (the daemon's own state dir is used, so the startup
+  credential sweep covers `codex-run/` scratch dirs), no credentials. The adapter copies `$CODEX_HOME/auth.json`, else
+  `~/.codex/auth.json` of the daemon's user, into a per-run scratch `CODEX_HOME` at `0600` and removes it afterwards.
+- **Base profile still required.** Agent runs, repos, worktrees, the approval policy, the resource limits
+  (`memory_limit_bytes` and output caps) and the same-user acknowledgement come from the enabled
+  `--claude-cli-config` base, so a Codex task needs it enabled (and with `"sandbox": false`, see above).
+- **Unsandboxed.** **Codex runs unsandboxed by Synapse.** Synapse does not wrap the Codex child in bwrap; the only confinement is Codex's own `-s read-only` / `-s workspace-write`, and `read-only` does not confine reads. A Codex child can therefore read anything the daemon's user can: `approver.token` and `operator.token` in the state dir (so it can approve its own gated requests), the SQLite database, `agentd.sock`, and the user's other credentials. For that reason a codex profile is **refused** (startup error, and `codex_ineligible`/422 as backstops) whenever the `--claude-cli-config` base has `"sandbox": true`: it would silently get less isolation than every Claude child. Codex is only available with the base sandbox off and `--allow-same-user-agents` acknowledged; the startup warning and the `agent_runtime.same_user_acknowledged` audit row then record `codex_unsandboxed: true`.
+- **Same trust domain.** The Codex child runs as the daemon's OS user. `read-only` is not known to confine reads,
+  and the scratch `auth.json` is readable by the agent for the run's duration (see the adapter doc).
+- **No fallback after a refusal.** A spawn refusal (for example a worktree with `AGENTS.md`) fails the attempt with
+  `start_rejected`; an `unknown` outcome blocks the task. Neither re-runs the task on Claude or on another profile.
+- **Health.** `AgentRuntime.probe_profile(id)` runs only `codex --version` (no agent, no worktree, no credential
+  copy): `healthy` for a verified version, `unverified_version` for another parseable one, `unavailable` when
+  disabled, missing or unparseable. No API surface calls it yet.
+- **Unverified Codex version.** **Version gate at spawn.** Before every Codex spawn the router checks `codex --version` (run off the event loop and cached per executable realpath, device, inode, size, mtime and ctime, at most 16 entries; a successful result is kept while that identity holds, a failed one for 30 s, so a transient failure is retried. The key is the configured executable: if it is a wrapper script, a change to what the wrapper execs is not noticed until the wrapper itself changes). The `/tmp`/`$TMPDIR` exclusion of `workspace-write` relies on `-c sandbox_workspace_write.*` keys verified only on `VERIFIED_CLI_VERSIONS` (`0.170.0`), and a newer Codex could silently ignore a renamed key, so a task that would run `workspace-write` on any other (or unparseable) version is refused before spawning with detail `codex_ineligible`. A `read-only` task still runs on an unverified version, and each such spawn logs a warning naming the task, the profile and the parsed version (digits and dots only, otherwise `unknown`). Updating Codex therefore disables Codex edits until the new version is verified and added to `VERIFIED_CLI_VERSIONS`. **Probe failure** (the binary is missing, exits non-zero, prints no parseable `codex-cli X.Y.Z`, times out after 10 s, or the check itself errors) counts as *no version*: exactly like an unverified version, a `workspace-write` task is refused with `codex_ineligible` and nothing is spawned, while a `read-only` task still runs and its spawn logs the version as `unknown`. A probe failure never fails a task as `start_rejected` by itself and never affects Claude tasks.
+- **Provider of an id is fixed.** `sync_profiles` refuses to turn an existing claude id into a codex one (or back);
+  attempts and usage rows keep pointing at the provider they ran under.
 
 ## Not in this part
 
-Codex (stays disabled; W3), fallback selection,
-per-attempt `agent.profile_selected` events and router construction per profile (A7b-2).
+Fallback selection and `allow_fallback`; Codex as primary/fallback; a probe API surface.
 
 ## Effective profile in run views
 

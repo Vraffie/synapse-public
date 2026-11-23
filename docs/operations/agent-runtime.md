@@ -3,7 +3,8 @@
 > **Security limit (read first).** Against code running as the same OS user as the daemon (including any agent child), approvals are **not** a security boundary: that code can read `approver.token` and `operator.token` and write the SQLite file directly, so it can forge or delete approvals and audit rows. The checks described here catch mistakes and honest components, not a hostile same-user process. See the [security review](../security/review-2026-11-20.md) (F1, F2). The daemon refuses to enable agent runs unless the operator passes `--allow-same-user-agents`.
 
 `synapse.daemon.agent_runtime.AgentRuntime` runs a queued run's tasks with the
-real `ClaudeCliProvider` through the same claim / attempt / approval-gate
+real `ClaudeCliProvider` (or, for a task that names a Codex profile, the
+`CodexCliProvider`; see below) through the same claim / attempt / approval-gate
 machinery as the mock path. Operators reach it through the HTTP/CLI surface described in [agent-runs](agent-runs.md); a caller in
 the daemon process invokes `start(run_id, key, task_specs)`, `cancel(run_id,
 key)`, and the daemon calls `recover_interrupted()` / `resume_parked()`.
@@ -54,6 +55,16 @@ re-supplied.
 run completion are shared) and replaces only the provider step. A narrowed
 tool list / permission mode is applied by building a `ClaudeCliProvider` per
 combination with `dataclasses.replace` on the operator profile (re-validated).
+
+`AgentProviderRouter` caches one provider per `(profile_id, allowed_tools, permission_mode)`. A task that names a
+`codex` registry profile ([agent profiles](agent-profiles.md#codex-profiles)) gets a `CodexCliProvider` instead: the
+registry executable, the daemon's state dir, the daemon's spawn journal and a sandbox derived from a fixed table
+(`plan` -> `read-only`; `acceptEdits` -> `workspace-write` iff `Edit`/`Write` is requested). Tools outside `Read`,
+`Glob`, `Grep`, `Edit`, `Write`, the modes `dontAsk`/`manual`, and `Edit`/`Write` with `plan` make the task ineligible
+(422 at the API, `codex_ineligible` before any spawn for a recorded spec). For Codex the tool list is **not** a tool
+restriction, only a sandbox selector. A task that names no profile never runs on Codex, a Codex spawn refusal is
+`start_rejected` and an `unknown` Codex outcome blocks the task: neither falls back to Claude or another profile.
+`agent.profile_selected` records `provider: "codex"` and `model: null`.
 
 | provider terminal event | attempt | task |
 | --- | --- | --- |
@@ -135,13 +146,14 @@ cancellation, an `unknown` attempt is **not** discarded: such a run goes to
 
 `recover_interrupted()` (after the daemon lock is held) marks every in-flight
 attempt `unknown`, blocks its task and moves the run to `recovering` via the
-shared `recover_mock_run(provider_kind="claude")`. Nothing is re-spawned.
+shared `recover_mock_run(provider_kind={"claude", "codex"})`: attempts of both real providers are reconciled the
+same way; a mock-profile or profile-less attempt still refuses the whole recovery. Nothing is re-spawned.
 
 ### Startup worker fence (ADR 023)
 
 Every real spawn is journaled under `<state>/spawn-journal` (intent before `Popen`, pid, start ticks and boot id right
-after, removed once reaped unless the stop status was `unknown`). The Claude and Codex providers journal identically; the
-Codex provider is not wired into the daemon yet, so daemon runs today are Claude spawns. Before recovery, startup fences each leftover entry:
+after, removed once reaped unless the stop status was `unknown`). The Claude and Codex providers journal identically and
+the daemon passes the same journal to both. Before recovery, startup fences each leftover entry:
 provably dead (other boot, no such pid and empty group, zombies only) or its whole process group is killed and checked
 empty. Anything it cannot prove (begin-only entry, malformed file, reused pid with a live group, a group that will not
 die) is `unverified` and is never signalled when ambiguous. Recovery then proceeds as above.

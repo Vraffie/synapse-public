@@ -29,6 +29,7 @@ from dataclasses import replace
 import hashlib
 import json
 import logging
+import re
 import sqlite3
 from typing import Any
 
@@ -48,9 +49,11 @@ from synapse.persistence.mock_execution_store import record_verification, set_at
 from synapse.persistence.run_store import write_run_transition
 from synapse.persistence.state_store import StateConflict
 from synapse.providers.claude_cli import ClaudeCliProfile, ClaudeCliProvider
+from synapse.providers.codex_cli import VERIFIED_CLI_VERSIONS, CodexCliProfile, sandbox_for_task
 from synapse.providers.contracts import ExecutionRequest, ProviderAdapter, ProviderEvent, UsageObservation
 
 _LOG = logging.getLogger(__name__)
+_VERSION_SHOWN = re.compile(r"\d{1,4}\.\d{1,4}\.\d{1,4}")  # only a parsed version is ever logged
 MAX_SUMMARY_TEXT_BYTES = 16 * 1024
 # reduce_output keeps every failure line even past its budget (up to 1 MiB); the summary blob holds 64 KiB, so the
 # forwarded text is clipped hard. The full text is always in the raw artifact.
@@ -82,29 +85,75 @@ async def process_outcome_verifier(task_id: str, candidate: bytes) -> bool:
 
 
 class AgentProviderRouter:
-    """ProviderAdapter that picks a ``ClaudeCliProvider`` per task spec.
+    """ProviderAdapter that picks a ``ClaudeCliProvider`` or ``CodexCliProvider`` per task spec (ADR 016 decision 4).
 
-    Tool allowlist and permission mode are profile-level in the adapter, so one
-    provider is built (and cached) for each distinct narrowed combination via
-    ``dataclasses.replace`` on the operator profile, which re-runs its validation.
+    Providers are cached by ``(profile_id, narrowed key)``. For Claude, tool allowlist and permission mode are
+    profile-level in the adapter, so the operator profile is narrowed with ``dataclasses.replace`` (which re-runs
+    its validation). For Codex there is no tool allowlist: the task's tools and mode select the sandbox through the
+    fixed table in ``codex_cli.sandbox_for_task``; anything it cannot map refuses the start (no process).
     """
 
     def __init__(self, profile: ClaudeCliProfile, specs: Mapping[str, Mapping[str, Any]],
                  factory: Callable[[ClaudeCliProfile], ProviderAdapter] = ClaudeCliProvider,
-                 profile_resolver: Callable[[str], ClaudeCliProfile] | None = None):
-        # profile_resolver: registry profile id -> the ClaudeCliProfile to spawn with (never invents one).
+                 profile_resolver: Callable[[str], ClaudeCliProfile | CodexCliProfile] | None = None,
+                 codex_factory: Callable[[CodexCliProfile], ProviderAdapter] | None = None):
+        # profile_resolver: registry profile id -> the Claude or Codex profile to spawn with (never invents one).
+        # codex_factory: None means a Codex profile is refused at start (fail closed, never a Claude fallback).
         self._profile, self._specs, self._factory = profile, specs, factory
         self._resolver = profile_resolver
+        self._codex_factory = codex_factory
         self._providers: dict[tuple, ProviderAdapter] = {}
         self._owner: dict[str, ProviderAdapter] = {}
         self.handles: dict[str, str] = {}
         self.start_failed: set[str] = set()
+        self.start_refusals: dict[str, str] = {}  # task_id -> fixed refusal detail (default: start_rejected)
+        self._codex_sandbox: dict[int, str] = {}  # id(codex provider) -> its sandbox; providers live as long as us
 
     async def probe(self, profile_id):
         return await next(iter(self._providers.values())).probe(profile_id)
 
     async def capabilities(self, profile_id):
         return await next(iter(self._providers.values())).capabilities(profile_id)
+
+    def _build(self, named: str | None, tools: tuple[str, ...], mode: str) -> ProviderAdapter:
+        if named is None:
+            return self._factory(replace(self._profile, allowed_tools=tools, permission_mode=mode))
+        if self._resolver is None:
+            raise ValueError("no resolver for a named profile")  # fail closed: never the default
+        base = self._resolver(named)
+        if isinstance(base, CodexCliProfile):
+            if self._codex_factory is None:
+                raise ValueError("codex provider is not available")
+            profile = replace(base, sandbox=sandbox_for_task(tools, mode), extra_args=())
+            provider = self._codex_factory(profile)
+            self._codex_sandbox[id(provider)] = profile.sandbox
+            return provider
+        if not isinstance(base, ClaudeCliProfile):
+            raise TypeError("profile resolver returned an unsupported profile")
+        return self._factory(replace(base, allowed_tools=tools, permission_mode=mode))
+
+    async def _codex_version_gate(self, provider: ProviderAdapter, sandbox: str, request: ExecutionRequest) -> None:
+        """Spawn-time version check of a Codex executable (cached per binary identity, off the event loop).
+
+        The /tmp and $TMPDIR exclusion of ``workspace-write`` relies on ``-c sandbox_workspace_write.*`` keys checked
+        only on VERIFIED_CLI_VERSIONS; an unknown version could ignore a renamed key, so ``workspace-write`` is
+        refused there. ``read-only`` still runs, and each such spawn is logged with the (parsed, digits-and-dots)
+        version. No provider able to report its version counts as unverified.
+        """
+        check = getattr(provider, "cached_cli_version", None)
+        try:
+            version = await asyncio.to_thread(check) if callable(check) else None
+        except Exception:  # a failed check is "no version": workspace-write refused, read-only still runs
+            _LOG.warning("codex version check failed for task %s", request.task_id, exc_info=True)
+            version = None
+        if version in VERIFIED_CLI_VERSIONS:
+            return
+        shown = version if isinstance(version, str) and _VERSION_SHOWN.fullmatch(version) else "unknown"
+        if sandbox != "read-only":
+            self.start_refusals[request.task_id] = "codex_ineligible"
+            raise ValueError("codex workspace-write is refused on an unverified CLI version")
+        _LOG.warning("codex CLI version %s is not verified; running read-only task %s on profile %s",
+                     shown, request.task_id, request.profile_id)
 
     async def start(self, request: ExecutionRequest) -> str:
         spec = self._specs[request.task_id]
@@ -113,13 +162,10 @@ class AgentProviderRouter:
         try:
             provider = self._providers.get(key)
             if provider is None:
-                base = self._profile
-                if named is not None:
-                    if self._resolver is None:
-                        raise ValueError("no resolver for a named profile")  # fail closed: never the default
-                    base = self._resolver(named)
-                provider = self._providers[key] = self._factory(
-                    replace(base, allowed_tools=key[1], permission_mode=key[2]))
+                provider = self._providers[key] = self._build(*key)
+            sandbox = self._codex_sandbox.get(id(provider))
+            if sandbox is not None:
+                await self._codex_version_gate(provider, sandbox, request)
             handle = await provider.start(request)
         except BaseException:
             self.start_failed.add(request.task_id)  # provider.start never spawns: known no process
@@ -547,7 +593,9 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                     await self.provider.execute(request, emit)
                 except BaseException:
                     if task_id in self.router.start_failed and terminal is None:
-                        terminal = ProviderEvent("failed", "start_rejected")  # no process was ever spawned
+                        # no process was ever spawned; a known fixed refusal reason is kept (e.g. codex_ineligible)
+                        terminal = ProviderEvent("failed", getattr(self.router, "start_refusals", {}).get(
+                            task_id, "start_rejected"))
                     else:
                         raise
                 finally:
