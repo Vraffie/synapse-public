@@ -181,15 +181,23 @@ Existing base: hash, policy and expiry binding with execution-time recheck; syst
 ## M8 — Post-v1 (P2, not planned in detail)
 Knowledge index, optional browser client, remote workers, additional plugins, semantic caching only after an evaluation.
 
-## Roadmap to 100% (no checkboxes here; the boxes above are the source of truth)
-Owners: A = integrator and trust lane, B = clients, API routes, CLI, plugins, you = owner decisions. Numbers refer to the plan agreed 2026-11-23.
-0. Land in-flight work: #41 (auto-resume, migration 0017), wire ADR 025 review enforcement into the daemon (first fix the `skip-worktree` bypass and FIFO hang found in review), merge ADR 026 (#43), tick the boxes for merged PRs, post late-review items to B. [A]
-1. Close M2/M3: secure session credentials and live MCP/fallback messaging (ADR first, builds on ADR 019); human identity closed with the documented passphrase-verifier limit; fencing follow-ups (`daemon_epoch`, setsid/cgroup containment, F7); M3 client work (run control, messaging, recovery, paging, fence and Codex in the desktop, commit-dialog test). [A, B]
-2. M4 leftovers: per-profile concurrency up to 6 tasks; 2 to 3 Claude profiles with fallback and cooldowns; `claude --version` probe with a recorded fixture per verified version; per-profile CLI authentication; opt-in real-run matrix (asks the owner each time); worktree garbage collection with M6.1. [A; owner approves real runs]
-3. M5 close-out: cache storage (migration 0018) and wiring, M5.6 handoff wiring, M5.7 desktop pane, `on_unknown: allow` budget gap and the ADR 020 amendment, routing judge only if data justifies it. [B, A]
-4. M6: owner supplies repo ids, paths, baseline refs, protected paths, Catalog Validator commands and XML layout; then M6.1 and M6.2 wiring per ADR 026 (migration 0019), B's routes, CLI and desktop views, plugin wiring with process isolation, M6.4 to M6.6. [owner, A, B]
-5. M7: owner chooses the STAGING transport; M7.1 adapter with approval binding and recheck; M7.2 reconciliation; M7.4 fault-injection harness for the ten invariants; M7.5 threat model and findings F1/F2 (accepted), F7, F10; owner-only GitHub settings. [owner, A, B]
-6. Final gate: independent full security review, regenerated progress table, end-to-end real run on this machine (Claude, then Codex if wanted, then multi-repo), results recorded in the docs. [A, B]
+## Fast path: XML config tool working on the BSS repos (owner decision 2026-11-23)
+The tool only produces XML config for product-config, portfolio and tenant-specification, then deploys to dev with one approved CLI command. This path is the only work scheduled now; everything under "Later" is parked and not planned. Owners: A = integrator and trust lane, B = clients, routes, CLI, you = owner inputs. No checkboxes here; the boxes above stay the source of truth.
+1. Land in flight: #41 auto-resume (migration 0017), ADR 026 trimmed to its first slice (#43). [A]
+2. Repo registry and per-repo worktrees (ADR 026 slice, migration 0019): object entries in `agent.json`, pinned baseline refs, one worktree per attempt per repo, read-only worktrees for read repos, writes limited to an XML path pattern, host-side commit at attempt end, protected paths. [A]
+3. Candidate manifest v2 and approval binding: one immutable object listing every repo's baseline and candidate SHA and diff hash; approvals bind to its hash; invalidated if a baseline moves. [A]
+4. Validators: XML well-formed check plus the Catalog Validator adapter as exact argv (no shell), results stored as evidence. Needs the validator command from the owner. [A and B]
+5. Dev deploy adapter: one operator-configured command, approval bound to environment, manifest hash and command, recheck right before running, intent record before and outcome after, `UNKNOWN` when unclear. Needs the deploy command from the owner. [A]
+6. Surfaces: run creation with repos, manifest show, approve, deploy and status in the API, `agentctl` and desktop. [B]
+7. Proof: independent security review of the new surface, then one real end-to-end run on the BSS repos (asks the owner first), results recorded in the docs. [A, B, owner]
+Owner inputs needed: repo paths and the XML file pattern agents may edit; the Catalog Validator command and what pass or fail looks like; the dev deploy command (one repo or all, any status check, how it logs in); approval for the first real run.
+
+## Later (parked, not planned; the owner builds a backlog from this)
+- Providers: second and third Claude profiles with fallback and cooldowns, per-profile CLI authentication, Codex real run and edits, `claude --version` fixture per version, per-profile concurrency up to 6.
+- Trust: secure session credentials and live MCP messaging, review independence wiring (ADR 025; fix the `skip-worktree` bypass and FIFO hang first), `daemon_epoch` and setsid/cgroup containment (F7), F10, hardware key or OS confirmation for human identity, plugin process isolation.
+- M5 extras: cache storage (migration 0018) and wiring, handoff wiring (M5.6), analytics desktop pane (M5.7), routing judge, `on_unknown: allow` budget gap and ADR 020 amendment.
+- M6/M7 extras: cross-repo barrier (M6.6), Domain role workflow beyond the first run, retention sweep and worktree GC, STAGING transport and reconciliation beyond the single command, full ten-invariant fault-injection harness.
+- Owner-only GitHub settings: require a pull request and narrow admin bypass on `block main`, fork-workflow approval, Dependabot and scanning, Wiki and Projects off.
 
 ## Ordering
 M4-A first. M4-B, the trust close-out and M5.1/M5.2 can proceed in parallel branches. Worker fencing, human identity and review enforcement depend on PRs #75–#77. M5.5 routing needs M5.1 data. M6 needs M4-B and the trust close-out. M7 needs the M6 candidate manifest.
