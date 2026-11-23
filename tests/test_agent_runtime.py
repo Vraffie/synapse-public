@@ -1197,6 +1197,47 @@ def test_routing_log_failure_after_the_event_insert_rolls_the_whole_write_back(e
     assert not env.db.in_transaction
 
 
+def test_audit_logs_are_written_after_the_provider_has_run_not_before_the_spawn(env, monkeypatch):
+    import synapse.orchestration.agent_engine as ae
+    seen = {}
+    for name in ("_record_manifest", "_record_routing"):
+        def wrap(self, *a, _orig=getattr(ae.AgentWorkflowEngine, name), _name=name, **k):
+            seen[_name] = env.spawns()  # the fake CLI logs its mode when it starts
+            return _orig(self, *a, **k)
+        monkeypatch.setattr(ae.AgentWorkflowEngine, name, wrap)
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(prompt="ok"))
+        await finish(env)
+    asyncio.run(go())
+    assert seen == {"_record_manifest": ["ok"], "_record_routing": ["ok"]}
+    assert env.states() == ("succeeded", {"work": "completed"})
+    assert env.db.execute("SELECT count(*) FROM context_manifests").fetchone()[0] == 1
+    assert env.db.execute("SELECT count(*) FROM optimization_decisions").fetchone()[0] == 1
+
+
+def test_audit_log_writes_give_up_quickly_when_the_database_is_write_locked(env):
+    import sqlite3
+    import time
+    from synapse.application.routing_dry_run import RoutingDryRunConfig
+    from synapse.orchestration.agent_engine import AgentWorkflowEngine
+    engine = object.__new__(AgentWorkflowEngine)
+    engine.db, engine._routing_dry_run = env.db, RoutingDryRunConfig()
+    spec = {"prompt_artifact_id": "a", "prompt_sha256": "0" * 64, "prompt_bytes": 1}
+    other = sqlite3.connect(env.path, isolation_level=None)
+    other.execute("BEGIN IMMEDIATE")
+    try:
+        t0 = time.monotonic()
+        engine._record_manifest(env.run_id, "t", "att", spec)
+        engine._record_routing(env.run_id, "t", "att", spec, 1)
+        elapsed = time.monotonic() - t0
+    finally:
+        other.execute("ROLLBACK")
+        other.close()
+    assert elapsed < 1.0, elapsed  # was 2 x busy_timeout (5 s each) before
+    assert env.db.execute("PRAGMA busy_timeout").fetchone()[0] == 5000 and not env.db.in_transaction
+    assert env.db.execute("SELECT count(*) FROM optimization_decisions").fetchone()[0] == 0
+
+
 def test_routing_dry_run_none_disables_the_log_and_writes_nothing(env, monkeypatch):
     import functools
     import synapse.daemon.agent_runtime as ar

@@ -56,9 +56,18 @@ def test_estimate_uses_operator_prices_and_is_labelled():
     assert kept["decision"]["tier"] == kept["decision"]["baseline_tier"] and kept["estimate"]["estimated_usd"] == 0.0
 
 
+def test_unchanged_tier_without_prices_is_unknown_not_a_zero_saving():
+    r = routing_record(RoutingDryRunConfig(expected_input_tokens=10, expected_output_tokens=10), RoutingInput(**SMALL))
+    kept = routing_record(RoutingDryRunConfig(expected_input_tokens=10, expected_output_tokens=10), RoutingInput())
+    assert kept["decision"]["tier"] == kept["decision"]["baseline_tier"]
+    assert kept["estimate"]["status"] == "unknown" and kept["estimate"]["estimated_usd"] is None
+    assert RoutingDryRunConfig(expected_input_tokens=10**12).expected_input_tokens == 10**12 and r
+
+
 @pytest.mark.parametrize("kwargs", [{"policy_version": "bad version"}, {"policy_version": ""}, {"allowed_tiers": ()},
                                     {"allowed_tiers": ("huge",)}, {"min_downgrade_confidence": 2}, {"expected_input_tokens": -1},
-                                    {"expected_output_tokens": True}, {"pricing": [1]}])
+                                    {"expected_output_tokens": True}, {"pricing": [1]},
+                                    {"expected_input_tokens": 10**400}, {"expected_output_tokens": 10**12 + 1}])
 def test_config_is_validated(kwargs):
     with pytest.raises(ValueError):
         RoutingDryRunConfig(**kwargs)

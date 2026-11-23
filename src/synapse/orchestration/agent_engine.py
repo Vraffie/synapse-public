@@ -19,6 +19,7 @@ differences, all deliberately conservative:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 import hashlib
@@ -54,6 +55,7 @@ MAX_SUMMARY_JSON_BYTES = 48 * 1024
 _CLIP_MARKER = "\n[clipped: output continues in the raw artifact]\n"
 MAX_TOOL_NAMES = 100
 _PROVIDER_OUTPUT_CAP = 4 * 1024 * 1024
+_LOG_LOCK_WAIT_MS = 100  # audit-only writes (manifest, routing dry run) wait this long for the write lock
 RAW_OUTPUT_KIND = "agent_raw_output"
 _ATTEMPT_STATE = {"succeeded": "completed", "failed": "failed", "timed_out": "failed",
                   "cancelled": "cancelled", "unknown": "unknown"}
@@ -385,6 +387,18 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                 "reduction": {"rules": list(reduced.rules_applied), "dropped_lines": reduced.dropped_lines,
                               "kept_failures": len(reduced.kept_failures), "over_budget": reduced.over_budget}}
 
+    @contextlib.contextmanager
+    def _best_effort_transaction(self):
+        """A transaction for audit-only writes: waits at most ``_LOG_LOCK_WAIT_MS`` for the write lock,
+        so a busy database costs a lost log row, not seconds of a blocked event loop."""
+        previous = self.db.execute("PRAGMA busy_timeout").fetchone()[0]
+        self.db.execute(f"PRAGMA busy_timeout={_LOG_LOCK_WAIT_MS}")
+        try:
+            with self._transaction():
+                yield
+        finally:
+            self.db.execute(f"PRAGMA busy_timeout={int(previous)}")
+
     def _record_manifest(self, run_id: str, task_id: str, attempt_id: str, spec: Mapping[str, Any]) -> None:
         """Record (never act on) the daemon-owned context for this attempt (ADR 017 D5, record only).
 
@@ -397,7 +411,7 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                        ManifestEntry("artifact", str(spec["prompt_artifact_id"]), spec["prompt_sha256"], spec.get("prompt_bytes"))]
             manifest = build_manifest(task_id, repo_head=_manifest_head(head),
                                       worktree_clean=None, entries=entries)
-            with self._transaction():
+            with self._best_effort_transaction():
                 record_manifest(self.db, run_id=run_id, attempt_id=attempt_id, manifest=manifest)
         except Exception:
             _LOG.exception("Could not record the context manifest for task %s", task_id)
@@ -417,7 +431,7 @@ class AgentWorkflowEngine(MockWorkflowEngine):
             record = routing_record(self._routing_dry_run, RoutingInput(
                 prompt_bytes=spec.get("prompt_bytes"), has_approval_gate=gated,
                 retry_no=max(0, attempt_no - 1 - (1 if gated else 0))))
-            with self._transaction():
+            with self._best_effort_transaction():
                 record_routing(self.db, run_id=run_id, attempt_id=attempt_id, record=record)
         except Exception:
             _LOG.exception("Could not record the routing dry run for task %s", task_id)
@@ -473,8 +487,6 @@ class AgentWorkflowEngine(MockWorkflowEngine):
             if problem is not None:
                 terminal = ProviderEvent("failed", problem)  # refused before any spawn
             else:
-                self._record_manifest(run_id, task_id, attempt_id, spec)
-                self._record_routing(run_id, task_id, attempt_id, spec, attempt_no)
                 request = ExecutionRequest(profile_id, task_id, {
                     "prompt": self._prompts(task_id).decode("utf-8"), "worktree": spec["worktree"],
                     "timeout_seconds": spec["timeout_seconds"], "max_output_bytes": _PROVIDER_OUTPUT_CAP})
@@ -485,6 +497,11 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                         terminal = ProviderEvent("failed", "start_rejected")  # no process was ever spawned
                     else:
                         raise
+                finally:
+                    # Audit logs never delay a spawn: written after the provider returns, from spec facts
+                    # fixed before the run, under a short lock wait (see _best_effort_transaction).
+                    self._record_manifest(run_id, task_id, attempt_id, spec)
+                    self._record_routing(run_id, task_id, attempt_id, spec, attempt_no)
             if terminal is None:
                 terminal = ProviderEvent("unknown", "no_terminal_event")
             outcome, detail = terminal.kind, terminal.text

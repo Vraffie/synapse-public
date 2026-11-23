@@ -28,6 +28,7 @@ from synapse.domain.contracts import EventEnvelope, encode_payload, new_id
 from synapse.persistence.idempotency import canonical_request_hash
 
 RECORD_VERSION = 1
+MAX_EXPECTED_TOKENS = 10**12  # far above any real request; keeps the estimate arithmetic finite
 _VERSION = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
@@ -48,8 +49,8 @@ class RoutingDryRunConfig:
             raise ValueError("policy_version must match [A-Za-z0-9._-] and be at most 64 characters")
         for what in ("expected_input_tokens", "expected_output_tokens"):
             v = getattr(self, what)
-            if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < 0):
-                raise ValueError(f"{what} must be a non-negative integer or None")
+            if v is not None and (isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= MAX_EXPECTED_TOKENS):
+                raise ValueError(f"{what} must be an integer from 0 to {MAX_EXPECTED_TOKENS} or None")
         if self.pricing is not None and not isinstance(self.pricing, Mapping):
             raise ValueError("pricing must be a mapping or None")
         # Validates allowed_tiers and thresholds with the same rules the policy uses.
