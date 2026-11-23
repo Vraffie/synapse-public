@@ -62,7 +62,10 @@ COVERAGE = {
         "test_output_reducer.py::test_pytest_failures_survive_a_tight_budget",
         "test_output_reducer.py::test_failures_beyond_the_budget_are_kept_and_reported_over_budget",
         "test_budget_wiring.py::test_approved_gated_step_is_blocked_at_resume_and_never_runs",
-    ], "the reducer and budget are unit-tested; no fault scenario drives reduction or caching through the engine until the M5.3 wiring merges"),
+        "test_agent_runtime.py::test_raw_output_is_stored_and_summary_carries_reduction_and_raw_hash",
+        "test_agent_runtime.py::test_a_large_reduction_is_clipped_so_a_succeeded_attempt_still_gets_a_summary",
+        "test_agent_runtime.py::test_a_stored_raw_artifact_with_the_wrong_digest_fails_a_succeeded_attempt_closed",
+    ], "reduction is now exercised through the engine (raw output kept, failure lines survive, a summary that would overflow is clipped, a raw artifact that cannot be stored fails a success closed), but the exact cache (M5.4 second half) is not built and routing is a dry-run log only, so neither can bypass a check yet and neither has a fault scenario"),
 }
 STATUSES = {"covered", "partial", "outside-harness"}
 
