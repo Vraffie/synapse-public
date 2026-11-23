@@ -224,3 +224,10 @@ def test_merge_normalises_paths_so_trailing_slash_is_not_a_second_entry(tmp_path
     out = up.write_config(cfg, tmp_path / "claude", Path("/r/one"), ("Read",), tmp_path / "wt")
     assert out["repos"] == ["/r/one"]
     assert up.merge_repos(["/r/one"], [Path("/r/one/")]) == (["/r/one"], [])
+
+
+def test_start_hint_has_required_flags_and_no_hardcoded_base_ref():
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent / "scripts" / "synapse_up.py").read_text()
+    assert "--base-ref BASE_REF" in src and "--base-ref main" not in src
+    assert "--idempotency-key" in src and "--correlation-id" in src
