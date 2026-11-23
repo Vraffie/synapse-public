@@ -67,6 +67,21 @@ def _load_token(state_dir: Path) -> str:
         os.close(directory)
 
 
+def _follow_fetch(state_dir: Path):
+    """``events --follow`` fetcher. A missing state dir or operator token is a configuration error, not a daemon
+    that is down: it raises FollowError (never retried), so only the socket itself is a transient failure."""
+    from synapse.cli.follow import FollowError
+
+    def fetch(endpoint: str) -> object:
+        try:
+            _load_token(state_dir)
+        except (OSError, ValueError) as exc:
+            raise FollowError(f"cannot use state directory {state_dir}: "
+                              f"{getattr(exc, 'strerror', None) or exc}") from None
+        return _request(state_dir, endpoint)
+    return fetch
+
+
 def _request(state_dir: Path, endpoint: str, *, body: bytes | None = None,
              idempotency_key: str | None = None, correlation_id: str | None = None,
              approver_token: str | None = None, plain_method: str | None = None) -> object:
@@ -474,9 +489,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state-dir", type=Path, required=True, help="private daemon state directory")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("health", help="show daemon health")
-    events = commands.add_parser("events", help="replay one page of events")
-    events.add_argument("--after", type=_integer(0, _MAX_SEQUENCE), default=0)
+    events = commands.add_parser("events", help="replay one page of events (--follow to tail them)")
+    events.add_argument("--after", type=_integer(0, _MAX_SEQUENCE), default=None)
     events.add_argument("--limit", type=_integer(1, 1000), default=100)
+    events.add_argument("--follow", action="store_true",
+                        help="keep reading, print one JSON event per line, resume from a saved cursor")
+    events.add_argument("--cursor-file", type=Path, default=None, help="cursor file (default: STATE_DIR/events.cursor)")
+    events.add_argument("--interval", type=float, default=1.0, help="seconds between polls when idle (--follow)")
+    events.add_argument("--stop-when-idle", action="store_true", help="with --follow: exit once caught up")
     for command in ("run", "tasks", "usage"):
         query = commands.add_parser(command, help=f"show run {command} details")
         query.add_argument("run_id", help="run identifier")
@@ -593,7 +613,18 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("approval cursor must be at most 256 characters")
         endpoint = "/api/v1/approvals?" + urlencode({"after": args.after, "limit": args.limit})
     elif args.command == "events":
-        endpoint = "/api/v1/events?" + urlencode({"after": args.after, "limit": args.limit})
+        if args.follow:
+            from synapse.cli.follow import CURSOR_NAME, follow_events
+            if not 0.05 <= args.interval <= 60:
+                parser.error("--interval must be between 0.05 and 60 seconds")
+            default_cursor = args.state_dir / CURSOR_NAME
+            cursor_file = args.cursor_file or default_cursor
+            return follow_events(_follow_fetch(args.state_dir), cursor_file=cursor_file,
+                                 # only a file other than the default one may be rewound by --after
+                                 cursor_file_explicit=cursor_file.resolve() != default_cursor.resolve(),
+                                 after=args.after,
+                                 limit=args.limit, interval=args.interval, stop_when_idle=args.stop_when_idle)
+        endpoint = "/api/v1/events?" + urlencode({"after": args.after or 0, "limit": args.limit})
     else:
         endpoint = "/api/v1/system/health"
     try:
