@@ -180,7 +180,8 @@ with `"enabled": true`.
   `start_rejected`; an `unknown` outcome blocks the task. Neither re-runs the task on Claude or on another profile.
 - **Health.** `AgentRuntime.probe_profile(id)` runs only `codex --version` (no agent, no worktree, no credential
   copy): `healthy` for a verified version, `unverified_version` for another parseable one, `unavailable` when
-  disabled, missing or unparseable. It is advisory; no API surface calls it yet.
+  disabled, missing or unparseable. No API surface calls it yet.
+- **Unverified Codex version.** **Version gate at spawn.** Before every Codex spawn the router checks `codex --version` (cached per executable realpath, inode, size and mtime, at most 16 entries, run off the event loop). The `/tmp`/`$TMPDIR` exclusion of `workspace-write` relies on `-c sandbox_workspace_write.*` keys verified only on `VERIFIED_CLI_VERSIONS` (`0.170.0`), and a newer Codex could silently ignore a renamed key, so a task that would run `workspace-write` on any other (or unparseable) version is refused before spawning with detail `codex_ineligible`. A `read-only` task still runs on an unverified version, and each such spawn logs a warning naming the task, the profile and the parsed version (digits and dots only, otherwise `unknown`). Updating Codex therefore disables Codex edits until the new version is verified and added to `VERIFIED_CLI_VERSIONS`.
 - **Provider of an id is fixed.** `sync_profiles` refuses to turn an existing claude id into a codex one (or back);
   attempts and usage rows keep pointing at the provider they ran under.
 

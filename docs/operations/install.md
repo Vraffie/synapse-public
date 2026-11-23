@@ -69,6 +69,8 @@ sandboxed agent runs on this machine, and `python scripts/synapse_up.py down` st
   and, unless `--no-desktop`, the desktop console. Running `up` again for another repo is safe; restart with
   `down` then `up` for the daemon to pick up a new repo.
 
+Codex is optional and off by default: Synapse never needs the `codex` binary to start or to run Claude tasks, it is only used for a task that names a Codex profile, and a Codex profile is refused when the daemon sandbox is on (the `synapse_up.py` default), so a sandboxed Claude-only setup never sees it.
+
 It prints the `agentctl agent-start` command to use. No approver token is needed for ordinary runs. Logs and pid
 files are in the state directory (`daemon.log`, `desktop.log`, `*.pid`); `down` only signals a pid that is
 verifiably a Synapse process.

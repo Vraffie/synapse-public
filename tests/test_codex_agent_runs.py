@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import sqlite3
 import sys
+import time
 
 import pytest
 
@@ -321,9 +322,21 @@ def test_codex_spawn_is_journaled_while_running_and_cleared_after_cancel(cenv):
 
     async def go():
         cenv.runtime.start(cenv.run_id, "s", cenv.codex_spec("hang"))
-        await cenv.until(lambda: cenv.attempts() == ["running"] and len(cenv.journal.pending()) == 1)
-        entry = json.loads((cenv.journal._dir / (cenv.journal.pending()[0] + ".json")).read_text())
-        seen.append(entry)
+        def recorded():
+            # The entry is written in two steps (intent before Popen, then pid/ticks/boot id): wait for the second,
+            # and for the child to have started (its argv line), so the snapshot is never the bare intent.
+            pending = cenv.journal.pending()
+            if cenv.attempts() != ["running"] or len(pending) != 1 or not cenv.codex_argv():
+                return False
+            try:
+                entry = json.loads((cenv.journal._dir / (pending[0] + ".json")).read_text())
+            except (FileNotFoundError, ValueError):
+                return False
+            if "pid" not in entry:
+                return False
+            seen.append(entry)
+            return True
+        await cenv.until(recorded)
         cenv.runtime.cancel(cenv.run_id, "c")
         await asyncio.wait_for(cenv.runtime._cancelling, 30)
     asyncio.run(go())
@@ -448,6 +461,9 @@ def test_router_builds_one_codex_provider_per_profile_and_narrowed_key(cenv):
         async def start(self, request):
             return "h-" + request.task_id
 
+        def cached_cli_version(self):
+            return "0.170.0"
+
     specs = {"a": {"profile_id": "cx", "allowed_tools": ["Read"], "permission_mode": "plan"},
              "b": {"profile_id": "cx", "allowed_tools": ["Read"], "permission_mode": "plan"},
              "c": {"profile_id": "cx", "allowed_tools": ["Edit", "Read"], "permission_mode": "acceptEdits"}}
@@ -564,18 +580,149 @@ def test_version_probe_is_bounded_and_kills_its_group(cenv, tmp_path, monkeypatc
     prov = CodexCliProvider(CodexCliProfile(executable=str(hang), state_dir=str(cenv.state), enabled=True))
     assert prov._cli_version() is None
     pid = int(pidfile.read_text())
-    import time
     for _ in range(100):
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            break
-        state = open("/proc/%d/stat" % pid).read().rsplit(")", 1)[1].split()[0] if os.path.exists("/proc/%d" % pid) else "X"
-        if state in "ZX":
+        if _gone(pid):
             break
         time.sleep(0.02)
     else:
         raise AssertionError("the probe left a descendant running")
+
+
+def _gone(pid):
+    """True when pid no longer runs (absent, zombie or dead); a /proc entry vanishing mid-read counts as gone."""
+    try:
+        raw = open("/proc/%d/stat" % pid).read()
+    except (FileNotFoundError, ProcessLookupError):
+        return True
+    return raw.rsplit(")", 1)[1].split()[0] in ("Z", "X")
+
+
+def test_version_probe_is_not_held_by_an_escaped_descendant(cenv, tmp_path):
+    """Review of 8d147fa: a setsid'd grandchild kept the stdout pipe open and the probe blocked until it exited."""
+    escaped = tmp_path / "escaped-codex"
+    pidfile = tmp_path / "escaped.pid"
+    escaped.write_text("#!/bin/sh\nsetsid sleep 25 &\necho $! > %s\necho 'codex-cli 0.170.0'\nexit 0\n" % pidfile)
+    escaped.chmod(0o755)
+    started = time.monotonic()
+    try:
+        version = CodexCliProvider(CodexCliProfile(executable=str(escaped), state_dir=str(cenv.state),
+                                                   enabled=True))._cli_version()
+        elapsed = time.monotonic() - started
+    finally:
+        if pidfile.exists():
+            try:
+                os.kill(int(pidfile.read_text()), 9)  # outside the probe's group by construction: clean up here
+            except (ProcessLookupError, ValueError):
+                pass
+    assert version == "0.170.0"
+    assert elapsed < 3.0, elapsed  # was ~25 s before the fix; the hard bound is the 10 s deadline
+
+
+# ------------------------------------------------------------ unverified codex version at spawn
+@pytest.fixture
+def unverified(tmp_path):
+    e = CodexEnv(tmp_path, version="0.171.0")
+    yield e
+    e.close()
+
+
+def test_verified_version_allows_workspace_write(cenv):
+    _run(cenv, cenv.codex_spec("ok"))  # fake reports 0.170.0
+    assert cenv.states()[1] == {"work": "completed"} and "-s workspace-write" in cenv.codex_argv()[0]
+
+
+def test_unverified_version_refuses_workspace_write_before_any_spawn(unverified):
+    _run(unverified, unverified.codex_spec("ok"))  # Edit + acceptEdits -> workspace-write
+    assert unverified.codex_argv() == [] and unverified.spawns() == []
+    assert unverified.attempts() == ["failed"] and unverified.detail() == ("failed", "codex_ineligible")
+
+
+def test_unverified_version_still_runs_read_only_and_logs_it(unverified, caplog):
+    caplog.set_level("WARNING", logger="synapse.orchestration.agent_engine")
+    _run(unverified, unverified.codex_spec("ok", allowed_tools=["Read"], permission_mode="plan"))
+    assert unverified.states()[1] == {"work": "completed"}
+    (argv,) = unverified.codex_argv()
+    assert "-s read-only" in argv
+    notes = [r.getMessage() for r in caplog.records if "not verified" in r.getMessage()]
+    assert len(notes) == 1 and "0.171.0" in notes[0] and "read-only" in notes[0]
+    assert SECRET not in notes[0]
+
+
+def test_unparseable_version_is_logged_as_unknown_never_verbatim(tmp_path, caplog):
+    env = CodexEnv(tmp_path, version="0.170.0\\x1b[31mINJECT")  # parse fails -> None
+    try:
+        caplog.set_level("WARNING", logger="synapse.orchestration.agent_engine")
+        _run(env, env.codex_spec("ok", allowed_tools=["Read"], permission_mode="plan"))
+        notes = [r.getMessage() for r in caplog.records if "not verified" in r.getMessage()]
+        assert notes and "unknown" in notes[0] and "INJECT" not in notes[0] and "\x1b" not in notes[0]
+    finally:
+        env.close()
+
+
+# ------------------------------------------------------------ Codex is optional
+def _never_codex(*args, **kwargs):
+    raise AssertionError("a codex provider was built for a run that never named a codex profile")
+
+
+@pytest.mark.parametrize("with_codex_entry", [False, True])
+def test_claude_tasks_never_touch_codex(tmp_path, with_codex_entry):
+    """No codex entry (or one whose binary reports an unknown version): Claude tasks run exactly as before."""
+    env = CodexEnv(tmp_path, version="garbage", nodes=("plain", "named"))
+    try:
+        if not with_codex_entry:
+            agents = tmp_path / "claude-only.json"
+            agents.write_text(json.dumps({"profiles": [{"id": "reader", "provider": "claude", "allowed_tools": ["Read"],
+                                                        "permission_mode": "plan", "enabled": True}]}))
+            agents.chmod(0o600)
+            env.registry = load_agent_profiles(agents, env.base)
+            env.codex.unlink()  # and no codex binary at all
+        env.runtime = AgentRuntime(env.db, env.blobs, profile=env.profile, registry=env.registry,
+                                   worktree_check=lambda run_id, task_id, path: ("a" * 40, True),
+                                   codex_provider_factory=_never_codex)
+        _run(env, {"plain": env.spec("plain", prompt="ok"),
+                   "named": env.spec("named", prompt="ok", allowed_tools=["Read"], permission_mode="plan",
+                                     profile_id="reader")})
+        assert env.states() == ("succeeded", {"plain": "completed", "named": "completed"})
+        assert env.spawns("plain") == ["ok"] and env.spawns("named") == ["ok"]
+        assert env.codex_argv("plain") == env.codex_argv("named") == []
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize("codex", ["none", "missing-binary", "unknown-version"])
+def test_daemon_starts_without_codex_or_with_a_broken_one(cenv, codex):
+    """Startup never probes or requires codex; only a task that names a codex profile could be affected."""
+    from test_same_user_agents_gate import _spawn
+    import signal
+    import shutil
+    import tempfile
+    top = Path(tempfile.mkdtemp(prefix="syn-"))  # short: the unix socket path has a length limit
+    state = top / "s"  # _spawn writes its log next to the state dir, so keep both inside our own temp dir
+    state.mkdir(mode=0o700)
+    request_cleanup = shutil.rmtree
+    extra = ()
+    if codex != "none":
+        broken = cenv.tmp / "broken-codex"
+        if codex == "unknown-version":
+            broken.write_text("#!/bin/sh\necho 'not codex'\nexit 1\n")
+            broken.chmod(0o755)
+        agents = cenv.tmp / ("agents-" + codex + ".json")
+        # A missing binary is only accepted for a disabled entry (enabled ones are checked at load).
+        agents.write_text(json.dumps({"profiles": [_codex_entry(broken, enabled=codex == "unknown-version")]}))
+        agents.chmod(0o600)
+        extra = ("--agent-config", str(agents))
+    proc, log = _spawn(state, cenv.tmp / "base.json", "--allow-same-user-agents", *extra)
+    try:
+        deadline = time.monotonic() + 30
+        while not (state / "agentd.sock").exists() and proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert proc.poll() is None and (state / "agentd.sock").exists(), log.read_text()
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=30)
+    text = log.read_text()
+    request_cleanup(top, ignore_errors=True)
+    assert ("a codex profile is configured" in text) is (codex == "unknown-version")
 
 
 # ------------------------------------------------------------ test isolation

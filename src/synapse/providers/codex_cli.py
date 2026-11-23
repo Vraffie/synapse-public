@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import resource
+import select
 import shutil
 import signal
 import stat
@@ -142,6 +143,92 @@ def sandbox_for_task(allowed_tools, permission_mode) -> str:
     if writes and permission_mode == "plan":
         raise CodexIneligible("Edit/Write need permission_mode acceptEdits on a codex profile")
     return "workspace-write" if writes else "read-only"
+
+
+def cli_version(executable: str, environ: Mapping[str, str]) -> str | None:
+    """Run ``<executable> --version``; return "X.Y.Z" or None. Wall-clock bounded by one deadline.
+
+    Own session/process group, scrubbed env, stderr discarded. stdout is read from the raw, non-blocking fd in this
+    thread with select against the deadline and capped at _VERSION_MAX_BYTES; once the child has exited only what is
+    already in the pipe is read, so a descendant that escaped the group (e.g. ``setsid``) and keeps the pipe open
+    cannot delay the result. The group is then killed and the child reaped; the fd is closed with ``os.close``.
+    A descendant that left the group via ``setsid`` is not killed (it is outside the group by construction).
+    """
+    env = {k: v for k, v in environ.items() if k in _ENV_ALLOWLIST}
+    deadline = time.monotonic() + _VERSION_TIMEOUT_SECONDS
+    try:
+        proc = subprocess.Popen([executable, "--version"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, env=env, cwd="/", start_new_session=True,
+                                close_fds=True, bufsize=0)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    fd = os.dup(proc.stdout.fileno())  # our own descriptor: the file object is closed now, never read
+    proc.stdout.close()
+    os.set_blocking(fd, False)
+    buf = bytearray()
+    exited = False
+    eof = False
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if not exited:
+                # WNOWAIT keeps the exited leader as a zombie, so its process-group id cannot be reused before killpg.
+                exited = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+            if not eof and len(buf) < _VERSION_MAX_BYTES:
+                ready, _, _ = select.select([fd], [], [], 0 if exited else min(0.02, remaining))
+                if ready:
+                    try:
+                        chunk = os.read(fd, _VERSION_MAX_BYTES - len(buf))
+                    except BlockingIOError:
+                        chunk = None
+                    if chunk == b"":
+                        eof = True
+                    elif chunk:
+                        buf += chunk
+                        continue  # drain what is there before deciding
+            elif not exited:
+                time.sleep(min(0.02, remaining))
+            if exited:
+                break  # everything the child wrote is already in the pipe; never wait for a descendant's EOF
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)  # the group: also descendants that outlived the child
+        except (ProcessLookupError, PermissionError):
+            pass
+        proc.wait()
+        os.close(fd)
+    if not exited or proc.returncode != 0:
+        return None
+    return parse_cli_version(bytes(buf[:256]).decode("utf-8", "replace"))
+
+
+_VERSION_CACHE: dict[tuple, str | None] = {}
+_VERSION_CACHE_MAX = 16
+_VERSION_CACHE_LOCK = threading.Lock()
+
+
+def cached_cli_version(executable: str, environ: Mapping[str, str]) -> str | None:
+    """``cli_version`` cached by the executable's identity (realpath, device, inode, size, mtime_ns); bounded.
+
+    Replacing or modifying the binary changes the key, so the next spawn re-checks. A failed stat is never cached.
+    """
+    try:
+        real = os.path.realpath(executable)
+        st = os.stat(real)
+    except OSError:
+        return None
+    key = (real, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+    with _VERSION_CACHE_LOCK:
+        if key in _VERSION_CACHE:
+            return _VERSION_CACHE[key]
+    version = cli_version(executable, environ)
+    with _VERSION_CACHE_LOCK:
+        if len(_VERSION_CACHE) >= _VERSION_CACHE_MAX:
+            _VERSION_CACHE.pop(next(iter(_VERSION_CACHE)))
+        _VERSION_CACHE[key] = version
+    return version
 
 
 def parse_cli_version(output: str) -> str | None:
@@ -276,46 +363,11 @@ class CodexCliProvider:
 
     def _cli_version(self) -> str | None:
         """Run `<executable> --version` with a scrubbed environment; None on any failure."""
-        # Own session/process group, stdout read with a hard byte bound, stderr discarded; on timeout (or anything
-        # left behind) the whole group is killed. Never more than _VERSION_MAX_BYTES of the child's output is held.
-        env = {k: v for k, v in self._environ.items() if k in _ENV_ALLOWLIST}
-        try:
-            proc = subprocess.Popen([self._profile.executable, "--version"], stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, cwd="/",
-                                    start_new_session=True, close_fds=True)
-        except (OSError, subprocess.SubprocessError):
-            return None
-        out: list[bytes] = []
+        return cli_version(self._profile.executable, self._environ)
 
-        def read() -> None:
-            try:
-                out.append(proc.stdout.read(_VERSION_MAX_BYTES))
-            except (OSError, ValueError):
-                pass
-
-        reader = threading.Thread(target=read, daemon=True)
-        reader.start()
-        exited = False
-        try:
-            # WNOWAIT leaves the exited leader as a zombie, so its process-group id cannot be reused before killpg.
-            deadline = time.monotonic() + _VERSION_TIMEOUT_SECONDS
-            while time.monotonic() < deadline:
-                if os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
-                    exited = True
-                    break
-                time.sleep(0.01)
-        finally:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)  # the group: also descendants that outlived the child
-            except (ProcessLookupError, PermissionError):
-                pass
-            proc.wait()
-            reader.join(1.0)
-            proc.stdout.close()
-        code = proc.returncode if exited else None
-        if code != 0 or not out:
-            return None
-        return parse_cli_version(out[0][:256].decode("utf-8", "replace"))
+    def cached_cli_version(self) -> str | None:
+        """``_cli_version`` cached per executable identity (path, inode, size, mtime); see ``cached_cli_version``."""
+        return cached_cli_version(self._profile.executable, self._environ)
 
     async def capabilities(self, profile_id: str) -> ProviderCapabilities:
         validate_id(profile_id)

@@ -1,5 +1,7 @@
 # Codex CLI provider adapter (disabled by default; runs only for tasks that name a Codex profile)
 
+Codex is optional and off by default: Synapse never needs the `codex` binary to start or to run Claude tasks, it is only used for a task that names a Codex profile, and a Codex profile is refused when the daemon sandbox is on (the `synapse_up.py` default), so a sandboxed Claude-only setup never sees it.
+
 `synapse.providers.codex_cli.CodexCliProvider` runs `codex exec --json` as a supervised subprocess in a
 caller-supplied git worktree. It implements the `ProviderAdapter` protocol and mirrors the hardening of the
 [Claude adapter](claude-cli-provider.md). Since ADR 016 decision 4 it is wired into agent runs through a `codex`
@@ -29,9 +31,14 @@ applies), no model (`agent.profile_selected` records `model: null`; the `--model
 daemon), and the daemon's spawn journal, exactly like Claude spawns. Providers are cached per
 `(profile_id, allowed_tools, permission_mode)`. Recovery reconciles Codex attempts like Claude ones
 (`recover_mock_run(provider_kind={"claude","codex"})`). `AgentRuntime.probe_profile(id)` runs only `codex --version`
-(no agent, no worktree, no credential copy) and returns `healthy`, `unverified_version` or `unavailable`; it is advisory
-and has no API surface yet. The version child runs in its own session with a scrubbed environment, at most 4 KiB of
-its stdout is read (stderr discarded), and its whole process group is killed after it exits or after 10 s.
+(no agent, no worktree, no credential copy) and returns `healthy`, `unverified_version` or `unavailable`; it has no
+API surface yet. The version child runs in its own session with a scrubbed environment and stderr discarded; its
+stdout is read from a non-blocking descriptor in the calling thread against one 10 s deadline, capped at 4 KiB, and
+once the child has exited only what is already in the pipe is read, so a descendant that escaped with `setsid` and
+keeps the pipe open cannot delay the result. The whole call returns within about 10 s; the child's process group is
+then killed and the child reaped (a `setsid` descendant is outside that group and is not killed).
+
+**Version gate at spawn.** Before every Codex spawn the router checks `codex --version` (cached per executable realpath, inode, size and mtime, at most 16 entries, run off the event loop). The `/tmp`/`$TMPDIR` exclusion of `workspace-write` relies on `-c sandbox_workspace_write.*` keys verified only on `VERIFIED_CLI_VERSIONS` (`0.170.0`), and a newer Codex could silently ignore a renamed key, so a task that would run `workspace-write` on any other (or unparseable) version is refused before spawning with detail `codex_ineligible`. A `read-only` task still runs on an unverified version, and each such spawn logs a warning naming the task, the profile and the parsed version (digits and dots only, otherwise `unknown`). Updating Codex therefore disables Codex edits until the new version is verified and added to `VERIFIED_CLI_VERSIONS`.
 
 Executable checks: like the Claude base executable, the codex `executable` must be an absolute, normalized path and
 (when enabled) an existing executable file; neither adapter refuses a symlink or a group/world-writable binary.
@@ -111,8 +118,9 @@ The effect of `network_access=false` was **not** checked.
 ## Verified against codex-cli 0.170.0 (2026-11-20, Linux)
 
 `VERIFIED_CLI_VERSIONS = ("0.170.0",)`. `probe()` runs `codex --version` (scrubbed env, no stdin, 10 s timeout) and
-returns `healthy` for a verified version, `unverified_version` for another parseable one, `unavailable` otherwise;
-it is advisory and does not block execution.
+returns `healthy` for a verified version, `unverified_version` for another parseable one, `unavailable` otherwise.
+On its own it does not block execution; through the daemon, the spawn-time version gate above refuses
+`workspace-write` on any unverified version.
 
 Recorded event fixtures (scrubbed of paths): `tests/fixtures/codex_cli_0_170_0/` (`read_only_command`,
 `read_only_write_refused`, `turn_failed_bad_model`, `workspace_write_command`). The fake-executable tests replay them.
