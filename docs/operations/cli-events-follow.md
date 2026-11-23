@@ -37,6 +37,7 @@ handled and its id, which binds the cursor to one database.
 - **Stops instead of guessing** (exit 1, cursor not moved): HTTP 4xx (for example a rotated token), a permission
   error on the socket, a malformed response, or events that are not strictly increasing.
 - **A reader that goes away** (`| head`): the unwritten page is not marked delivered; exit 1 with no traceback.
+- **Output the terminal encoding cannot represent** (for example an ASCII locale with non-ASCII event text): one line on stderr, exit 1, cursor not moved; use a UTF-8 locale or `PYTHONIOENCODING=utf-8`.
 - **SIGTERM** is handled like Ctrl-C: exit 0 (the cursor is saved after every page).
 - `--interval` outside 0.05..60 is rejected with exit 2.
 - A cursor file that is a symlink, not owned by you, group/other accessible, not `SEQUENCE EVENT_ID` (or a bare integer) or larger than the

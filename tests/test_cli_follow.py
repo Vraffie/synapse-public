@@ -347,3 +347,25 @@ def test_follow_against_a_real_daemon_resumes_across_a_daemon_restart(tmp_path):
         assert everything == before + new
     finally:
         stop(proc)
+
+
+def test_the_failure_budget_counts_consecutive_failures_and_resets_after_a_success(tmp_path):
+    # Two failures, a success, two more failures, a success: 4 in total but never more than 2 in a row.
+    feed = Feed(3, fail=[ConnectionRefusedError(), ConnectionRefusedError(), None,
+                         ConnectionRefusedError(), ConnectionRefusedError(), None])
+    code, seen, err = run(feed, tmp_path, limit=1, max_errors=2)
+    assert code == 0 and seen == [1, 2, 3] and "giving up" not in err
+
+
+def test_an_output_encoding_error_exits_one_line_and_keeps_the_cursor(tmp_path):
+    class Ascii(io.StringIO):
+        def write(self, text):
+            text.encode("ascii")
+            return super().write(text)
+    def fetch(endpoint):
+        return {"events": [{"sequence": 1, "id": "evt-1", "type": "café"}]}
+    err = io.StringIO()
+    code = follow_events(fetch, cursor_file=tmp_path / "cursor", after=None, limit=10, interval=0.1,
+                         stop_when_idle=True, out=Ascii(), err=err, sleep=lambda s: None)
+    assert code == 1 and read_cursor(tmp_path / "cursor") is None
+    assert len(err.getvalue().strip().splitlines()) == 1 and "Traceback" not in err.getvalue()

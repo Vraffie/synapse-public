@@ -216,6 +216,10 @@ def follow_events(fetch: Callable[[str], object], *, cursor_file: Path, after: i
                 except BrokenPipeError:
                     _quiet_stdout(out)
                     return 1  # the reader went away: do not claim the page was delivered
+                except UnicodeEncodeError as exc:
+                    print(f"agentctl: cannot write events to stdout ({exc.encoding} cannot encode the output); "
+                          "set PYTHONIOENCODING=utf-8 or a UTF-8 locale; the cursor was not moved", file=err)
+                    return 1
                 if not save(last, last_id):
                     return 1
                 cursor = last
