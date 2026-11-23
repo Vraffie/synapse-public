@@ -469,3 +469,12 @@ def test_pick_repos_inspects_only_the_chosen(tmp_path, monkeypatch):
     assert seen == ["chosen"]
     with pytest.raises(ValueError, match="outside"):
         ws.pick_repos(str(root.resolve()), ["../x"])
+
+
+def test_config_hooks_make_a_repo_unusable(tmp_path):
+    marker = tmp_path / "marker"
+    repo = make_repo(tmp_path / "ws" / "hooked")
+    git(repo, "config", "hook.pwn.event", "post-index-change")
+    git(repo, "config", "hook.pwn.command", "touch '%s'" % marker)
+    info = ws.inspect_repo(str(repo.resolve()))
+    assert not info.usable and "hook.pwn" in info.reason and not marker.exists()

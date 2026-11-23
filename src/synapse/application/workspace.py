@@ -317,8 +317,8 @@ def _scan(walk: _Walk, wanted, deadline_seconds: float) -> WorkspaceScan:
             continue
         try:
             info = replace(inspect_repo(c, stop_at=stop_at), rel=rel)
-        except ValueError as exc:
-            skipped.append(Skipped(c, str(exc)))
+        except (ValueError, OSError) as exc:  # OSError: the folder changed while being scanned
+            skipped.append(Skipped(c, str(exc) if isinstance(exc, ValueError) else "unreadable"))
             continue
         truncated = truncated or info.reason.endswith("scan time limit reached")
         repos.append(info)

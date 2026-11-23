@@ -565,3 +565,76 @@ def test_commondir_redirect_is_refused_and_no_filter_runs(mgr, repo, tmp_path):
         WorktreeManager([repo], str((tmp_path / "wt2").resolve()))
     assert not marker.exists()
     assert not os.path.exists(os.path.join(mgr._root, "run1", "task1"))
+
+
+def add_config_hooks(repo: str, marker) -> None:
+    """git 2.54+ config-defined hooks: not disabled by core.hooksPath=/dev/null."""
+    for event in ("post-checkout", "reference-transaction", "post-index-change", "post-commit"):
+        run_git(repo, "config", "--add", "hook.pwn.event", event)
+    run_git(repo, "config", "hook.pwn.command", "touch '%s'" % marker)
+
+
+def test_config_hooks_fixture_fires_under_plain_git(repo, tmp_path):
+    marker = tmp_path / "marker"
+    add_config_hooks(repo, marker)
+    subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "worktree", "add", "-q", str(tmp_path / "plain")],
+                   cwd=repo, env=ENV, capture_output=True)
+    if not marker.exists():
+        pytest.skip("this git has no config-based hooks")
+
+
+def test_config_hooks_are_refused_in_create_and_force_remove(mgr, repo, tmp_path):
+    marker = tmp_path / "marker"
+    mgr.create("run1", "task1", repo, "main")
+    add_config_hooks(repo, marker)  # planted after the worktree exists
+    with pytest.raises(WorktreeError, match="hook.pwn"):
+        mgr.check_base(repo, "main")
+    with pytest.raises(WorktreeError, match="hook.pwn"):
+        mgr.create("run2", "task2", repo, "main")
+    with pytest.raises(WorktreeError, match="hook.pwn"):
+        mgr.remove("run1", "task1", force=True)
+    assert not marker.exists()
+
+
+def test_agent_made_submodule_config_never_runs_in_host_git(mgr, repo, tmp_path):
+    """A gitlink in the base commit gives an empty sub/ in the worktree; the agent turns it into a repo
+    whose own config + info/attributes define a clean filter. Host status/diff/commit/remove must not
+    recurse into it."""
+    marker = tmp_path / "marker"
+    sha = run_git(repo, "rev-parse", "HEAD").strip()
+    run_git(repo, "update-index", "--add", "--cacheinfo", "160000,%s,sub" % sha)
+    run_git(repo, "commit", "-q", "-m", "gitlink")
+    path = mgr.create("run1", "task1", repo, "main")
+    sub = os.path.join(path, "sub")
+    run_git(sub, "init", "-q", "-b", "main")
+    with open(os.path.join(sub, "a.txt"), "w") as fh:
+        fh.write("x\n")
+    run_git(sub, "add", "a.txt")
+    run_git(sub, "commit", "-q", "-m", "s")
+    run_git(sub, "config", "filter.pwn.clean", "touch '%s'; cat" % marker)
+    with open(os.path.join(sub, ".git", "info", "attributes"), "w") as fh:
+        fh.write("a.txt filter=pwn\n")
+    future = os.stat(os.path.join(sub, "a.txt")).st_mtime + 100
+    os.utime(os.path.join(sub, "a.txt"), (future, future))
+    control = subprocess.run(["git", "status"], cwd=path, env=ENV, capture_output=True)
+    assert control.returncode == 0 and marker.exists()  # the fixture really is hostile under plain git
+    marker.unlink()
+    mgr.status("run1", "task1")
+    mgr.diff("run1", "task1")
+    mgr.diff_since("run1", "task1", sha)
+    try:
+        mgr.commit("run1", "task1", "agent work")
+    except WorktreeError:
+        pass  # a gitlink change is refused anyway; what matters is that no filter ran
+    mgr.remove("run1", "task1", force=True)
+    assert not marker.exists()
+
+
+def test_worktree_commondir_must_point_at_its_repository(mgr, repo, tmp_path):
+    path = mgr.create("run1", "task1", repo, "main")
+    meta = os.path.join(repo, ".git", "worktrees", "task1")
+    with open(os.path.join(meta, "commondir"), "w") as fh:
+        fh.write(str(tmp_path) + "\n")
+    with pytest.raises(WorktreeError, match="commondir"):
+        mgr.status("run1", "task1")
+    assert os.path.isdir(path)

@@ -59,13 +59,20 @@ The agent-runs API uses it for the per-run worktree.
   `core.attributesFile`, `core.askPass`, `core.editor`, `diff.external`,
   `diff.*.command|textconv`, `merge.*.driver`, `credential.*helper`, `gpg.*program`,
   `remote.*.uploadpack|receivepack|vcs|proxy`, `core.alternateRefsCommand`,
-  `uploadpack.*`, `http.*proxy`, `extensions.worktreeConfig`, any `config.worktree`
+  `uploadpack.*`, `http.*proxy`, config-defined hooks `hook.*` (git 2.54+ runs them even
+  with `core.hooksPath=/dev/null`), `gpg.ssh.defaultKeyCommand`,
+  `extensions.worktreeConfig`, any `config.worktree`
   file, a non-comment `info/attributes` file in the repository's git directory, and a
   `.git/config` too large (over 1 MiB listed) to check completely, and any
   `.git/commondir` (it makes git take config, `info/attributes`, objects and refs
   from another directory; also refused when the allowlist is loaded). The check lists
   the effective config with an explicit `--git-dir=<repo>/.git config --local`, so it
-  never walks up to another repo.
+  never walks up to another repo. The check runs first in `check_base` (before any other
+  git query) and also before `remove`, including `remove(force=True)`.
+- Host-side `status`/`diff` in a worktree pass `--ignore-submodules=all`, so git never
+  starts a child process inside a nested repository the agent created (its own config
+  and `info/attributes` are not checked by the guard). A linked worktree's
+  `.git/worktrees/<id>/commondir` must point back at the owning repository's `.git`.
 - Work-tree git additionally runs with `--attr-source=<empty tree>`, so the tree's
   `.gitattributes` cannot enable a filter or diff driver even if a config plant
   slips in between the check and the call.

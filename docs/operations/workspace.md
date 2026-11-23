@@ -45,7 +45,7 @@ Not usable, with the reason shown:
 | Case | Why |
 |---|---|
 | no commits | a worktree needs a committed base ref |
-| unsafe config (`core.fsmonitor`, `core.hooksPath`, filters, `include.path`, `!` aliases, `remote.*.uploadpack`/`receivepack`/`vcs`/`proxy`, `core.alternateRefsCommand`, `config.worktree`, `info/attributes`, a config too large to check, ...) | exactly the rule `WorktreeManager` applies before every run, so the daemon would refuse it anyway |
+| unsafe config (`core.fsmonitor`, `core.hooksPath`, filters, `include.path`, `!` aliases, `remote.*.uploadpack`/`receivepack`/`vcs`/`proxy`, config hooks `hook.*`, `core.alternateRefsCommand`, `config.worktree`, `info/attributes`, a config too large to check, ...) | exactly the rule `WorktreeManager` applies before every run, so the daemon would refuse it anyway |
 | bare repository | no working tree |
 | `.git` is a file (linked worktree or submodule) | register the main repository instead |
 | `.git` is a symlink, or not owned by you | the daemon's allowlist rules refuse these |
