@@ -348,6 +348,17 @@ def test_finished_attempt_usage_is_visible_to_the_next_claim_allow(indep, monkey
     assert [d["reason"] for d in denials(indep)] == ["budget_exceeded"]
 
 
+def test_usage_write_failure_keeps_the_outcome_and_records_nothing(env):
+    """The usage write shares the terminal transaction under a savepoint: a failing insert loses the usage only."""
+    budgeted(env, per_run={"max_attempts": 5})
+    env.db.execute("CREATE TEMP TRIGGER no_usage BEFORE INSERT ON usage_observations BEGIN SELECT RAISE(ABORT,'nope'); END")
+    run(env, {"work": "ok"})
+    assert env.states() == ("succeeded", {"work": "completed"})
+    assert env.attempts() == ["completed"]
+    assert env.db.execute("SELECT COUNT(*) FROM usage_observations").fetchone() == (0,)
+    assert env.db.execute("SELECT COUNT(*) FROM events WHERE type='agent.usage_observed'").fetchone() == (0,)
+
+
 def test_refusal_that_cannot_be_recorded_rolls_back_and_spawns_nothing(chain, monkeypatch):
     budgeted(chain, per_run={"max_total_tokens": 6})
 

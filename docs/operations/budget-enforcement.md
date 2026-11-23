@@ -124,8 +124,19 @@ returns, together with the routing and manifest logs, under the same short lock 
 - **Other pre-spawn refusals are strict:** an attempt refused for another reason (for example the worktree
   recheck) is a failed attempt without usage. It makes token totals in its scopes unknown, so later claims there
   are blocked with `usage_unknown` (with `on_unknown: deny`). This fails closed, but it is strict.
-- **A usage row that cannot be written:** it is rolled back alone (savepoint) and logged. That attempt's usage
-  is then unknown, which the rules above treat as unknown, never zero.
+- **A usage row that cannot be written:** an ordinary failure (constraint, oversized value) is rolled back alone
+  (savepoint) and logged; the attempt still reaches its outcome and its usage is unknown, never zero
+  (`test_usage_write_failure_keeps_the_outcome_and_records_nothing`). If SQLite itself has already aborted the
+  transaction (I/O error, disk full), the terminal write fails too and the engine's error path records the attempt
+  `unknown` and blocks the task, which also fails closed.
+- **`on_unknown: allow` can hide a known overspend:** for each scope, a token metric is unknown as soon as any
+  finished attempt in it lacks that metric, and the known part of the sum is then discarded
+  (`budget_binding._scope_totals`, existing ADR 020 code, not changed here). Example: one attempt reported 5000
+  input tokens against a 1000 limit, another failed without usage; with `allow` the next claim passes as
+  `usage_unknown_allowed`. With the default `deny` it is blocked. Until the evaluation keeps a known lower bound,
+  treat `allow` as "do not enforce token limits once any usage is missing".
+- **`max_total_tokens` is derived:** the agent engine never writes `reported_total_tokens`, so the total is
+  input + output when both are known for every finished attempt in the scope, and unknown otherwise.
 
 Tests are in `tests/test_budget_enforcement.py`. They cover:
 
