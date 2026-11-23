@@ -11,6 +11,8 @@ an `unknown` outcome is never retried on another profile. No real Codex run has 
 
 ## How agent runs use it
 
+**Codex runs unsandboxed by Synapse.** Synapse does not wrap the Codex child in bwrap; the only confinement is Codex's own `-s read-only` / `-s workspace-write`, and `read-only` does not confine reads. A Codex child can therefore read anything the daemon's user can: `approver.token` and `operator.token` in the state dir (so it can approve its own gated requests), the SQLite database, `agentd.sock`, and the user's other credentials. For that reason a codex profile is **refused** (startup error, and `codex_ineligible`/422 as backstops) whenever the `--claude-cli-config` base has `"sandbox": true`: it would silently get less isolation than every Claude child. Codex is only available with the base sandbox off and `--allow-same-user-agents` acknowledged; the startup warning and the `agent_runtime.same_user_acknowledged` audit row then record `codex_unsandboxed: true`.
+
 | task field | Codex |
 | --- | --- |
 | `permission_mode` `plan` | `-s read-only` |
@@ -20,13 +22,20 @@ an `unknown` outcome is never retried on another profile. No real Codex run has 
 | `Edit`/`Write` with `plan` | refused |
 
 The router builds `CodexCliProfile(executable=<registry entry>, state_dir=<daemon state dir>, enabled=True,
-sandbox=<derived>, extra_args=(), max_timeout_seconds=<entry>)`: no `credentials_file` (the default lookup below
+sandbox=<derived>, extra_args=(), max_timeout_seconds=<entry>)` plus the base profile's `memory_limit_bytes`,
+`max_output_bytes_limit`, `max_line_bytes` and `term_grace_seconds` (the same rlimits as a Claude child): no
+`credentials_file` (the default lookup below
 applies), no model (`agent.profile_selected` records `model: null`; the `--model=` allowlist entry is not used by the
 daemon), and the daemon's spawn journal, exactly like Claude spawns. Providers are cached per
 `(profile_id, allowed_tools, permission_mode)`. Recovery reconciles Codex attempts like Claude ones
 (`recover_mock_run(provider_kind={"claude","codex"})`). `AgentRuntime.probe_profile(id)` runs only `codex --version`
 (no agent, no worktree, no credential copy) and returns `healthy`, `unverified_version` or `unavailable`; it is advisory
-and has no API surface yet.
+and has no API surface yet. The version child runs in its own session with a scrubbed environment, at most 4 KiB of
+its stdout is read (stderr discarded), and its whole process group is killed after it exits or after 10 s.
+
+Executable checks: like the Claude base executable, the codex `executable` must be an absolute, normalized path and
+(when enabled) an existing executable file; neither adapter refuses a symlink or a group/world-writable binary.
+Keep the binary owned by the daemon's user or root and not writable by others.
 
 ## Profile
 
@@ -107,6 +116,12 @@ it is advisory and does not block execution.
 
 Recorded event fixtures (scrubbed of paths): `tests/fixtures/codex_cli_0_170_0/` (`read_only_command`,
 `read_only_write_refused`, `turn_failed_bad_model`, `workspace_write_command`). The fake-executable tests replay them.
+
+Test isolation: `tests/conftest.py` points `CODEX_HOME`/`CLAUDE_CONFIG_DIR` at fake credential files and guards both
+adapters' credential readers, so a fake-executable test that reaches the real `~/.codex` or `~/.claude` login (even
+through an explicit environment naming the real `HOME`) is refused before the file is opened and fails. Only tests
+marked `real_cli("SYNAPSE_REAL_CODEX")`/`real_cli("SYNAPSE_REAL_CLAUDE")` see the real environment when their flag is
+`1`; run them in a separate invocation (`SYNAPSE_REAL_CODEX=1 pytest tests/test_codex_cli_real.py`).
 
 `tests/test_codex_cli_real.py` (opt-in `SYNAPSE_REAL_CODEX=1`) passed 7/7:
 

@@ -271,10 +271,15 @@ def real_home():
     return os.path.expanduser("~")
 
 
+# These tests need the real HOME (to check what the sandbox hides) but never the real login: the conftest fake
+# CLAUDE_CONFIG_DIR is found first, so ~/.claude/.credentials.json is never read.
+FAKE_LOGIN = {"CLAUDE_CONFIG_DIR": os.environ["CLAUDE_CONFIG_DIR"]}
+
+
 @needs_bwrap
 def test_sandboxed_agent_cannot_see_state_dir_or_real_home_and_has_private_pid_ns(box):
     _, _, wt, state = box
-    ambient = {"PATH": "/usr/bin:/bin", "HOME": real_home()}
+    ambient = {"PATH": "/usr/bin:/bin", "HOME": real_home(), **FAKE_LOGIN}
     prov = ClaudeCliProvider(make_profile(box, api_key="K-1"), environ=ambient)
     events = asyncio.run(run(prov, make_request(box, "probe", {"state": str(state), "real_home": real_home()})))
     assert events[-1].kind == "succeeded", events
@@ -296,7 +301,7 @@ def test_sandboxed_agent_cannot_see_state_dir_or_real_home_and_has_private_pid_n
 def test_control_unsandboxed_agent_can_read_state_dir(box):
     """Control: without the sandbox the same fake DOES read the planted secrets (same uid)."""
     _, _, _, state = box
-    prov = ClaudeCliProvider(make_profile(box, sandbox=False), environ={"PATH": "/usr/bin:/bin", "HOME": real_home()})
+    prov = ClaudeCliProvider(make_profile(box, sandbox=False), environ={"PATH": "/usr/bin:/bin", "HOME": real_home(), **FAKE_LOGIN})
     events = asyncio.run(run(prov, make_request(box, "probe", {"state": str(state), "real_home": real_home()})))
     out = json.loads(next(e.text for e in events if e.kind == "output"))
     assert out["token"].startswith("ok:FAKE-APPROVER") and out["sqlite"].startswith("ok:")
@@ -311,7 +316,7 @@ def test_linked_worktree_repo_is_read_only_inside_sandbox(box):
     (wt / ".git").rmdir()
     (wt / ".git").write_text(f"gitdir: {repo}/.git/worktrees/w1\n")
     prov = ClaudeCliProvider(make_profile(box, git_repos=(str(repo),)),
-                             environ={"PATH": "/usr/bin:/bin", "HOME": real_home()})
+                             environ={"PATH": "/usr/bin:/bin", "HOME": real_home(), **FAKE_LOGIN})
     events = asyncio.run(run(prov, make_request(box, "probe", {"state": str(state), "real_home": real_home(),
                                                                "repo": str(repo / ".git")})))
     assert events[-1].kind == "succeeded", events
@@ -323,7 +328,7 @@ def test_linked_worktree_repo_is_read_only_inside_sandbox(box):
 @needs_bwrap
 def test_setsid_grandchild_dies_on_cancel(box):
     token = "synapse-grandchild-%d-%d" % (os.getpid(), time.monotonic_ns())
-    prov = ClaudeCliProvider(make_profile(box), environ={"PATH": "/usr/bin:/bin", "HOME": real_home()})
+    prov = ClaudeCliProvider(make_profile(box), environ={"PATH": "/usr/bin:/bin", "HOME": real_home(), **FAKE_LOGIN})
 
     async def go():
         handle = await prov.start(make_request(box, "grandchild", {"token": token}))
@@ -354,7 +359,7 @@ def test_setsid_grandchild_dies_on_cancel(box):
 
 @needs_bwrap
 def test_scratch_removed_after_sandboxed_run(box):
-    prov = ClaudeCliProvider(make_profile(box), environ={"PATH": "/usr/bin:/bin", "HOME": real_home()})
+    prov = ClaudeCliProvider(make_profile(box), environ={"PATH": "/usr/bin:/bin", "HOME": real_home(), **FAKE_LOGIN})
     events = asyncio.run(run(prov, make_request(box, "ok")))
     assert events[-1].kind == "succeeded", events
     base = box[0] / "scratchtmp" / f"synapse-agent-{os.getuid()}"
@@ -670,7 +675,7 @@ def _git(cwd, *args):
 
 
 def _git_probe(box, config_path, **profile_kw):
-    prov = ClaudeCliProvider(make_profile(box, **profile_kw), environ={"PATH": "/usr/bin:/bin", "HOME": real_home()})
+    prov = ClaudeCliProvider(make_profile(box, **profile_kw), environ={"PATH": "/usr/bin:/bin", "HOME": real_home(), **FAKE_LOGIN})
     events = asyncio.run(run(prov, make_request(box, "git", {"config": str(config_path)})))
     assert events[-1].kind == "succeeded", events
     return json.loads(next(e.text for e in events if e.kind == "output"))

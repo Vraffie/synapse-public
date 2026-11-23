@@ -17,10 +17,10 @@ from synapse.providers.codex_cli import CodexCliProfile, CodexCliProvider
 from synapse.providers.contracts import ExecutionRequest
 
 CODEX = shutil.which("codex")
-pytestmark = pytest.mark.skipif(
+pytestmark = [pytest.mark.real_cli("SYNAPSE_REAL_CODEX"), pytest.mark.skipif(
     os.environ.get("SYNAPSE_REAL_CODEX") != "1" or CODEX is None,
     reason="opt-in: set SYNAPSE_REAL_CODEX=1 and put `codex` on PATH",
-)
+)]
 
 SECRET = "synapse-codex-real-7f3a9c"
 

@@ -5,6 +5,7 @@ replays recorded 0.170.0 event lines, and every codex provider here gets an expl
 CODEX_HOME holds a fake auth.json.
 """
 import asyncio
+import dataclasses
 import functools
 import json
 import os
@@ -458,7 +459,151 @@ def test_router_builds_one_codex_provider_per_profile_and_narrowed_key(cenv):
     assert all(p.state_dir == cenv.profile.state_dir and p.executable == str(cenv.codex) for p in built)
 
 
+# ------------------------------------------------------------ base sandbox: codex is refused (security review, PR #33)
+def _sandboxed(profile):
+    return dataclasses.replace(profile, sandbox=True)
+
+
+def test_sandboxed_base_refuses_a_codex_entry_at_registry_load(cenv):
+    sandboxed = dataclasses.replace(cenv.base, profile=_sandboxed(cenv.base.profile))
+    path = cenv.tmp / "agents3.json"
+    path.write_text(json.dumps({"profiles": [_codex_entry(cenv.codex, enabled=True)]}))
+    path.chmod(0o600)
+    with pytest.raises(RegistryError, match="codex profiles are refused while the --claude-cli-config base has"):
+        load_agent_profiles(path, sandboxed)
+    disabled = cenv.tmp / "agents4.json"
+    disabled.write_text(json.dumps({"profiles": [_codex_entry(cenv.codex, enabled=False)]}))
+    disabled.chmod(0o600)
+    with pytest.raises(RegistryError, match="codex profiles are refused"):  # even a disabled entry
+        load_agent_profiles(disabled, sandboxed)
+    # A sandboxed base with only claude entries still loads.
+    claude_only = cenv.tmp / "agents5.json"
+    claude_only.write_text(json.dumps({"profiles": [{"id": "reader", "provider": "claude", "allowed_tools": ["Read"],
+                                                     "permission_mode": "plan", "enabled": True}]}))
+    claude_only.chmod(0o600)
+    assert load_agent_profiles(claude_only, sandboxed).get("reader").provider == "claude"
+
+
+def test_unsandboxed_base_still_allows_codex(cenv):
+    assert cenv.base.profile.sandbox is False and cenv.registry.get("cx").provider == "codex"
+    assert _service(cenv).validate(_body())["tasks"][0]["profile"] == "cx"
+    assert isinstance(cenv.runtime._resolve_profile("cx"), CodexCliProfile)
+
+
+def test_sandboxed_base_never_lets_a_codex_child_read_the_state_dir(cenv):
+    """Regression: a codex child is not wrapped in bwrap, so with the base sandbox on it must never spawn.
+
+    The wrapper copies the approver token into the worktree; before the fix it ran and leaked the token.
+    """
+    token = cenv.state / "approver.token"
+    assert token.exists()
+    leak = cenv.worktrees["work"] / "leak.txt"
+    cenv.codex.write_text('#!/bin/sh\ncat "%s" > "$PWD/leak.txt" 2>/dev/null\necho "$@" >> "$PWD/codex-argv.log"\n'
+                          'exit 3\n' % token)
+    cenv.profile = _sandboxed(cenv.profile)  # registry already holds cx (loaded under an unsandboxed base)
+    cenv.runtime = cenv.new_runtime()
+    _run(cenv, cenv.codex_spec("ok"))
+    assert not leak.exists() and cenv.codex_argv() == [] and cenv.spawns() == []
+    assert cenv.states()[1] == {"work": "failed"} and cenv.detail() == ("failed", "codex_ineligible")
+    with pytest.raises(ValueError, match="sandboxed"):
+        cenv.runtime._resolve_profile("cx")  # second backstop: the router can never build it
+    with pytest.raises(AgentRunError, match="sandboxed") as err:
+        _service(cenv).validate(_body())
+    assert err.value.status == 422
+
+
+def test_daemon_records_that_codex_runs_unsandboxed(cenv):
+    """The same-user acknowledgement (log and audit row) says a codex profile runs without a Synapse sandbox."""
+    from test_same_user_agents_gate import _spawn
+    import signal
+    import time
+    state = cenv.tmp / "daemon-state"
+    state.mkdir(mode=0o700)
+    base = cenv.tmp / "base.json"
+    agents = cenv.tmp / "agents-daemon.json"
+    agents.write_text(json.dumps({"profiles": [_codex_entry(cenv.codex, enabled=True)]}))
+    agents.chmod(0o600)
+    proc, log = _spawn(state, base, "--allow-same-user-agents", "--agent-config", str(agents))
+    try:
+        deadline = time.monotonic() + 30
+        while not (state / "agentd.sock").exists() and proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert proc.poll() is None, log.read_text()
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=30)
+    assert "a codex profile is configured" in log.read_text()
+    with sqlite3.connect(state / "synapse.sqlite") as db:
+        (details,) = db.execute("SELECT details_json FROM audit_entries "
+                                "WHERE action='agent_runtime.same_user_acknowledged'").fetchone()
+    assert json.loads(details)["codex_unsandboxed"] is True
+
+
+def test_codex_child_gets_the_base_resource_limits(cenv):
+    cenv.profile = dataclasses.replace(cenv.profile, memory_limit_bytes=1 << 31, term_grace_seconds=1.5)
+    cenv.runtime = cenv.new_runtime()
+    prof = cenv.runtime._resolve_profile("cx")
+    assert (prof.memory_limit_bytes, prof.term_grace_seconds) == (1 << 31, 1.5)
+    assert (prof.max_output_bytes_limit, prof.max_line_bytes) == (cenv.profile.max_output_bytes_limit,
+                                                                  cenv.profile.max_line_bytes)
+
+
+# ------------------------------------------------------------ bounded version probe
+def test_version_probe_is_bounded_and_kills_its_group(cenv, tmp_path, monkeypatch):
+    from synapse.providers import codex_cli
+    monkeypatch.setattr(codex_cli, "_VERSION_TIMEOUT_SECONDS", 0.5)
+    flood = tmp_path / "flood-codex"
+    flood.write_text("#!%s\nimport sys\nsys.stdout.write('codex-cli 0.170.0 ' + 'x' * 10_000_000)\n" % sys.executable)
+    flood.chmod(0o755)
+    prov = CodexCliProvider(CodexCliProfile(executable=str(flood), state_dir=str(cenv.state), enabled=True))
+    assert prov._cli_version() is None  # never reads more than a bounded prefix; a blocked writer is killed
+    hang = tmp_path / "hang-codex"
+    pidfile = tmp_path / "grandchild.pid"
+    hang.write_text("#!/bin/sh\nsleep 300 &\necho $! > %s\nsleep 300\n" % pidfile)
+    hang.chmod(0o755)
+    prov = CodexCliProvider(CodexCliProfile(executable=str(hang), state_dir=str(cenv.state), enabled=True))
+    assert prov._cli_version() is None
+    pid = int(pidfile.read_text())
+    import time
+    for _ in range(100):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        state = open("/proc/%d/stat" % pid).read().rsplit(")", 1)[1].split()[0] if os.path.exists("/proc/%d" % pid) else "X"
+        if state in "ZX":
+            break
+        time.sleep(0.02)
+    else:
+        raise AssertionError("the probe left a descendant running")
+
+
 # ------------------------------------------------------------ test isolation
+def test_explicit_real_home_environ_is_refused_by_the_guard(credential_guard, tmp_path):
+    """Even a provider given the real HOME (and no CODEX_HOME) cannot read the real login in a test."""
+    from conftest import PROTECTED_CREDENTIAL_ROOTS, is_protected_credential_path
+    real_home = os.path.expanduser("~")
+    assert is_protected_credential_path(os.path.join(real_home, ".codex", "auth.json"))
+    assert is_protected_credential_path(os.path.join(real_home, ".claude", ".credentials.json"))
+    assert PROTECTED_CREDENTIAL_ROOTS
+    target = os.path.join(real_home, ".codex", "auth.json")
+    prov = CodexCliProvider(CodexCliProfile(executable="/bin/true", state_dir=str(tmp_path), enabled=True),
+                            environ={"PATH": "/usr/bin", "HOME": real_home})  # real HOME, no CODEX_HOME
+    if os.path.lexists(target):  # only existence is checked; the guard refuses before the file is opened
+        with pytest.raises(PermissionError):
+            prov._credential_source()
+        assert credential_guard == [target]
+        credential_guard.clear()  # provoked on purpose
+    else:
+        assert prov._credential_source() is None
+    # The guard also refuses a direct read of the protected path, whether or not it exists.
+    with pytest.raises(PermissionError):
+        CodexCliProvider._read_credentials(target)
+    assert credential_guard == [target]
+    credential_guard.clear()
+
+
+@pytest.mark.skipif(os.environ.get("SYNAPSE_REAL_CODEX") == "1", reason="real-codex session: ambient env is real")
 def test_ambient_environment_never_points_codex_at_the_real_login():
     """conftest points CODEX_HOME at a fake auth.json, so a provider built from os.environ never reads ~/.codex."""
     home = os.environ.get("CODEX_HOME", "")

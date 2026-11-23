@@ -38,6 +38,9 @@ RESERVED_PREFIX = "synapse.builtin."
 REGISTRY_REF_PREFIX = "registry:"
 _REQUIRED = {"id", "provider", "allowed_tools", "permission_mode", "enabled"}
 _OPTIONAL = {"model", "max_timeout_seconds", "max_concurrency", "executable"}  # executable: codex only (required)
+CODEX_SANDBOX_REFUSAL = ("%s: codex profiles are refused while the --claude-cli-config base has \"sandbox\": true; "
+                         "Synapse does not run Codex inside bwrap, so a codex child could read the state dir "
+                         "(approver/operator tokens) that the sandbox hides from Claude")
 _SECRETISH = ("key", "token", "secret", "password", "credential", "auth")
 # Least to most privileged. A task may ask for a mode no more privileged than its profile's.
 MODE_RANK = {"plan": 0, "manual": 1, "acceptEdits": 2, "dontAsk": 3}
@@ -74,6 +77,10 @@ def _entry(raw, index: int, base: AgentConfig) -> ProfileSpec:
     if provider == "claude" and "executable" in raw:
         raise RegistryError("%s: a claude profile uses the --claude-cli-config executable; 'executable' is refused" % where)
     if provider == "codex":
+        if getattr(base.profile, "sandbox", True) is not False:
+            # Synapse does not wrap the Codex child in bwrap: with the base sandbox on, a codex profile would run
+            # without the hidden state dir / credential dirs every Claude child gets (security review of PR #33).
+            raise RegistryError(CODEX_SANDBOX_REFUSAL % where)
         if "executable" not in raw:
             raise RegistryError("%s: a codex profile is missing executable" % where)
         try:

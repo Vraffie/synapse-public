@@ -113,6 +113,8 @@ class AgentRunService:
             raise _bad("profile is disabled")
         if spec.provider not in ("claude", "codex"):
             raise _bad("profile provider is not supported")
+        if spec.provider == "codex" and getattr(self.runtime.profile, "sandbox", True) is not False:
+            raise _bad("codex profiles are refused while the base profile is sandboxed")
         return spec
 
     def validate(self, req: dict, profile_id: str | None = None) -> dict:

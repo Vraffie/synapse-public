@@ -262,11 +262,15 @@ def run(state_dir: Path, migrations: Path, *, enable_mock_mcp_ipc: bool = False,
             frozenset() if profile_registry is None else frozenset(s.id for s in profile_registry.profiles))
         budget_policy = None if budget_policy_path is None else load_budget_policy(
             budget_policy_path, profile_ids=known_profiles)
+        # A codex profile (only possible with the base sandbox off) runs with no Synapse sandbox at all: say so.
+        codex_unsandboxed = profile_registry is not None and any(
+            s.provider == "codex" and s.enabled for s in profile_registry.profiles)
         # Fail closed (security review F1/F2) before touching state unless the operator acknowledged.
         acknowledged = check_same_user_agents(
             state_dir, agents_enabled=agent_config is not None and agent_config.profile.enabled,
             allow=allow_same_user_agents,
-            sandbox_configured=None if agent_config is None else bool(agent_config.profile.sandbox))
+            sandbox_configured=None if agent_config is None else bool(agent_config.profile.sandbox),
+            codex_unsandboxed=codex_unsandboxed)
         worktrees = None
         if agent_config is not None and agent_config.repos:
             try:
@@ -292,7 +296,7 @@ def run(state_dir: Path, migrations: Path, *, enable_mock_mcp_ipc: bool = False,
                 print("agentd: audit chain has no readable external anchor; tamper evidence is limited", file=sys.stderr)
             token = _operator_token(dir_fd)
             if acknowledged:
-                record_acknowledgement(connection)
+                record_acknowledgement(connection, codex_unsandboxed=codex_unsandboxed)
             try:
                 os.mkdir("artifacts", 0o700, dir_fd=dir_fd)
             except FileExistsError:

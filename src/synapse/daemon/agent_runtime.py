@@ -237,11 +237,27 @@ class AgentRuntime:
         if spec is None or not spec.enabled or self.profile is None:
             raise ValueError("profile is not available")
         if spec.provider == "codex":
-            return CodexCliProfile(executable=spec.executable, state_dir=self.profile.state_dir, enabled=True,
-                                   max_timeout_seconds=spec.max_timeout_seconds)
+            if not self._codex_allowed():
+                raise ValueError("codex is refused while the base profile is sandboxed")  # backstop: no spawn
+            base = self.profile
+            # The base profile's resource limits apply to the Codex child too (same fields and ranges as Claude).
+            return CodexCliProfile(executable=spec.executable, state_dir=base.state_dir, enabled=True,
+                                   max_timeout_seconds=spec.max_timeout_seconds,
+                                   memory_limit_bytes=base.memory_limit_bytes,
+                                   max_output_bytes_limit=base.max_output_bytes_limit,
+                                   max_line_bytes=base.max_line_bytes, term_grace_seconds=base.term_grace_seconds)
         if spec.provider != "claude":
             raise ValueError("profile is not available")
         return replace(self.profile, executable=spec.executable)
+
+    def _codex_allowed(self) -> bool:
+        """Codex runs only when the base profile is explicitly unsandboxed.
+
+        Synapse does not wrap the Codex child in bwrap. With ``sandbox: true`` every Claude child has the state dir
+        (approver/operator tokens, agentd.sock) and the home credential dirs hidden; a Codex child would not, so
+        Codex is refused instead of silently running with less isolation than the operator configured.
+        """
+        return self.profile is not None and self.profile.sandbox is False
 
     async def probe_profile(self, profile_id: str) -> ProviderHealth:
         """Advisory health of a registry profile; never starts an agent (Codex runs only ``<exe> --version``).
@@ -271,6 +287,8 @@ class AgentRuntime:
         if declared is None:
             return "profile_unknown"
         if declared.provider == "codex":
+            if not self._codex_allowed():
+                return "codex_ineligible"  # base sandbox on: Synapse cannot give a codex child the same isolation
             try:
                 sandbox_for_task(spec.get("allowed_tools", ()), spec.get("permission_mode"))
             except CodexIneligible:

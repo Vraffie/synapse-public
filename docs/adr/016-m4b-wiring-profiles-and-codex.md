@@ -4,7 +4,10 @@ Status: accepted in part. W0 (finished runs release capacity) and W1 are impleme
 wiring, sandbox mapping, eligibility, recovery set) and the codex part of decision 5 (never primary/fallback, no
 fallback after a spawn refusal or `unknown`) are implemented and tested with fake executables only (2026-11-23). Not
 done: automatic fallback/`allow_fallback`, the decision 9 gates (no independent review of the wiring and no real
-`SYNAPSE_REAL_CODEX=1` run through the daemon yet), a probe API surface. Date: 2026-11-20. Follows ADR 015 (`docs/adr/015-m4b-parallel-agents-and-profiles.md`, PR #85).
+`SYNAPSE_REAL_CODEX=1` run through the daemon yet), a probe API surface. Security review of PR #33: Synapse runs
+Codex without bwrap, so a codex profile is refused when the base profile has `"sandbox": true` (a fake-executable test
+proved a codex child could otherwise read `approver.token`); with the sandbox off it runs unsandboxed under the
+`--allow-same-user-agents` acknowledgement, which records `codex_unsandboxed`. Date: 2026-11-20. Follows ADR 015 (`docs/adr/015-m4b-parallel-agents-and-profiles.md`, PR #85).
 
 This ADR decides how the open M4-B pieces are connected. It was written against `origin/main` plus the **unmerged**
 PRs it names; every statement about those PRs describes their heads at the time of writing and must be re-checked

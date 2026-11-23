@@ -73,13 +73,20 @@ def agents_share_approver_uid(state_dir: Path) -> bool:
     return info.st_uid == os.geteuid()
 
 
+CODEX_NOTE = ("a codex profile is configured; Synapse runs the Codex child WITHOUT any Synapse sandbox (only "
+              "Codex's own -s read-only/workspace-write, which does not confine reads), so it can read the approver "
+              "and operator tokens and reach agentd.sock")
+
+
 def check_same_user_agents(state_dir: Path, *, agents_enabled: bool, allow: bool,
-                           sandbox_configured: bool | None = None) -> bool:
+                           sandbox_configured: bool | None = None, codex_unsandboxed: bool = False) -> bool:
     """Return True when an acknowledged same-user start must be recorded; raise when refused."""
     if not agents_enabled or not agents_share_approver_uid(state_dir):
         return False
     # The verdict only words the message; the refusal below depends solely on `allow`.
     note = sandbox_note(assess_exposure(os.geteuid(), os.geteuid(), sandbox_configured))
+    if codex_unsandboxed:
+        note += "; " + CODEX_NOTE
     if not allow:
         raise SameUserAgentsRefused(
             "refusing to enable agent runs: agents would run as the same user that can read the approver "
@@ -91,7 +98,10 @@ def check_same_user_agents(state_dir: Path, *, agents_enabled: bool, allow: bool
     return True
 
 
-def record_acknowledgement(db: sqlite3.Connection) -> None:
+def record_acknowledgement(db: sqlite3.Connection, *, codex_unsandboxed: bool = False) -> None:
+    detail = {"flag": FLAG, "review": REVIEW_DOC}
+    if codex_unsandboxed:  # only then, so earlier audit rows keep their exact shape
+        detail["codex_unsandboxed"] = True
     append_audit(db, "daemon:startup", ACK_ACTION, "agent-runtime", "allowed", None,
-                 json.dumps({"flag": FLAG, "review": REVIEW_DOC}, sort_keys=True, separators=(",", ":")),
+                 json.dumps(detail, sort_keys=True, separators=(",", ":")),
                  datetime.now(timezone.utc).isoformat())

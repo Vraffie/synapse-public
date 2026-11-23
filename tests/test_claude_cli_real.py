@@ -16,10 +16,10 @@ from synapse.providers.claude_cli import ClaudeCliProfile, ClaudeCliProvider
 from synapse.providers.contracts import ExecutionRequest
 
 CLAUDE = shutil.which("claude")
-pytestmark = pytest.mark.skipif(
+pytestmark = [pytest.mark.real_cli("SYNAPSE_REAL_CLAUDE"), pytest.mark.skipif(
     os.environ.get("SYNAPSE_REAL_CLAUDE") != "1" or CLAUDE is None,
     reason="opt-in: set SYNAPSE_REAL_CLAUDE=1 and put `claude` on PATH",
-)
+)]
 
 SECRET = "synapse-real-test-7f3a9c"
 

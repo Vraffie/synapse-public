@@ -53,6 +53,7 @@ _LOG = logging.getLogger(__name__)
 VERIFIED_CLI_VERSIONS = ("0.170.0",)
 _VERSION_RE = re.compile(r"^codex-cli (\d{1,4}\.\d{1,4}\.\d{1,4})(?:\s|$)")
 _VERSION_TIMEOUT_SECONDS = 10.0
+_VERSION_MAX_BYTES = 4096
 
 # `-s danger-full-access` is deliberately NOT allowed.
 SANDBOX_MODES = frozenset({"read-only", "workspace-write"})
@@ -275,16 +276,46 @@ class CodexCliProvider:
 
     def _cli_version(self) -> str | None:
         """Run `<executable> --version` with a scrubbed environment; None on any failure."""
+        # Own session/process group, stdout read with a hard byte bound, stderr discarded; on timeout (or anything
+        # left behind) the whole group is killed. Never more than _VERSION_MAX_BYTES of the child's output is held.
         env = {k: v for k, v in self._environ.items() if k in _ENV_ALLOWLIST}
         try:
-            done = subprocess.run([self._profile.executable, "--version"], stdin=subprocess.DEVNULL,
-                                  capture_output=True, timeout=_VERSION_TIMEOUT_SECONDS, env=env,
-                                  cwd="/", check=False)
+            proc = subprocess.Popen([self._profile.executable, "--version"], stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, cwd="/",
+                                    start_new_session=True, close_fds=True)
         except (OSError, subprocess.SubprocessError):
             return None
-        if done.returncode != 0:
+        out: list[bytes] = []
+
+        def read() -> None:
+            try:
+                out.append(proc.stdout.read(_VERSION_MAX_BYTES))
+            except (OSError, ValueError):
+                pass
+
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+        exited = False
+        try:
+            # WNOWAIT leaves the exited leader as a zombie, so its process-group id cannot be reused before killpg.
+            deadline = time.monotonic() + _VERSION_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                if os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                    exited = True
+                    break
+                time.sleep(0.01)
+        finally:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)  # the group: also descendants that outlived the child
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait()
+            reader.join(1.0)
+            proc.stdout.close()
+        code = proc.returncode if exited else None
+        if code != 0 or not out:
             return None
-        return parse_cli_version(done.stdout[:256].decode("utf-8", "replace"))
+        return parse_cli_version(out[0][:256].decode("utf-8", "replace"))
 
     async def capabilities(self, profile_id: str) -> ProviderCapabilities:
         validate_id(profile_id)

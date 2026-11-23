@@ -114,6 +114,9 @@ tool outside `Read`, `Glob`, `Grep`, `Edit`, `Write` (for example any `Bash(...)
 inside its sandbox (it can run shell commands there); it only selects the sandbox. Same-user trust applies as for
 Claude: the agent runs as the daemon's user and can read that user's files.
 
+**Codex runs unsandboxed by Synapse.** Synapse does not wrap the Codex child in bwrap; the only confinement is Codex's own `-s read-only` / `-s workspace-write`, and `read-only` does not confine reads. A Codex child can therefore read anything the daemon's user can: `approver.token` and `operator.token` in the state dir (so it can approve its own gated requests), the SQLite database, `agentd.sock`, and the user's other credentials. For that reason a codex profile is **refused** (startup error, and `codex_ineligible`/422 as backstops) whenever the `--claude-cli-config` base has `"sandbox": true`: it would silently get less isolation than every Claude child. Codex is only available with the base sandbox off and `--allow-same-user-agents` acknowledged; the startup warning and the `agent_runtime.same_user_acknowledged` audit row then record `codex_unsandboxed: true`. In practice: only name a Codex profile for work you would let run with full read access to
+your account and to the daemon's approval secrets; approvals do not constrain a Codex task.
+
 ## `GET /api/v1/runs/{run_id}/agent`
 
 Read-only; 404 for an unknown or non-agent run. Top level: `run_id`, `run_state`,

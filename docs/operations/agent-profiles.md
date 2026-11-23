@@ -170,8 +170,10 @@ with `"enabled": true`.
   records `model: null`), no extra arguments, no state dir (the daemon's own state dir is used, so the startup
   credential sweep covers `codex-run/` scratch dirs), no credentials. The adapter copies `$CODEX_HOME/auth.json`, else
   `~/.codex/auth.json` of the daemon's user, into a per-run scratch `CODEX_HOME` at `0600` and removes it afterwards.
-- **Base profile still required.** Agent runs, repos, worktrees, the approval policy and the same-user
-  acknowledgement come from the enabled `--claude-cli-config` base, so a Codex task needs it enabled too.
+- **Base profile still required.** Agent runs, repos, worktrees, the approval policy, the resource limits
+  (`memory_limit_bytes` and output caps) and the same-user acknowledgement come from the enabled
+  `--claude-cli-config` base, so a Codex task needs it enabled (and with `"sandbox": false`, see above).
+- **Unsandboxed.** **Codex runs unsandboxed by Synapse.** Synapse does not wrap the Codex child in bwrap; the only confinement is Codex's own `-s read-only` / `-s workspace-write`, and `read-only` does not confine reads. A Codex child can therefore read anything the daemon's user can: `approver.token` and `operator.token` in the state dir (so it can approve its own gated requests), the SQLite database, `agentd.sock`, and the user's other credentials. For that reason a codex profile is **refused** (startup error, and `codex_ineligible`/422 as backstops) whenever the `--claude-cli-config` base has `"sandbox": true`: it would silently get less isolation than every Claude child. Codex is only available with the base sandbox off and `--allow-same-user-agents` acknowledged; the startup warning and the `agent_runtime.same_user_acknowledged` audit row then record `codex_unsandboxed: true`.
 - **Same trust domain.** The Codex child runs as the daemon's OS user. `read-only` is not known to confine reads,
   and the scratch `auth.json` is readable by the agent for the run's duration (see the adapter doc).
 - **No fallback after a refusal.** A spawn refusal (for example a worktree with `AGENTS.md`) fails the attempt with
