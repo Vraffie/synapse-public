@@ -44,6 +44,20 @@ elif mode == "noisy":
         text("progress step %d" % i)
     text("FAILED tests/test_b.py::test_two - ValueError: bad")
     ok()
+elif mode in ("errors", "errors-fail"):
+    for i in range(3000):
+        text("error: distinct failure number %d in module_%d" % (i, i))
+    if mode == "errors-fail":
+        sys.exit(3)
+    ok()
+elif mode == "nul":
+    text("start\\x00binary")
+    text("FAILED tests/test_n.py::test_nul - AssertionError: after nul")
+    ok()
+elif mode == "huge":
+    for i in range(130):
+        text(("%04d " % i) + "y" * 40000)
+    ok()
 elif mode == "noisy-fail":
     text("FAILED tests/test_c.py::test_three - KeyError: k")
     sys.exit(3)
@@ -982,3 +996,90 @@ def test_cleared_cooldown_lets_the_profile_run_again(env):
         await finish(env)
     asyncio.run(go())
     assert env.states() == ("succeeded", {"work": "completed"})
+
+
+# ------------------------------------------------------------------ M5.3 review fixes (A's findings on #1)
+def _run(env, prompt):
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(prompt=prompt))
+        await finish(env)
+    asyncio.run(go())
+
+
+def test_a_large_reduction_is_clipped_so_a_succeeded_attempt_still_gets_a_summary(env):
+    _run(env, "errors")
+    assert env.states() == ("succeeded", {"work": "completed"})  # before the fix: run recovering, task blocked
+    (summary,) = env.summaries()
+    (raw_row,) = _only(env, "agent_raw_output")
+    assert summary["clipped"] is True and summary["output_truncated"] is True
+    assert len(summary["output_text"].encode()) <= 32 * 1024 and "[clipped" in summary["output_text"]
+    assert summary["reduction"]["over_budget"] is True and summary["reduction"]["kept_failures"] >= 100
+    assert summary["raw_artifact_id"] == raw_row[0] and summary["raw_sha256"] == raw_row[1]  # digest kept, full text in raw
+    assert b"module_2999" in env.runtime.blobs.with_max_bytes(4 * 1024 * 1024).read(raw_row[1])
+
+
+def test_a_large_reduction_on_a_failed_attempt_still_records_its_summary(env):
+    _run(env, "errors-fail")
+    assert env.states()[1] == {"work": "failed"}
+    (summary,) = env.summaries()  # before the fix: no summary, only a log line
+    assert summary["outcome"] != "succeeded" and summary["clipped"] is True and summary["raw_artifact_id"]
+    assert len(summary["output_text"].encode()) <= 32 * 1024
+
+
+def test_a_nul_byte_does_not_hide_failure_lines_and_the_raw_artifact_keeps_the_real_bytes(env):
+    _run(env, "nul")
+    (summary,) = env.summaries()
+    (raw_row,) = _only(env, "agent_raw_output")
+    raw = env.runtime.blobs.with_max_bytes(4 * 1024 * 1024).read(raw_row[1])
+    assert b"\x00" in raw and hashlib.sha256(raw).hexdigest() == summary["raw_sha256"]
+    assert summary["nul_replaced"] is True and "binary output omitted" not in summary["output_text"]
+    assert "test_n.py::test_nul - AssertionError: after nul" in summary["output_text"]
+
+
+def test_output_over_the_4_mib_cap_fails_the_attempt_and_stores_a_capped_raw_artifact(env):
+    _run(env, "huge")
+    assert env.states()[1] == {"work": "failed"}  # the provider's output limit stops it; never "succeeded"
+    (summary,) = env.summaries()
+    (raw_row,) = _only(env, "agent_raw_output")
+    assert summary["outcome"] != "succeeded" and summary["output_truncated"] is True
+    assert 0 < raw_row[2] <= 4 * 1024 * 1024 and summary["raw_sha256"] == raw_row[1]
+    assert summary["raw_artifact_id"] == raw_row[0]
+    assert summary["detail"] == "output_limit"
+
+
+def test_failed_attempt_that_cannot_store_raw_output_keeps_a_capped_summary_without_raw_id(env, monkeypatch):
+    class Full:
+        def put(self, chunks):
+            raise OSError("disk full")
+    monkeypatch.setattr(type(env.runtime.blobs), "with_max_bytes", lambda self, n: Full())
+    _run(env, "noisy-fail")
+    assert env.states()[1] == {"work": "failed"}
+    (summary,) = env.summaries()
+    assert summary["raw_artifact_id"] is None and summary["raw_sha256"] is None and summary["raw_complete"] is False
+    assert "test_c.py::test_three" in summary["output_text"] and _only(env, "agent_raw_output") == []
+
+
+def test_a_stored_raw_artifact_with_the_wrong_digest_fails_a_succeeded_attempt_closed(env, monkeypatch):
+    import synapse.orchestration.agent_engine as engine
+    real = engine.publish_artifact
+    def lying(db, blobs, **kwargs):
+        result = real(db, blobs, **kwargs)
+        if kwargs["provenance"]["kind"] == "agent_raw_output":
+            result.response["sha256"] = "0" * 64
+        return result
+    monkeypatch.setattr(engine, "publish_artifact", lying)
+    _run(env, "ok")
+    assert env.states()[1] == {"work": "blocked"}
+    assert env.db.execute("SELECT count(*) FROM verification_results").fetchone() == (0,)
+
+
+def test_a_capped_capture_is_reported_as_incomplete_in_the_summary_fields(env):
+    from synapse.orchestration.agent_engine import AgentWorkflowEngine
+    engine = object.__new__(AgentWorkflowEngine)  # only the storage seam is under test, no provider needed
+    engine.db, engine._principal = env.db, "agent-engine"
+    engine.raw_blobs = env.runtime.blobs.with_max_bytes(4 * 1024 * 1024)
+    async def go():
+        return await engine._store_raw_and_reduce(env.run_id, "work", "attempt-x", b"line one\nline two\n", True)
+    fields = asyncio.run(go())
+    assert fields["raw_complete"] is False and fields["output_truncated"] is True and fields["raw_artifact_id"]
+    assert fields["raw_sha256"] == hashlib.sha256(b"line one\nline two\n").hexdigest()

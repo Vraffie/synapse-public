@@ -66,12 +66,20 @@ combination with `dataclasses.replace` on the operator profile (re-validated).
 Per attempt the full assistant text (one output event per line, capped at 4 MiB) is published as a
 `text/plain` artifact with provenance `kind=agent_raw_output`, then a bounded summary is published as an
 `application/json` artifact: `output_text` is the deterministic [output reduction](output-reducer.md) of the raw
-text (at most 16 KiB; every distinct failure line is kept), `raw_sha256` and `raw_artifact_id` name the raw artifact
+text (reduced to about 16 KiB; the reducer keeps every distinct failure line even past its budget, so the forwarded
+text is **hard-clipped at 32 KiB** with a marker and `clipped: true`; the rest is in the raw artifact), `raw_sha256` and `raw_artifact_id` name the raw artifact
 so the unreduced output stays recoverable, `raw_complete` is false when the 4 MiB cap cut it, `reduction` holds the
 rules applied, dropped line count and kept-failure count, plus at most 100 tool names and never tool inputs. Reduction
 only changes what is forwarded; the outcome and the verifier do not depend on it. If the raw artifact cannot be stored,
 a succeeded attempt fails closed (the task is blocked for an operator, nothing re-spawns); a failed attempt still
 records its summary with `raw_artifact_id` null and `raw_complete` false. The
+raw artifact holds the provider's text **unredacted** (up to 4 MiB, the same private blob directory as other
+artifacts, mode 0600). Approvers are not shown it: the approval reader filters on `kind='agent_summary'`. Anything
+that can read `<state>/artifacts` or list artifacts by kind can read it, so treat it like the transcript it is. A NUL
+byte in the output would make the reducer replace the whole text with "[binary output omitted]" and hide failure lines;
+the engine reduces a copy with NUL replaced by U+FFFD (`nul_replaced: true`), while the raw artifact and `raw_sha256`
+keep the real bytes. Output past the 4 MiB cap is stopped by the provider (`output_limit`, a failed attempt) and what
+was captured is stored; `raw_complete` is false only if the engine itself had to cut the capture. The
 provider's usage observation is recorded as an `agent.usage_observed` event and as an append-only
 `usage_observations` ledger row, readable with `agentctl usage RUN` (see [usage-ledger](usage-ledger.md); missing
 usage records nothing and is never shown as zero).

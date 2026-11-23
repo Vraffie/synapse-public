@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
+import hashlib
 import json
 import logging
 import sqlite3
@@ -41,6 +42,10 @@ from synapse.providers.contracts import ExecutionRequest, ProviderAdapter, Provi
 
 _LOG = logging.getLogger(__name__)
 MAX_SUMMARY_TEXT_BYTES = 16 * 1024
+# reduce_output keeps every failure line even past its budget (up to 1 MiB); the summary blob holds 64 KiB, so the
+# forwarded text is clipped hard. The full text is always in the raw artifact.
+MAX_FORWARDED_TEXT_BYTES = 32 * 1024
+_CLIP_MARKER = "\n[clipped: output continues in the raw artifact]\n"
 MAX_TOOL_NAMES = 100
 _PROVIDER_OUTPUT_CAP = 4 * 1024 * 1024
 RAW_OUTPUT_KIND = "agent_raw_output"
@@ -118,6 +123,15 @@ class AgentProviderRouter:
 
     async def usage(self, handle) -> UsageObservation | None:
         return await self._owner[handle].usage(handle)
+
+
+def _clip_text(text: str) -> tuple[str, bool]:
+    """Hard cap on forwarded text, cut on a UTF-8 boundary, with a marker. Returns (text, clipped)."""
+    data = text.encode("utf-8")
+    if len(data) <= MAX_FORWARDED_TEXT_BYTES:
+        return text, False
+    room = MAX_FORWARDED_TEXT_BYTES - len(_CLIP_MARKER.encode("utf-8"))
+    return data[:room].decode("utf-8", "ignore") + _CLIP_MARKER, True
 
 
 class AgentWorkflowEngine(MockWorkflowEngine):
@@ -308,7 +322,13 @@ class AgentWorkflowEngine(MockWorkflowEngine):
 
         The raw artifact is published before the summary so the summary can cite it.
         """
-        reduced = await asyncio.to_thread(reduce_output, raw, max_bytes=MAX_SUMMARY_TEXT_BYTES)
+        # The reducer treats a NUL byte as binary and would replace the whole text, hiding failure lines. Reduce a
+        # copy with NUL replaced by U+FFFD; the stored artifact and the digest are always of the real bytes.
+        nul_replaced = b"\x00" in raw
+        scrubbed = raw.replace(b"\x00", "\ufffd".encode()) if nul_replaced else raw
+        reduced = await asyncio.to_thread(reduce_output, scrubbed, max_bytes=MAX_SUMMARY_TEXT_BYTES)
+        raw_sha256 = hashlib.sha256(raw).hexdigest()
+        text, clipped = _clip_text(reduced.reduced)
         artifact_id = None
         if raw:
             artifact_id = new_id()
@@ -316,10 +336,11 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                 media_type="text/plain; charset=utf-8",
                 provenance={"run_id": run_id, "task_id": task_id, "attempt_id": attempt_id, "kind": RAW_OUTPUT_KIND},
                 principal=self._principal, idempotency_key=attempt_id + ":raw").response
-            if ref["sha256"] != reduced.raw_sha256:
+            if ref["sha256"] != raw_sha256:
                 raise RuntimeError("Stored raw output does not match its reduction hash")
-        return {"output_text": reduced.reduced, "output_truncated": bool(reduced.truncated or reduced.dropped_lines or reduced.rules_applied or raw_capped),
-                "raw_sha256": reduced.raw_sha256, "raw_artifact_id": artifact_id,
+        return {"output_text": text, "output_truncated": bool(clipped or reduced.truncated or reduced.dropped_lines or reduced.rules_applied or raw_capped),
+                "clipped": clipped, "nul_replaced": nul_replaced,
+                "raw_sha256": raw_sha256, "raw_artifact_id": artifact_id,
                 "raw_complete": not raw_capped,
                 "reduction": {"rules": list(reduced.rules_applied), "dropped_lines": reduced.dropped_lines,
                               "kept_failures": len(reduced.kept_failures), "over_budget": reduced.over_budget}}
@@ -412,8 +433,9 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                 if outcome == "succeeded":
                     raise  # fail closed: a success whose raw output cannot be kept is blocked for an operator
                 _LOG.exception("Could not store raw output for task %s", task_id)
-                cut = bytes(raw[:MAX_SUMMARY_TEXT_BYTES]).decode("utf-8", "ignore")
-                reduction = {"output_text": cut, "output_truncated": True, "raw_sha256": None,
+                cut = bytes(raw[:MAX_SUMMARY_TEXT_BYTES]).decode("utf-8", "ignore").replace("\x00", "\ufffd")
+                reduction = {"output_text": cut, "output_truncated": True, "clipped": False, "nul_replaced": b"\x00" in raw,
+                             "raw_sha256": None,
                              "raw_artifact_id": None, "raw_complete": False, "reduction": None}
             summary = {"v": 1, "run_id": run_id, "task_id": task_id, "attempt_id": attempt_id, "outcome": outcome,
                        "detail": detail if isinstance(detail, str) else None,
