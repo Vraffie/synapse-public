@@ -152,6 +152,15 @@ def _fit_summary(summary: dict) -> dict:
     return fitted
 
 
+def _manifest_head(head: object) -> str | None:
+    """A 40-hex worktree head, lowercased; anything else is recorded as unknown (None) so the manifest is kept."""
+    if isinstance(head, str) and len(head) == 40:
+        lowered = head.lower()
+        if all(c in "0123456789abcdef" for c in lowered):
+            return lowered
+    return None
+
+
 def _clip_text(text: str) -> tuple[str, bool]:
     """Hard cap on forwarded text, cut on a UTF-8 boundary, with a marker. Returns (text, clipped)."""
     data = text.encode("utf-8")
@@ -382,7 +391,7 @@ class AgentWorkflowEngine(MockWorkflowEngine):
             head = spec.get("worktree_head")
             entries = [ManifestEntry("spec", task_id, spec_hash(dict(spec))),
                        ManifestEntry("artifact", str(spec["prompt_artifact_id"]), spec["prompt_sha256"], spec.get("prompt_bytes"))]
-            manifest = build_manifest(task_id, repo_head=head if isinstance(head, str) and len(head) == 40 else None,
+            manifest = build_manifest(task_id, repo_head=_manifest_head(head),
                                       worktree_clean=None, entries=entries)
             with self._transaction():
                 record_manifest(self.db, run_id=run_id, attempt_id=attempt_id, manifest=manifest)

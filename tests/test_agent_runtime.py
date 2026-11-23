@@ -1127,3 +1127,10 @@ def test_manifest_recording_failure_does_not_fail_the_attempt(env, monkeypatch):
     asyncio.run(go())
     assert env.states() == ("succeeded", {"work": "completed"})
     assert env.db.execute("SELECT count(*) FROM context_manifests").fetchone()[0] == 0
+
+
+def test_a_worktree_head_is_lowercased_and_an_invalid_one_becomes_unknown_not_a_lost_manifest():
+    from synapse.orchestration.agent_engine import _manifest_head
+    assert _manifest_head("A" * 40) == "a" * 40 and _manifest_head("ab12" * 10) == "ab12" * 10
+    for bad in ("g" * 40, "a" * 39, "a" * 41, "", None, 7, "A" * 39 + "Z"):
+        assert _manifest_head(bad) is None
