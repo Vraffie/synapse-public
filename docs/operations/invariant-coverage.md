@@ -75,13 +75,17 @@ Not covered: message and prompt seams are tested (grants unchanged after a messa
 
 ## 7. unknown quota displayed as unknown
 
-Status: `partial`.
+Status: `covered`.
 
 - `test_usage_ledger.py::test_partial_usage_keeps_unknown_fields_none_not_zero`
 - `test_budget_wiring.py::test_missing_usage_is_unknown_never_zero`
 - `test_invariants.py::test_detects_usage_row_that_reports_nothing`
+- `test_cli_usage_daemon.py::test_usage_reports_known_totals_and_per_field_coverage`
+- `test_cli_usage_daemon.py::test_usage_for_run_without_attempts_is_empty_not_zero`
+- `test_desktop_agent_run.py::test_usage_table_distinguishes_zero_from_unknown`
+- `test_desktop_agent_run.py::test_usage_empty_unavailable_and_invalid_states`
 
-Not covered: storage and budget side only; what the desktop and CLI show for unknown is not asserted here.
+Not covered: real provider usage reports (only fakes are used) and the desktop under a real display; Qt tests run offscreen.
 
 ## 8. desktop disconnection cannot cancel work
 
@@ -124,6 +128,5 @@ its observable effect on the daemon is exactly these dropped sockets.
 ## Remaining gaps
 
 - Invariant 6: a real spawned agent and a real model's obedience are not tested; only the message and prompt seams are.
-- Invariant 7: the display of unknown quota in the desktop and CLI is not asserted by the harness.
 - Invariant 10: reduction is covered through the engine since M5.3; scenarios for the exact cache wait for the M5.4 second half, and routing is dry-run only.
 - Stability: the harness (`tests/test_invariants.py`, `tests/test_fault_injection*.py`, this map) passed 5 consecutive runs of 98 tests each (2026-11-23, local, about 15 s per run). That is evidence against obvious flakiness, not a proof, and CI was not used.

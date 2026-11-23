@@ -50,11 +50,15 @@ COVERAGE = {
         "test_capability_elevation.py::test_hostile_text_in_a_prompt_value_cannot_close_its_fence_or_outrank_the_guard",
         "test_capability_elevation.py::test_a_prompt_value_cannot_inject_new_template_fields_or_extra_values",
     ], "message and prompt seams are tested (grants unchanged after a message that asks for power, forged fields refused, hostile text cannot close its fence); not tested: a real spawned agent, whose only enforcement is the spawn's tool and permission allowlist, and a real model's obedience"),
-    7: ("unknown quota displayed as unknown", "partial", [
+    7: ("unknown quota displayed as unknown", "covered", [
         "test_usage_ledger.py::test_partial_usage_keeps_unknown_fields_none_not_zero",
         "test_budget_wiring.py::test_missing_usage_is_unknown_never_zero",
         "test_invariants.py::test_detects_usage_row_that_reports_nothing",
-    ], "storage and budget side only; what the desktop and CLI show for unknown is not asserted here"),
+        "test_cli_usage_daemon.py::test_usage_reports_known_totals_and_per_field_coverage",
+        "test_cli_usage_daemon.py::test_usage_for_run_without_attempts_is_empty_not_zero",
+        "test_desktop_agent_run.py::test_usage_table_distinguishes_zero_from_unknown",
+        "test_desktop_agent_run.py::test_usage_empty_unavailable_and_invalid_states",
+    ], "real provider usage reports (only fakes are used) and the desktop under a real display; Qt tests run offscreen"),
     8: ("desktop disconnection cannot cancel work", "covered", [
         "test_fault_injection_clients.py::test_dropped_clients_never_cancel_a_parked_run_and_approval_still_finishes_it",
     ], "real daemon, dropped HTTP and WebSocket clients; a killed Qt process is not simulated, only its socket behaviour"),
