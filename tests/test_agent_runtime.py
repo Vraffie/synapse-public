@@ -36,6 +36,36 @@ if mode.startswith("ok"):
     text("hello " + "x" * 40000 if mode == "ok-long" else "hello")
     emit({{"type": "assistant", "message": {{"content": [{{"type": "tool_use", "name": "Edit", "input": {{"secret": "TOPSECRET"}}}}]}}}})
     ok()
+elif mode == "noisy":
+    for i in range(3000):
+        text("progress step %d" % i)
+    text("FAILED tests/test_a.py::test_one - AssertionError: boom")
+    for i in range(3000, 6000):
+        text("progress step %d" % i)
+    text("FAILED tests/test_b.py::test_two - ValueError: bad")
+    ok()
+elif mode in ("errors", "errors-fail"):
+    for i in range(3000):
+        text("error: distinct failure number %d in module_%d" % (i, i))
+    if mode == "errors-fail":
+        sys.exit(3)
+    ok()
+elif mode in ("errors-emoji", "errors-cjk", "errors-quotes"):
+    filler = {{"errors-emoji": chr(0x1F600) * 60, "errors-cjk": chr(0x9519) * 80, "errors-quotes": ('"' + chr(92)) * 40}}[mode]
+    for i in range(3000):
+        text("error: distinct failure %d " % i + filler)
+    ok()
+elif mode == "nul":
+    text("start\\x00binary")
+    text("FAILED tests/test_n.py::test_nul - AssertionError: after nul")
+    ok()
+elif mode == "huge":
+    for i in range(130):
+        text(("%04d " % i) + "y" * 40000)
+    ok()
+elif mode == "noisy-fail":
+    text("FAILED tests/test_c.py::test_three - KeyError: k")
+    sys.exit(3)
 elif mode == "usage-full":
     text("hi")
     emit({{"type": "result", "subtype": "success", "is_error": False, "total_cost_usd": 0.0131914,
@@ -187,6 +217,68 @@ def test_success_completes_with_bounded_summary_and_usage(env):
     assert env.runtime.blobs.read(spec["prompt_sha256"]) == b"ok-long"
     assert at.is_agent_run(env.db, env.run_id) and ms.mock_kind(env.db, env.run_id) is None
     assert env.db.execute("SELECT DISTINCT json_extract(payload_json,'$.principal') FROM events WHERE type='task.state_changed' AND json_extract(payload_json,'$.after')<>'completed'").fetchall() == [("agent-engine",)]
+
+
+def _only(env, kind):
+    rows = env.db.execute("SELECT id,sha256,byte_size FROM artifacts WHERE json_extract(provenance_json,'$.kind')=?", (kind,)).fetchall()
+    return rows
+
+
+def test_raw_output_is_stored_and_summary_carries_reduction_and_raw_hash(env):
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(prompt="noisy"))
+        await finish(env)
+    asyncio.run(go())
+    assert env.states() == ("succeeded", {"work": "completed"})
+    (summary,) = env.summaries()
+    (raw_row,) = _only(env, "agent_raw_output")
+    raw = env.runtime.blobs.with_max_bytes(4 * 1024 * 1024).read(raw_row[1])
+    # The raw hash in the summary is recoverable: it names the stored raw artifact, byte for byte.
+    assert summary["raw_sha256"] == raw_row[1] == hashlib.sha256(raw).hexdigest()
+    assert summary["raw_artifact_id"] == raw_row[0] and summary["raw_complete"] is True
+    assert summary["output_bytes"] == len(raw) == raw_row[2] > 60000
+    assert raw.count(b"progress step") == 6000
+    # The forwarded text is much smaller yet keeps every failure line.
+    reduced = summary["output_text"]
+    assert len(reduced.encode()) <= 16 * 1024 and "progress step 4000" not in reduced and "similar lines" in reduced
+    assert "FAILED tests/test_a.py::test_one - AssertionError: boom" in reduced
+    assert "FAILED tests/test_b.py::test_two - ValueError: bad" in reduced
+    assert summary["reduction"]["kept_failures"] == 2 and summary["output_truncated"] is True
+    assert env.db.execute("SELECT outcome FROM verification_results").fetchall() == [("approved",)]
+
+
+def test_failed_attempt_still_stores_raw_and_keeps_failure_lines(env):
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(prompt="noisy-fail"))
+        await finish(env)
+    asyncio.run(go())
+    assert env.states()[1] == {"work": "failed"}
+    (summary,) = env.summaries()
+    (raw_row,) = _only(env, "agent_raw_output")
+    assert summary["raw_sha256"] == raw_row[1] and "test_c.py::test_three" in summary["output_text"]
+
+
+def test_no_output_stores_no_raw_artifact(env):
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(prompt="fail"))
+        await finish(env)
+    asyncio.run(go())
+    (summary,) = env.summaries()
+    assert summary["raw_artifact_id"] is None and summary["output_bytes"] == 0
+    assert summary["raw_sha256"] == hashlib.sha256(b"").hexdigest() and _only(env, "agent_raw_output") == []
+
+
+def test_succeeded_attempt_fails_closed_when_raw_cannot_be_stored(env, monkeypatch):
+    class Full:
+        def put(self, chunks):
+            raise OSError("disk full")
+    monkeypatch.setattr(type(env.runtime.blobs), "with_max_bytes", lambda self, n: Full())
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(prompt="ok"))
+        await finish(env)
+    asyncio.run(go())
+    assert env.states()[1] == {"work": "blocked"}
+    assert env.db.execute("SELECT count(*) FROM verification_results").fetchone() == (0,)
 
 
 def test_two_tasks_run_in_dependency_order(tmp_path):
@@ -909,3 +1001,101 @@ def test_cleared_cooldown_lets_the_profile_run_again(env):
         await finish(env)
     asyncio.run(go())
     assert env.states() == ("succeeded", {"work": "completed"})
+
+
+# ------------------------------------------------------------------ M5.3 review fixes (A's findings on #1)
+def _run(env, prompt):
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(prompt=prompt))
+        await finish(env)
+    asyncio.run(go())
+
+
+def test_a_large_reduction_is_clipped_so_a_succeeded_attempt_still_gets_a_summary(env):
+    _run(env, "errors")
+    assert env.states() == ("succeeded", {"work": "completed"})  # before the fix: run recovering, task blocked
+    (summary,) = env.summaries()
+    (raw_row,) = _only(env, "agent_raw_output")
+    assert summary["clipped"] is True and summary["output_truncated"] is True
+    assert len(summary["output_text"].encode()) <= 32 * 1024 and "[clipped" in summary["output_text"]
+    assert summary["reduction"]["over_budget"] is True and summary["reduction"]["kept_failures"] >= 100
+    assert summary["raw_artifact_id"] == raw_row[0] and summary["raw_sha256"] == raw_row[1]  # digest kept, full text in raw
+    assert b"module_2999" in env.runtime.blobs.with_max_bytes(4 * 1024 * 1024).read(raw_row[1])
+
+
+def test_a_large_reduction_on_a_failed_attempt_still_records_its_summary(env):
+    _run(env, "errors-fail")
+    assert env.states()[1] == {"work": "failed"}
+    (summary,) = env.summaries()  # before the fix: no summary, only a log line
+    assert summary["outcome"] != "succeeded" and summary["clipped"] is True and summary["raw_artifact_id"]
+    assert len(summary["output_text"].encode()) <= 32 * 1024
+
+
+def test_a_nul_byte_does_not_hide_failure_lines_and_the_raw_artifact_keeps_the_real_bytes(env):
+    _run(env, "nul")
+    (summary,) = env.summaries()
+    (raw_row,) = _only(env, "agent_raw_output")
+    raw = env.runtime.blobs.with_max_bytes(4 * 1024 * 1024).read(raw_row[1])
+    assert b"\x00" in raw and hashlib.sha256(raw).hexdigest() == summary["raw_sha256"]
+    assert summary["nul_replaced"] is True and "binary output omitted" not in summary["output_text"]
+    assert "test_n.py::test_nul - AssertionError: after nul" in summary["output_text"]
+
+
+def test_output_over_the_4_mib_cap_fails_the_attempt_and_stores_a_capped_raw_artifact(env):
+    _run(env, "huge")
+    assert env.states()[1] == {"work": "failed"}  # the provider's output limit stops it; never "succeeded"
+    (summary,) = env.summaries()
+    (raw_row,) = _only(env, "agent_raw_output")
+    assert summary["outcome"] != "succeeded" and summary["output_truncated"] is True
+    assert 0 < raw_row[2] <= 4 * 1024 * 1024 and summary["raw_sha256"] == raw_row[1]
+    assert summary["raw_artifact_id"] == raw_row[0]
+    assert summary["detail"] == "output_limit"
+
+
+def test_failed_attempt_that_cannot_store_raw_output_keeps_a_capped_summary_without_raw_id(env, monkeypatch):
+    class Full:
+        def put(self, chunks):
+            raise OSError("disk full")
+    monkeypatch.setattr(type(env.runtime.blobs), "with_max_bytes", lambda self, n: Full())
+    _run(env, "noisy-fail")
+    assert env.states()[1] == {"work": "failed"}
+    (summary,) = env.summaries()
+    assert summary["raw_artifact_id"] is None and summary["raw_sha256"] is None and summary["raw_complete"] is False
+    assert "test_c.py::test_three" in summary["output_text"] and _only(env, "agent_raw_output") == []
+
+
+def test_a_stored_raw_artifact_with_the_wrong_digest_fails_a_succeeded_attempt_closed(env, monkeypatch):
+    import synapse.orchestration.agent_engine as engine
+    real = engine.publish_artifact
+    def lying(db, blobs, **kwargs):
+        result = real(db, blobs, **kwargs)
+        if kwargs["provenance"]["kind"] == "agent_raw_output":
+            result.response["sha256"] = "0" * 64
+        return result
+    monkeypatch.setattr(engine, "publish_artifact", lying)
+    _run(env, "ok")
+    assert env.states()[1] == {"work": "blocked"}
+    assert env.db.execute("SELECT count(*) FROM verification_results").fetchone() == (0,)
+
+
+def test_a_capped_capture_is_reported_as_incomplete_in_the_summary_fields(env):
+    from synapse.orchestration.agent_engine import AgentWorkflowEngine
+    engine = object.__new__(AgentWorkflowEngine)  # only the storage seam is under test, no provider needed
+    engine.db, engine._principal = env.db, "agent-engine"
+    engine.raw_blobs = env.runtime.blobs.with_max_bytes(4 * 1024 * 1024)
+    async def go():
+        return await engine._store_raw_and_reduce(env.run_id, "work", "attempt-x", b"line one\nline two\n", True)
+    fields = asyncio.run(go())
+    assert fields["raw_complete"] is False and fields["output_truncated"] is True and fields["raw_artifact_id"]
+    assert fields["raw_sha256"] == hashlib.sha256(b"line one\nline two\n").hexdigest()
+
+
+@pytest.mark.parametrize("prompt", ["errors-emoji", "errors-cjk", "errors-quotes"])
+def test_the_summary_is_sized_on_its_serialised_json_so_escaped_text_cannot_overflow(env, prompt):
+    _run(env, prompt)
+    assert env.states() == ("succeeded", {"work": "completed"})
+    (row,) = env.db.execute("SELECT sha256,byte_size FROM artifacts WHERE json_extract(provenance_json,'$.kind')='agent_summary'").fetchall()
+    assert row[1] <= 48 * 1024  # the stored JSON, not the text
+    (summary,) = env.summaries()
+    assert summary["clipped"] is True and "[clipped" in summary["output_text"] and summary["raw_artifact_id"]
+    assert env.db.execute("SELECT outcome FROM verification_results").fetchall() == [("approved",)]

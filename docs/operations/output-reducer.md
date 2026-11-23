@@ -2,8 +2,7 @@
 
 `synapse.application.output_reducer.reduce_output(data, *, kind="generic", max_bytes=16384)` makes a bounded,
 readable version of one tool or command output. It is **pure and deterministic**: no I/O, no clock, no
-randomness, no LLM. It is **not wired into anything yet**; a later change decides where Synapse applies it
-(for example to the text that goes into messages and summaries, with the raw output kept as an artifact).
+randomness, no LLM. It is wired into the agent path (`AgentWorkflowEngine`, see [agent-runtime](agent-runtime.md)); the raw output is stored as an artifact and only the reduction is forwarded in the attempt summary.
 
 It follows [ARCHITECTURE.md §11](../architecture/ARCHITECTURE.md): "Tool output reducer preserves all unique
 failures and raw output". The reducer never stores the raw text. It returns `raw_sha256` (and `raw_bytes`)

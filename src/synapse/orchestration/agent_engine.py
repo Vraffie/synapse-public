@@ -9,14 +9,19 @@ differences, all deliberately conservative:
 * an ``unknown`` provider outcome, or any error after the process may have
   started, records the attempt as ``unknown`` and blocks the task for an
   operator; nothing re-spawns it;
-* provider output is reduced to a bounded summary (capped text, tool names
-  only) stored as an artifact; usage is recorded as an event.
+* the full provider text output is stored as a raw artifact (its SHA-256 is
+  recorded in the summary), and the summary carries the deterministic reduction
+  of it (every unique failure kept, see ``application.output_reducer``) plus
+  tool names only, stored as a second artifact; usage is recorded as an event.
+  Reduction affects only what is forwarded; the outcome and the verifier never
+  depend on it, so mandatory checks cannot be reduced away.
 """
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
+import hashlib
 import json
 import logging
 import sqlite3
@@ -24,6 +29,7 @@ from typing import Any
 
 from synapse.domain.contracts import EventEnvelope, encode_payload, new_id
 from synapse.domain.runs import RunChange, RunState
+from synapse.application.output_reducer import reduce_output
 from synapse.domain.workflow import State
 from synapse.infrastructure.artifact_blobs import ArtifactBlobStore
 from synapse.orchestration.mock_engine import MockWorkflowEngine, _RunInterrupted
@@ -36,8 +42,15 @@ from synapse.providers.contracts import ExecutionRequest, ProviderAdapter, Provi
 
 _LOG = logging.getLogger(__name__)
 MAX_SUMMARY_TEXT_BYTES = 16 * 1024
+# reduce_output keeps every failure line even past its budget (up to 1 MiB); the summary blob holds 64 KiB, so the
+# forwarded text is clipped hard. The full text is always in the raw artifact.
+MAX_FORWARDED_TEXT_BYTES = 32 * 1024
+# The serialised summary (json.dumps escapes non-ASCII: up to 3x) must fit the 64 KiB blob bound with headroom.
+MAX_SUMMARY_JSON_BYTES = 48 * 1024
+_CLIP_MARKER = "\n[clipped: output continues in the raw artifact]\n"
 MAX_TOOL_NAMES = 100
 _PROVIDER_OUTPUT_CAP = 4 * 1024 * 1024
+RAW_OUTPUT_KIND = "agent_raw_output"
 _ATTEMPT_STATE = {"succeeded": "completed", "failed": "failed", "timed_out": "failed",
                   "cancelled": "cancelled", "unknown": "unknown"}
 VERIFIER_ID = "builtin.agent.process-outcome-verifier.v1"
@@ -114,6 +127,38 @@ class AgentProviderRouter:
         return await self._owner[handle].usage(handle)
 
 
+def _serialize_summary(summary: dict) -> bytes:
+    return json.dumps(summary, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _fit_summary(summary: dict) -> dict:
+    """Shrink ``output_text`` until the SERIALISED summary fits; measured on the JSON, not on the text."""
+    if len(_serialize_summary(summary)) <= MAX_SUMMARY_JSON_BYTES:
+        return summary
+    fitted = dict(summary, clipped=True, output_truncated=True)
+    text = fitted.get("output_text")
+    text = text if isinstance(text, str) else ""
+    keep = len(text)
+    while keep > 0:
+        fitted["output_text"] = text[:keep].rstrip() + _CLIP_MARKER
+        size = len(_serialize_summary(fitted))
+        if size <= MAX_SUMMARY_JSON_BYTES:
+            return fitted
+        # shrink in proportion to the overshoot (escaping makes bytes-per-char uneven), always making progress
+        keep = min(keep - 1, int(keep * MAX_SUMMARY_JSON_BYTES / size * 0.95))
+    fitted["output_text"] = _CLIP_MARKER
+    return fitted
+
+
+def _clip_text(text: str) -> tuple[str, bool]:
+    """Hard cap on forwarded text, cut on a UTF-8 boundary, with a marker. Returns (text, clipped)."""
+    data = text.encode("utf-8")
+    if len(data) <= MAX_FORWARDED_TEXT_BYTES:
+        return text, False
+    room = MAX_FORWARDED_TEXT_BYTES - len(_CLIP_MARKER.encode("utf-8"))
+    return data[:room].decode("utf-8", "ignore") + _CLIP_MARKER, True
+
+
 class AgentWorkflowEngine(MockWorkflowEngine):
     """Run tasks with a real provider; see module docstring for the policy."""
 
@@ -130,7 +175,8 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                  verifier_id: str = VERIFIER_ID, max_concurrency: int = 2, approval_requester=None,
                  worktree_check: Callable[[str, str, str], tuple[str, bool]] | None = None,
                  profile_check: Callable[[str], str | None] | None = None,
-                 profile_limits_check: Callable[[Mapping[str, Any]], str | None] | None = None):
+                 profile_limits_check: Callable[[Mapping[str, Any]], str | None] | None = None,
+                 raw_blobs: ArtifactBlobStore | None = None):
         # max_attempts=2: a gated task spends one attempt on the approval wait.
         super().__init__(connection, router, blobs, verify, verifier_id=verifier_id,
                          max_concurrency=max_concurrency, max_attempts=2, approval_requester=approval_requester)
@@ -139,6 +185,8 @@ class AgentWorkflowEngine(MockWorkflowEngine):
         self._profile_check = profile_check  # profile_id -> refusal reason or None; only asked for named profiles
         # spec -> refusal reason or None: the recorded tools, mode and timeout must still fit the named profile
         self._profile_limits_check = profile_limits_check
+        # Raw provider output may exceed the summary blob bound; same directory, larger limit.
+        self.raw_blobs = raw_blobs if raw_blobs is not None else blobs.with_max_bytes(_PROVIDER_OUTPUT_CAP)
 
     def _profile_for(self, run_id: str, task_id: str, default_profile_id: str) -> str:
         """A task that named a registry profile claims capacity under it (its own cap, ADR 016).
@@ -286,32 +334,63 @@ class AgentWorkflowEngine(MockWorkflowEngine):
 
     def _publish_summary(self, run_id: str, task_id: str, attempt_id: str, summary: dict) -> tuple[str, dict]:
         artifact_id = new_id()
-        data = json.dumps(summary, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        data = _serialize_summary(_fit_summary(summary))
         ref = publish_artifact(self.db, self.blobs, chunks=[data], artifact_id=artifact_id,
             media_type="application/json",
             provenance={"run_id": run_id, "task_id": task_id, "attempt_id": attempt_id, "kind": "agent_summary"},
             principal=self._principal, idempotency_key=attempt_id).response
         return artifact_id, ref
 
+    async def _store_raw_and_reduce(self, run_id: str, task_id: str, attempt_id: str, raw: bytes,
+                                    raw_capped: bool) -> dict[str, Any]:
+        """Store ``raw`` as an artifact and return the reduction fields for the summary.
+
+        The raw artifact is published before the summary so the summary can cite it.
+        """
+        # The reducer treats a NUL byte as binary and would replace the whole text, hiding failure lines. Reduce a
+        # copy with NUL replaced by U+FFFD; the stored artifact and the digest are always of the real bytes.
+        nul_replaced = b"\x00" in raw
+        scrubbed = raw.replace(b"\x00", "\ufffd".encode()) if nul_replaced else raw
+        reduced = await asyncio.to_thread(reduce_output, scrubbed, max_bytes=MAX_SUMMARY_TEXT_BYTES)
+        raw_sha256 = hashlib.sha256(raw).hexdigest()
+        text, clipped = _clip_text(reduced.reduced)
+        artifact_id = None
+        if raw:
+            artifact_id = new_id()
+            ref = publish_artifact(self.db, self.raw_blobs, chunks=[raw], artifact_id=artifact_id,
+                media_type="text/plain; charset=utf-8",
+                provenance={"run_id": run_id, "task_id": task_id, "attempt_id": attempt_id, "kind": RAW_OUTPUT_KIND},
+                principal=self._principal, idempotency_key=attempt_id + ":raw").response
+            if ref["sha256"] != raw_sha256:
+                raise RuntimeError("Stored raw output does not match its reduction hash")
+        return {"output_text": text, "output_truncated": bool(clipped or reduced.truncated or reduced.dropped_lines or reduced.rules_applied or raw_capped),
+                "clipped": clipped, "nul_replaced": nul_replaced,
+                "raw_sha256": raw_sha256, "raw_artifact_id": artifact_id,
+                "raw_complete": not raw_capped,
+                "reduction": {"rules": list(reduced.rules_applied), "dropped_lines": reduced.dropped_lines,
+                              "kept_failures": len(reduced.kept_failures), "over_budget": reduced.over_budget}}
+
     async def _execute(self, run_id: str, task_id: str, attempt_id: str, profile_id: str, scenario: str,
                        version: int, attempt_no: int) -> None:
         spec = self.specs[task_id]
-        text, texts_total, truncated = bytearray(), 0, False
+        raw, texts_total, raw_capped = bytearray(), 0, False
         tools: list[str] = []
         tool_count = 0
         terminal: ProviderEvent | None = None
 
         async def emit(event: ProviderEvent) -> None:
-            nonlocal terminal, texts_total, truncated, tool_count
+            nonlocal terminal, texts_total, raw_capped, tool_count
             if terminal is not None:
                 raise RuntimeError("Provider emitted after terminal outcome")
             if event.kind == "output" and isinstance(event.text, str):
                 data = event.text.encode("utf-8")
+                if not data.endswith(b"\n"):
+                    data += b"\n"  # raw text is the output events, one per line
                 texts_total += len(data)
-                room = MAX_SUMMARY_TEXT_BYTES - len(text)
+                room = _PROVIDER_OUTPUT_CAP - len(raw)
                 if room < len(data):
-                    truncated = True
-                text.extend(data[:max(room, 0)])
+                    raw_capped = True  # the stored raw is a prefix; raw_complete=false records that
+                raw.extend(data[:max(room, 0)])
             elif event.kind == "tool_use" and isinstance(event.text, str):
                 tool_count += 1
                 if len(tools) < MAX_TOOL_NAMES:
@@ -373,10 +452,20 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                     self._check_running(run_id)
                     set_attempt(self.db, attempt_id=attempt_id, before="running", after=_ATTEMPT_STATE[outcome], run_id=run_id, task_id=task_id)
                     self._change(task_id, State.RUNNING, target, version)
+            try:
+                reduction = await self._store_raw_and_reduce(run_id, task_id, attempt_id, bytes(raw), raw_capped)
+            except Exception:
+                if outcome == "succeeded":
+                    raise  # fail closed: a success whose raw output cannot be kept is blocked for an operator
+                _LOG.exception("Could not store raw output for task %s", task_id)
+                cut = bytes(raw[:MAX_SUMMARY_TEXT_BYTES]).decode("utf-8", "ignore").replace("\x00", "\ufffd")
+                reduction = {"output_text": cut, "output_truncated": True, "clipped": False, "nul_replaced": b"\x00" in raw,
+                             "raw_sha256": None,
+                             "raw_artifact_id": None, "raw_complete": False, "reduction": None}
             summary = {"v": 1, "run_id": run_id, "task_id": task_id, "attempt_id": attempt_id, "outcome": outcome,
                        "detail": detail if isinstance(detail, str) else None,
-                       "output_text": bytes(text).decode("utf-8", "ignore"), "output_bytes": texts_total,
-                       "output_truncated": truncated, "tool_names": tools, "tool_use_count": tool_count,
+                       "output_bytes": texts_total, **reduction,
+                       "tool_names": tools, "tool_use_count": tool_count,
                        "usage": None if usage is None else {"input_tokens": usage.input_tokens,
                                                             "output_tokens": usage.output_tokens, "source": usage.source}}
             try:
