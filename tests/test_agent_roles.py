@@ -619,7 +619,11 @@ def test_find_latest_only_is_computed_before_filters():
 def test_catalog_and_loader_are_not_wired_into_the_runtime():
     src = ROOT / "src" / "synapse"
     users = [str(p.relative_to(src)) for p in src.rglob("*.py")
-             if p.parts[-2] != "agents" and "synapse.agents" in p.read_text()]
+             if p.parts[-2] not in {"agents", "plugins"} and "synapse.agents" in p.read_text()]
+    # synapse.plugins (M6.3) validates plugin roles with this module but is itself not wired into the runtime:
+    wired = [str(p.relative_to(src)) for p in src.rglob("*.py")
+             if p.parts[-2] != "plugins" and "synapse.plugins" in p.read_text()]
+    assert wired == []
     assert users == []
     assert "manual" not in R.ROLE_PERMISSION_MODES
     assert any("manual" in p for p in R.role_problems(replace(IMPL, permission_mode="manual")))

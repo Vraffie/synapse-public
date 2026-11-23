@@ -1,0 +1,1 @@
+{"manifest_version": 1, "id": "demo", "version": "1.0.0", "api_version": 1, "entrypoint": "plugin.py", "description": "demo plugin", "capabilities": ["register.roles"]}
