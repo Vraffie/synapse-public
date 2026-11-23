@@ -1,9 +1,11 @@
 """Exact result cache lookup/record logic against a storage port (M5.4 cache 2/3, ADR 017 D6)."""
+from contextlib import nullcontext
 from dataclasses import replace
 import hashlib
 import json
 import random
 import threading
+import time
 
 import pytest
 
@@ -12,8 +14,8 @@ from synapse.application import result_cache as rc
 from synapse.application.cache_key import CacheKeyInputs, derive_cache_key
 from synapse.application.context_manifest import ManifestEntry, build_manifest
 from synapse.application.result_cache import (
-    CacheDecision, CacheEntry, CacheOutcome, CacheResult, CacheStore, InMemoryCacheStore, MissReason,
-    RecordStatus, lookup, record,
+    ArtifactFacts, CacheDecision, CacheEntry, CacheOutcome, CacheResult, CacheStore, InMemoryCacheStore, MissReason,
+    RecordStatus, entry_digest, lookup, record,
 )
 
 H = lambda s: hashlib.sha256(s.encode()).hexdigest()  # noqa: E731
@@ -28,7 +30,7 @@ def manifest(head=HEAD, clean=True, spec="spec", task="t1"):
 
 def request(**over) -> CacheKeyInputs:
     base = CacheKeyInputs(
-        task_class="validation", operator_marked_cacheable=True, approval_gated=False,
+        task_class="read_only_analysis", operator_marked_cacheable=True, approval_gated=False,
         policy_version="policy-1", approval_policy_sha256=H("approval-policy-1"),
         provider="claude", profile_id="default", cli_version="2.1.0", model="model-a",
         allowed_tools=["Read", "Grep"], permission_mode="plan", settings={"max_turns": 3},
@@ -168,8 +170,12 @@ def test_changed_permission_mode_misses():
     assert lookup(seeded(), request(permission_mode="dontAsk")).reason == MissReason.NOT_FOUND
 
 
-def test_changed_task_class_misses():
-    assert lookup(seeded(), request(task_class="read_only_analysis")).reason == MissReason.NOT_FOUND
+def test_changed_task_class_misses(monkeypatch):
+    # read_only_analysis is the only cacheable class today; a second approved class must key apart
+    store = seeded()
+    monkeypatch.setattr(ck, "CACHEABLE_CLASSES", frozenset({"read_only_analysis", "other_analysis"}))
+    assert lookup(store, request(task_class="other_analysis")).reason == MissReason.NOT_FOUND
+    assert lookup(store, request()).is_hit
 
 
 def test_changed_validators_misses():
@@ -208,9 +214,11 @@ def test_invalidated_entry_misses_and_invalidation_is_one_way():
     ({"task_class": "edit"}, "edit_task"),
     ({"task_class": "review"}, "review_task"),
     ({"task_class": "verification"}, "verification_task"),
+    ({"task_class": "validation"}, "validation_task"),
     ({"task_class": "independent_check"}, "independent_check_task"),
     ({"task_class": "mystery"}, "unknown_task_class"),
     ({"operator_marked_cacheable": False}, "not_marked_cacheable"),
+    ({"task_class": "validation", "operator_marked_cacheable": True}, "validation_task"),
     ({"approval_gated": True}, "approval_gated"),
     ({"approval_gated": None}, "approval_gated"),
     ({"allowed_tools": ["Read", "Edit"]}, "write_capable_tool"),
@@ -301,15 +309,15 @@ def test_first_writer_wins_and_never_overwrites():
 
 def test_in_memory_put_is_first_writer_wins_directly():
     store = InMemoryCacheStore()
-    a = CacheEntry("k", ARTIFACT, 1, "a1", "m", "{}")
-    b = CacheEntry("k", H("b"), 2, "a2", "m", "{}")
+    a = CacheEntry("k", ARTIFACT, 1, "a1", "m", "{}", H("d1"))
+    b = CacheEntry("k", H("b"), 2, "a2", "m", "{}", H("d2"))
     assert store.put("k", a) is True and store.put("k", b) is False
     assert store.get("k") is a
 
 
 def test_concurrent_puts_have_exactly_one_winner_and_a_stable_result():
     for round_ in range(20):
-        store = InMemoryCacheStore()
+        store = InMemoryCacheStore(race_hook=lambda: time.sleep(0.0005))
         n = 16
         barrier = threading.Barrier(n)
         outcomes: dict[int, RecordStatus] = {}
@@ -330,6 +338,31 @@ def test_concurrent_puts_have_exactly_one_winner_and_a_stable_result():
         hit = lookup(store, request())
         assert hit.hit.origin_attempt_id == f"att-{winners[0]}" and hit.result_sha256 == H(f"r{winners[0]}")
         assert all(lookup(store, request()).hit.origin_attempt_id == f"att-{winners[0]}" for _ in range(5))
+
+
+def racing_puts(store, n=16):
+    barrier = threading.Barrier(n)
+    results: list[bool] = []
+
+    def worker(i: int) -> None:
+        barrier.wait()
+        results.append(store.put("k", CacheEntry("k", H(f"r{i}"), 1, f"a{i}", "m", "{}", H(f"d{i}"))))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return results
+
+
+def test_race_harness_detects_a_lockless_store():
+    # mutation check: with the lock removed the same harness sees several "winners"
+    lockless = InMemoryCacheStore(race_hook=lambda: time.sleep(0.005))
+    lockless._lock = nullcontext()
+    assert sum(racing_puts(lockless)) > 1
+    locked = InMemoryCacheStore(race_hook=lambda: time.sleep(0.005))
+    assert sum(racing_puts(locked)) == 1
 
 
 def test_sequential_order_decides_the_winner_deterministically():
@@ -390,7 +423,9 @@ def test_put_returning_non_bool_is_a_store_error(put_result):
 def good_entry(**over) -> CacheEntry:
     key = derive_cache_key(request())
     entry = CacheEntry(key.sha256, ARTIFACT, 12, "att-1", "seq:1",
-                       json.dumps(key.material, sort_keys=True, separators=(",", ":")))
+                       json.dumps(key.material, sort_keys=True, separators=(",", ":")),
+                       entry_digest(key_sha256=key.sha256, result_sha256=ARTIFACT, result_size=12,
+                                    origin_attempt_id="att-1", created_marker="seq:1"))
     return replace(entry, **over)
 
 
@@ -429,6 +464,12 @@ def tampered_material(**changes) -> str:
     (good_entry(key_material_json=tampered_material(policy_version="policy-0")), MissReason.MATERIAL_MISMATCH),
     (good_entry(key_material_json=tampered_material(worktree_clean=False)), MissReason.MATERIAL_MISMATCH),
     (good_entry(invalidated_marker="op:1"), MissReason.INVALIDATED),
+    (good_entry(entry_digest="nothex"), MissReason.MALFORMED_ENTRY),
+    (good_entry(entry_digest=H("other")), MissReason.ENTRY_DIGEST_MISMATCH),
+    (good_entry(result_sha256=H("another blob")), MissReason.ENTRY_DIGEST_MISMATCH),
+    (good_entry(result_size=13), MissReason.ENTRY_DIGEST_MISMATCH),
+    (good_entry(origin_attempt_id="att-evil"), MissReason.ENTRY_DIGEST_MISMATCH),
+    (good_entry(created_marker="seq:2"), MissReason.ENTRY_DIGEST_MISMATCH),
 ])
 def test_malformed_or_tampered_entries_are_misses(entry, reason):
     decision = lookup(FixedStore(entry), request())
@@ -453,6 +494,16 @@ def test_material_json_that_hashes_to_key_but_differs_from_request_cannot_occur_
     assert lookup(FixedStore(entry), request()).reason == MissReason.KEY_MISMATCH
 
 
+def test_rewritten_result_reference_is_not_served_even_with_an_agreeing_verifier():
+    # reviewer repro: point the entry at another blob and attempt; a verifier for that blob agrees
+    store = seeded()
+    key = key_of()
+    other = H("another blob")
+    store._entries[key] = replace(store.get(key), result_sha256=other, origin_attempt_id="att-evil")
+    decision = lookup(store, request(), verifier=lambda sha, size: ArtifactFacts(sha, size))
+    assert decision.outcome is CacheOutcome.MISS and decision.reason == MissReason.ENTRY_DIGEST_MISMATCH
+
+
 class EvilEntry(CacheEntry):
     __slots__ = ()
 
@@ -464,25 +515,61 @@ class EvilEntry(CacheEntry):
 
 def test_entry_whose_attributes_raise_is_a_miss():
     base = good_entry()
-    evil = EvilEntry(base.key_sha256, ARTIFACT, 12, "att-1", "seq:1", base.key_material_json)
+    evil = EvilEntry(base.key_sha256, ARTIFACT, 12, "att-1", "seq:1", base.key_material_json, base.entry_digest)
     assert lookup(FixedStore(evil), request()).reason == MissReason.MALFORMED_ENTRY
+
+
+class ShiftyEntry(CacheEntry):
+    """Returns the recorded hash for the first reads (validation), then a different one (TOCTOU)."""
+
+    __slots__ = ("_reads",)
+
+    def _get(self):
+        reads = object.__getattribute__(self, "_reads")
+        reads[0] += 1
+        return ARTIFACT if reads[0] <= 4 else H("swapped")
+
+    result_sha256 = property(_get, lambda self, value: None)  # type: ignore[assignment]
+
+
+def test_subclass_with_shifting_property_is_never_served():
+    base = good_entry()
+    shifty = ShiftyEntry(base.key_sha256, ARTIFACT, 12, "att-1", "seq:1", base.key_material_json, base.entry_digest)
+    object.__setattr__(shifty, "_reads", [0])
+    seen = []
+    decision = lookup(FixedStore(shifty), request(), verifier=lambda sha, size: seen.append(sha) or ArtifactFacts(sha))
+    assert decision.outcome is CacheOutcome.MISS and decision.reason == MissReason.MALFORMED_ENTRY
+    assert seen == [] and decision.result_sha256 is None
+
+
+def test_verifier_and_decision_get_the_same_values_that_were_validated():
+    seen = []
+    decision = lookup(seeded(), request(), verifier=lambda sha, size: seen.append((sha, size)) or ArtifactFacts(sha, size))
+    assert seen == [(ARTIFACT, 12)] and (decision.result_sha256, decision.result_size) == (ARTIFACT, 12)
 
 
 # --- verifier -----------------------------------------------------------------------------------
 
 def test_verifier_confirming_hash_marks_hit_checked():
     seen = []
-    decision = lookup(seeded(), request(), verifier=lambda ref: seen.append(ref) or ARTIFACT)
+    decision = lookup(seeded(), request(), verifier=lambda ref, size: seen.append(ref) or ArtifactFacts(ARTIFACT, 12))
     assert decision.is_hit and decision.artifact_hash_checked is True and seen == [ARTIFACT]
+    assert lookup(seeded(), request(), verifier=lambda ref, size: ArtifactFacts(ARTIFACT)).is_hit  # size unknown
     assert_never_authority(decision)
 
 
 @pytest.mark.parametrize("verifier,reason", [
-    (lambda ref: H("different bytes"), MissReason.CORRUPT_ENTRY),
-    (lambda ref: ref.upper(), MissReason.CORRUPT_ENTRY),
-    (lambda ref: 42, MissReason.CORRUPT_ENTRY),
-    (lambda ref: None, MissReason.ARTIFACT_MISSING),
-    (lambda ref: (_ for _ in ()).throw(OSError("blob gone")), MissReason.VERIFIER_ERROR),
+    (lambda ref, size: ArtifactFacts(H("different bytes"), size), MissReason.CORRUPT_ENTRY),
+    (lambda ref, size: ArtifactFacts(ref.upper(), size), MissReason.CORRUPT_ENTRY),
+    (lambda ref, size: ArtifactFacts(42, size), MissReason.CORRUPT_ENTRY),
+    (lambda ref, size: ArtifactFacts(ref, size + 1), MissReason.SIZE_MISMATCH),
+    (lambda ref, size: ArtifactFacts(ref, "12"), MissReason.SIZE_MISMATCH),
+    (lambda ref, size: ArtifactFacts(ref, True), MissReason.SIZE_MISMATCH),
+    (lambda ref, size: ref, MissReason.VERIFIER_ERROR),  # a bare hash is not ArtifactFacts
+    (lambda ref, size: 42, MissReason.VERIFIER_ERROR),
+    (lambda ref, size: None, MissReason.ARTIFACT_MISSING),
+    (lambda ref, size: (_ for _ in ()).throw(OSError("blob gone")), MissReason.VERIFIER_ERROR),
+    (lambda ref: ArtifactFacts(ref), MissReason.VERIFIER_ERROR),  # wrong arity raises TypeError
 ])
 def test_verifier_disagreement_is_a_typed_miss(verifier, reason):
     decision = lookup(seeded(), request(), verifier=verifier)
@@ -491,8 +578,8 @@ def test_verifier_disagreement_is_a_typed_miss(verifier, reason):
 
 def test_verifier_not_called_for_bypass_or_not_found():
     calls = []
-    lookup(InMemoryCacheStore(), request(), verifier=calls.append)
-    lookup(seeded(), request(task_class="edit"), verifier=calls.append)
+    lookup(InMemoryCacheStore(), request(), verifier=lambda *a: calls.append(a))
+    lookup(seeded(), request(task_class="edit"), verifier=lambda *a: calls.append(a))
     assert calls == []
 
 
@@ -535,8 +622,8 @@ def test_every_decision_on_every_path_is_never_authority():
     decisions = [
         lookup(InMemoryCacheStore(), request()),
         lookup(seeded(), request()),
-        lookup(seeded(), request(), verifier=lambda r: ARTIFACT),
-        lookup(seeded(), request(), verifier=lambda r: None),
+        lookup(seeded(), request(), verifier=lambda r, n: ArtifactFacts(r, n)),
+        lookup(seeded(), request(), verifier=lambda r, n: None),
         lookup(seeded(), request(task_class="review")),
         lookup(RaisingStore(RuntimeError()), request()),
         lookup(FixedStore("junk"), request()),
@@ -597,18 +684,74 @@ def test_material_never_contains_settings_values():
     store = InMemoryCacheStore()
     record(store, request(settings={"note": "SECRET-VALUE-123"}), result())
     (entry,) = store._entries.values()
-    assert "SECRET-VALUE-123" not in json.dumps(entry.document())
+    assert "SECRET-VALUE-123" not in entry.entry_json()
 
 
 def test_stored_entry_document_is_bounded_and_round_trips():
     store = seeded()
     entry = store.get(key_of())
-    doc = entry.document()
-    encoded = json.dumps(doc, sort_keys=True, separators=(",", ":"))
+    encoded = entry.entry_json()
+    doc = json.loads(encoded)
     assert len(encoded.encode()) <= rc.MAX_ENTRY_BYTES
     assert set(doc) == {"entry_schema_version", "key_sha256", "result_sha256", "result_size",
-                        "origin_attempt_id", "created_marker", "key_material"}
+                        "origin_attempt_id", "created_marker", "entry_digest", "key_material"}
     assert ck.canonical_request_hash(doc["key_material"]) == doc["key_sha256"]
+    assert doc["entry_digest"] == entry_digest(key_sha256=doc["key_sha256"], result_sha256=doc["result_sha256"],
+                                               result_size=doc["result_size"],
+                                               origin_attempt_id=doc["origin_attempt_id"],
+                                               created_marker=doc["created_marker"])
+
+
+def test_worst_case_entry_fits_the_entry_bound():
+    # material at its cap, longest text fields of non-BMP characters (12 bytes each once ASCII-escaped)
+    wide = "\U0001F600" * rc.MAX_TEXT
+    filler = "x" * (rc.MAX_MATERIAL_BYTES - len('{"a":""}'))
+    material = json.dumps({"a": filler}, separators=(",", ":"))
+    assert len(material.encode()) == rc.MAX_MATERIAL_BYTES
+    entry = CacheEntry(H("k"), H("r"), rc.MAX_RESULT_BYTES, wide, wide, material, H("d"), 10 ** 6)
+    assert len(entry.entry_json().encode()) <= rc.MAX_ENTRY_BYTES
+
+
+def test_material_over_its_cap_is_refused_and_never_stored():
+    wide = "\U0001F600" * ck.MAX_TEXT
+    req = request(policy_version=wide, provider=wide, profile_id=wide, cli_version=wide, model=wide,
+                  validator_sha256s=[H(str(i)) for i in range(ck.MAX_VALIDATORS)])
+    store = InMemoryCacheStore()
+    out = record(store, req, result())
+    assert out.status is RecordStatus.REFUSED and out.reason == "entry_too_large" and len(store) == 0
+
+
+def test_long_but_bounded_entry_is_stored_and_hits():
+    wide = "\U0001F600" * rc.MAX_TEXT
+    store = InMemoryCacheStore()
+    out = record(store, request(), result(origin_attempt_id=wide, created_marker=wide, result_size=rc.MAX_RESULT_BYTES))
+    assert out.status is RecordStatus.STORED
+    assert len(store.get(key_of()).entry_json().encode()) <= rc.MAX_ENTRY_BYTES
+    assert lookup(store, request()).hit.origin_attempt_id == wide
+
+
+# --- record is tied to the looked-up key ---------------------------------------------------------
+
+def test_record_refuses_when_the_request_moved_since_lookup():
+    store = InMemoryCacheStore()
+    looked_up = lookup(store, request(manifest=manifest(head="a" * 40)))
+    assert looked_up.reason == MissReason.NOT_FOUND
+    out = record(store, request(manifest=manifest(head="b" * 40)), result(),
+                 expected_key_sha256=looked_up.key_sha256)
+    assert out.status is RecordStatus.REFUSED and out.reason == "key_changed" and len(store) == 0
+
+
+def test_record_with_the_looked_up_key_stores():
+    store = InMemoryCacheStore()
+    looked_up = lookup(store, request())
+    out = record(store, request(), result(), expected_key_sha256=looked_up.key_sha256)
+    assert out.status is RecordStatus.STORED and out.key_sha256 == looked_up.key_sha256
+
+
+@pytest.mark.parametrize("bad", ["", "XYZ", "A" * 64, 42, b"a" * 64])
+def test_record_refuses_a_malformed_expected_key(bad):
+    out = record(InMemoryCacheStore(), request(), result(), expected_key_sha256=bad)
+    assert out.status is RecordStatus.REFUSED and out.reason == "invalid_input:expected_key_sha256"
 
 
 # --- purity -------------------------------------------------------------------------------------
