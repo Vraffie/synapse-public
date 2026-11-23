@@ -1,3 +1,3 @@
-# Withheld
+# Detailed review notes (summary only)
 
-This document is withheld from the public repository until the findings it describes are fixed. It will be published afterwards. To report a vulnerability, see [SECURITY.md](../../SECURITY.md).
+The full finding-by-finding write-up of this review is not published. What it concluded is public: the open items (F1 database writable by same-user processes, F2 same-user approver and operator tokens, F7 agent containment, F10 audit completeness) and the status of every finding are in [IMPLEMENTATION_BACKLOG.md](../../IMPLEMENTATION_BACKLOG.md) under M7.5, and the design for the privilege boundary is [ADR 019](../adr/019-privilege-boundary.md). These are same-user design limits of a local, single-machine tool; see [SECURITY.md](../../SECURITY.md) for the threat model and how to report a vulnerability.
