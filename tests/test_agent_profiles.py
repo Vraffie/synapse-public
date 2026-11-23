@@ -280,6 +280,9 @@ def test_cooldown_set_and_clear_are_audited_and_validated(env):
     assert {p["id"]: p for p in svc.list_profiles()["profiles"]}["reader"]["cooldown_remaining_seconds"] > 59
     (event,) = _events(svc, "profile.cooldown_set")
     assert event["profile_id"] == "reader" and event["seconds"] == 60 and event["principal"]
+    svc.set_cooldown("reader", 10)  # a shorter request does not shorten the cooldown; the audit says so
+    assert _events(svc, "profile.cooldown_set")[-1]["seconds"] == 10
+    assert _events(svc, "profile.cooldown_set")[-1]["effective_seconds"] > 50
     assert svc.clear_cooldown("reader")["cooldown_remaining_seconds"] == 0.0
     assert _events(svc, "profile.cooldown_cleared")[0]["was_cooling"] is True
     for bad in (0, -1, 86401, True, float("nan"), "5"):
@@ -290,7 +293,7 @@ def test_cooldown_set_and_clear_are_audited_and_validated(env):
             svc.set_cooldown(pid, 10)
         with pytest.raises(AgentRunError, match="unknown profile"):
             svc.clear_cooldown(pid)
-    assert len(_events(svc, "profile.cooldown_set")) == 1  # refusals are not recorded as changes
+    assert len(_events(svc, "profile.cooldown_set")) == 2  # refusals are not recorded as changes
 
 
 def test_unaudited_cooldown_never_takes_effect_and_clear_needs_its_audit(env):

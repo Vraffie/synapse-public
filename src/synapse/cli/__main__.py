@@ -422,7 +422,7 @@ def _profile_command(args, parser) -> int:
         if args.command == "profiles":
             result = _request(args.state_dir, "/api/v1/profiles")
         else:
-            if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", args.profile) is None:
+            if re.fullmatch(r"[A-Za-z0-9._][A-Za-z0-9._-]{0,63}", args.profile) is None:
                 parser.error("profile ID must be 1-64 characters of [A-Za-z0-9._-]")
             endpoint = "/api/v1/profiles/" + args.profile + "/cooldown"
             if args.clear:

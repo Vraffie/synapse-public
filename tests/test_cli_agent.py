@@ -188,6 +188,7 @@ def test_profiles_and_cooldown_commands_use_plain_requests(calls, capsys):
     ["profile-cooldown", "reader", "--seconds", "nan"],
     ["profile-cooldown", "../x", "--clear"],
     ["profile-cooldown", "a/b", "--seconds", "5"],
+    ["profile-cooldown", "--clear", "--", "-x"],                     # an option-like ID
 ])
 def test_cooldown_command_refuses_bad_input_before_any_request(calls, args):
     with pytest.raises(SystemExit):

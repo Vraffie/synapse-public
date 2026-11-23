@@ -413,7 +413,10 @@ class AgentRunService:
             Cooldowns().set(profile_id, seconds)  # range check on a scratch object: nothing is in force yet
         except ValueError:
             raise _bad("seconds must be above 0 and at most 86400") from None
-        self._audit_profile("profile.cooldown_set", profile_id, {"seconds": seconds})  # audit first, then the effect
+        # Cooldowns only extend, so record what will actually be in force as well as what was asked for.
+        effective = max(self.runtime.cooldowns.remaining(profile_id), float(seconds))
+        self._audit_profile("profile.cooldown_set", profile_id,  # audit first, then the effect
+                            {"seconds": seconds, "effective_seconds": round(effective, 3)})
         self.runtime.cooldowns.set(profile_id, seconds)
         return {"id": profile_id, "cooldown_remaining_seconds": round(self.runtime.cooldowns.remaining(profile_id), 3)}
 
