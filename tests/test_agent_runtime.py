@@ -1101,6 +1101,24 @@ def test_the_summary_is_sized_on_its_serialised_json_so_escaped_text_cannot_over
     assert env.db.execute("SELECT outcome FROM verification_results").fetchall() == [("approved",)]
 
 
+def test_raw_output_artifact_is_private_and_never_has_the_summary_kind_the_approver_reader_selects(env):
+    """docs/operations/agent-runtime.md: raw output is mode 0600 in a private directory, and approvers are not
+    shown it because their reader selects only kind='agent_summary'."""
+    import stat
+    _run(env, "errors")
+    assert env.states() == ("succeeded", {"work": "completed"})
+    rows = env.db.execute("SELECT sha256, json_extract(provenance_json,'$.kind') FROM artifacts").fetchall()
+    kinds = {kind for _, kind in rows}
+    assert {"agent_summary", "agent_raw_output"} <= kinds
+    raw_shas = [sha for sha, kind in rows if kind == "agent_raw_output"]
+    selected = [sha for (sha,) in env.db.execute(
+        "SELECT sha256 FROM artifacts WHERE json_extract(provenance_json,'$.kind')='agent_summary'")]
+    assert raw_shas and not set(raw_shas) & set(selected)
+    assert stat.S_IMODE(env.blobs.stat().st_mode) == 0o700
+    for sha in raw_shas:
+        assert stat.S_IMODE((env.blobs / sha).stat().st_mode) == 0o600
+
+
 def test_attempt_records_a_context_manifest_without_changing_the_run(env):
     async def go():
         env.runtime.start(env.run_id, "s", env.specs(prompt="ok"))
