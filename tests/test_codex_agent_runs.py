@@ -758,3 +758,114 @@ def test_ambient_environment_never_points_codex_at_the_real_login():
     prov = CodexCliProvider(CodexCliProfile(executable="/bin/true", state_dir="/nonexistent-state", enabled=True))
     assert prov._credential_source() == os.path.join(home, "auth.json")
     assert Path(home, "auth.json").read_text() == '{"fake": "test-credentials"}'
+
+
+# ------------------------------------------------------------ version probe robustness (review of 73dc320)
+def _exe(path, body):
+    path.write_text(body)
+    path.chmod(0o755)
+    return path
+
+
+def _probe(exe, state):
+    return CodexCliProvider(CodexCliProfile(executable=str(exe), state_dir=str(state), enabled=True))
+
+
+def test_probe_works_with_more_than_1024_open_fds(cenv, tmp_path, monkeypatch):
+    """select() refused fds >= FD_SETSIZE (1024), so a busy process failed every codex start; poll() has no limit."""
+    import resource
+    from synapse.providers import codex_cli
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    want = 1400
+    if hard != resource.RLIM_INFINITY and hard < want:
+        pytest.skip("hard RLIMIT_NOFILE below %d" % want)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, want), hard))
+    held = []
+    try:
+        while not held or held[-1] < 1100:
+            held.append(os.open("/dev/null", os.O_RDONLY))
+        ok = _exe(tmp_path / "ok-codex", "#!/bin/sh\necho 'codex-cli 0.170.0'\n")
+        assert _probe(ok, cenv.state)._cli_version() == "0.170.0"
+        monkeypatch.setattr(codex_cli, "_VERSION_TIMEOUT_SECONDS", 0.5)
+        hung = _exe(tmp_path / "hung-codex", "#!/bin/sh\nsleep 30\n")
+        started = time.monotonic()
+        assert _probe(hung, cenv.state)._cli_version() is None
+        assert time.monotonic() - started < 4.0  # the deadline still holds
+    finally:
+        for fd in held:
+            os.close(fd)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+
+def test_version_cache_key_includes_ctime(cenv, tmp_path):
+    exe = _exe(tmp_path / "rewritten-codex", "#!/bin/sh\necho 'codex-cli 0.170.0'\n")
+    prov = _probe(exe, cenv.state)
+    assert prov.cached_cli_version() == "0.170.0"
+    before = os.stat(exe)
+    time.sleep(0.01)
+    with open(exe, "r+") as fh:  # in place: same inode, same size
+        fh.write("#!/bin/sh\necho 'codex-cli 9.999.9'\n")
+    os.utime(exe, ns=(before.st_atime_ns, before.st_mtime_ns))  # mtime restored, ctime cannot be
+    after = os.stat(exe)
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (before.st_ino, before.st_size, before.st_mtime_ns)
+    assert prov.cached_cli_version() == "9.999.9"
+
+
+def test_version_cache_keeps_success_but_retries_a_failure_after_its_ttl(cenv, tmp_path, monkeypatch):
+    from synapse.providers import codex_cli
+    monkeypatch.setattr(codex_cli, "_VERSION_FAILURE_TTL_SECONDS", 0.3)
+    runs = tmp_path / "runs.log"
+    failing = _exe(tmp_path / "failing-codex", "#!/bin/sh\necho x >> %s\nexit 1\n" % runs)
+    prov = _probe(failing, cenv.state)
+    assert prov.cached_cli_version() is None and prov.cached_cli_version() is None
+    assert len(runs.read_text().split()) == 1  # within the TTL: not re-run
+    time.sleep(0.4)
+    assert prov.cached_cli_version() is None
+    assert len(runs.read_text().split()) == 2  # after the TTL: retried
+    good_runs = tmp_path / "good.log"
+    good = _exe(tmp_path / "good-codex", "#!/bin/sh\necho x >> %s\necho 'codex-cli 0.170.0'\n" % good_runs)
+    prov = _probe(good, cenv.state)
+    assert prov.cached_cli_version() == prov.cached_cli_version() == "0.170.0"
+    time.sleep(0.4)
+    assert prov.cached_cli_version() == "0.170.0" and len(good_runs.read_text().split()) == 1  # success kept
+
+
+def test_probe_setup_failure_still_kills_and_reaps_the_child(cenv, tmp_path, monkeypatch):
+    pidfile = tmp_path / "probe-child.pid"
+    exe = _exe(tmp_path / "slow-codex", "#!/bin/sh\necho $$ > %s\nsleep 30\n" % pidfile)
+
+    def broken(fd, flag):
+        for _ in range(200):  # let the child record its pid first
+            if pidfile.exists() and pidfile.read_text().strip():
+                break
+            time.sleep(0.01)
+        raise OSError(24, "Too many open files")
+    monkeypatch.setattr(os, "set_blocking", broken)
+    started = time.monotonic()
+    assert _probe(exe, cenv.state)._cli_version() is None
+    monkeypatch.undo()
+    assert time.monotonic() - started < 6.0
+    assert _gone(int(pidfile.read_text()))
+
+
+def test_probe_child_gets_the_spawn_rlimits(cenv, tmp_path):
+    out = tmp_path / "limits.json"
+    exe = _exe(tmp_path / "limits-codex", "#!%s\nimport json, resource\nopen(%r, 'w').write(json.dumps("
+               "{'nofile': resource.getrlimit(resource.RLIMIT_NOFILE), 'core': resource.getrlimit(resource.RLIMIT_CORE),"
+               " 'cpu': resource.getrlimit(resource.RLIMIT_CPU)}))\nprint('codex-cli 0.170.0')\n"
+               % (sys.executable, str(out)))
+    assert _probe(exe, cenv.state)._cli_version() == "0.170.0"
+    limits = json.loads(out.read_text())
+    assert limits["nofile"][0] <= 4096 and limits["core"] == [0, 0] and 0 < limits["cpu"][0] <= 11
+
+
+def test_failed_version_check_refuses_workspace_write(tmp_path):
+    env = CodexEnv(tmp_path, version="0.170.0")
+    try:
+        env.runtime = env.new_runtime()
+        real = tmp_path / "bin" / "codex-real"
+        real.write_text(real.read_text().replace('print("codex-cli 0.170.0"); sys.exit(0)', 'sys.exit(1)'))
+        _run(env, env.codex_spec("ok"))  # workspace-write: no version -> refused before spawn
+        assert env.codex_argv() == [] and env.detail() == ("failed", "codex_ineligible")
+    finally:
+        env.close()

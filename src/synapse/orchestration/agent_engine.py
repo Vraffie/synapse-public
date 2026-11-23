@@ -132,7 +132,11 @@ class AgentProviderRouter:
         version. No provider able to report its version counts as unverified.
         """
         check = getattr(provider, "cached_cli_version", None)
-        version = await asyncio.to_thread(check) if callable(check) else None
+        try:
+            version = await asyncio.to_thread(check) if callable(check) else None
+        except Exception:  # a failed check is "no version": workspace-write refused, read-only still runs
+            _LOG.warning("codex version check failed for task %s", request.task_id, exc_info=True)
+            version = None
         if version in VERIFIED_CLI_VERSIONS:
             return
         shown = version if isinstance(version, str) and _VERSION_SHOWN.fullmatch(version) else "unknown"

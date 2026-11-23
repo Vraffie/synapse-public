@@ -55,6 +55,7 @@ VERIFIED_CLI_VERSIONS = ("0.170.0",)
 _VERSION_RE = re.compile(r"^codex-cli (\d{1,4}\.\d{1,4}\.\d{1,4})(?:\s|$)")
 _VERSION_TIMEOUT_SECONDS = 10.0
 _VERSION_MAX_BYTES = 4096
+_REAP_TIMEOUT_SECONDS = 2.0
 
 # `-s danger-full-access` is deliberately NOT allowed.
 SANDBOX_MODES = frozenset({"read-only", "workspace-write"})
@@ -145,30 +146,34 @@ def sandbox_for_task(allowed_tools, permission_mode) -> str:
     return "workspace-write" if writes else "read-only"
 
 
-def cli_version(executable: str, environ: Mapping[str, str]) -> str | None:
-    """Run ``<executable> --version``; return "X.Y.Z" or None. Wall-clock bounded by one deadline.
+def cli_version(executable: str, environ: Mapping[str, str], preexec=None) -> str | None:
+    """Run ``<executable> --version``; return "X.Y.Z" or None (never raises). Wall-clock bounded by one deadline.
 
-    Own session/process group, scrubbed env, stderr discarded. stdout is read from the raw, non-blocking fd in this
-    thread with select against the deadline and capped at _VERSION_MAX_BYTES; once the child has exited only what is
-    already in the pipe is read, so a descendant that escaped the group (e.g. ``setsid``) and keeps the pipe open
-    cannot delay the result. The group is then killed and the child reaped; the fd is closed with ``os.close``.
-    A descendant that left the group via ``setsid`` is not killed (it is outside the group by construction).
+    Own session/process group, scrubbed env, stderr discarded, optional ``preexec`` (the spawn's rlimits). stdout is
+    read from a raw, non-blocking fd in this thread with ``poll`` (no FD_SETSIZE limit, unlike ``select``) against the
+    deadline and capped at _VERSION_MAX_BYTES; once the child has exited only what is already in the pipe is read, so
+    a descendant that escaped the group (``setsid``) and keeps the pipe open cannot delay the result. Afterwards the
+    group is killed and the child reaped with a bounded wait; a descendant that left the group via ``setsid`` is
+    outside it by construction and is not killed.
     """
     env = {k: v for k, v in environ.items() if k in _ENV_ALLOWLIST}
     deadline = time.monotonic() + _VERSION_TIMEOUT_SECONDS
     try:
         proc = subprocess.Popen([executable, "--version"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, env=env, cwd="/", start_new_session=True,
-                                close_fds=True, bufsize=0)
+                                close_fds=True, bufsize=0, preexec_fn=preexec)
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
-    fd = os.dup(proc.stdout.fileno())  # our own descriptor: the file object is closed now, never read
-    proc.stdout.close()
-    os.set_blocking(fd, False)
     buf = bytearray()
     exited = False
-    eof = False
+    fd = None
     try:
+        fd = os.dup(proc.stdout.fileno())  # our own descriptor: the file object is closed below, never read
+        proc.stdout.close()
+        os.set_blocking(fd, False)
+        poller = select.poll()
+        poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        eof = False
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -177,8 +182,8 @@ def cli_version(executable: str, environ: Mapping[str, str]) -> str | None:
                 # WNOWAIT keeps the exited leader as a zombie, so its process-group id cannot be reused before killpg.
                 exited = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
             if not eof and len(buf) < _VERSION_MAX_BYTES:
-                ready, _, _ = select.select([fd], [], [], 0 if exited else min(0.02, remaining))
-                if ready:
+                timeout_ms = 0 if exited else max(1, int(min(0.02, remaining) * 1000))
+                if poller.poll(timeout_ms):
                     try:
                         chunk = os.read(fd, _VERSION_MAX_BYTES - len(buf))
                     except BlockingIOError:
@@ -192,42 +197,66 @@ def cli_version(executable: str, environ: Mapping[str, str]) -> str | None:
                 time.sleep(min(0.02, remaining))
             if exited:
                 break  # everything the child wrote is already in the pipe; never wait for a descendant's EOF
+    except Exception:
+        _LOG.warning("codex --version check failed", exc_info=True)
+        exited = False
     finally:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)  # the group: also descendants that outlived the child
-        except (ProcessLookupError, PermissionError):
-            pass
-        proc.wait()
-        os.close(fd)
+        _kill_and_reap(proc)
+        if fd is not None:
+            os.close(fd)
+        elif proc.stdout is not None and not proc.stdout.closed:
+            proc.stdout.close()
     if not exited or proc.returncode != 0:
         return None
     return parse_cli_version(bytes(buf[:256]).decode("utf-8", "replace"))
 
 
-_VERSION_CACHE: dict[tuple, str | None] = {}
+def _kill_and_reap(proc: subprocess.Popen) -> None:
+    """SIGKILL the child's group (and the child), then reap it with a bounded wait; never hangs."""
+    for kill in (lambda: os.killpg(proc.pid, signal.SIGKILL), lambda: os.kill(proc.pid, signal.SIGKILL)):
+        try:
+            kill()
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=_REAP_TIMEOUT_SECONDS)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+    _LOG.error("codex --version child %d could not be reaped; giving up", proc.pid)
+
+
+_VERSION_CACHE: dict[tuple, tuple[str | None, float | None]] = {}  # key -> (version, expiry for a failure)
 _VERSION_CACHE_MAX = 16
+_VERSION_FAILURE_TTL_SECONDS = 30.0
 _VERSION_CACHE_LOCK = threading.Lock()
 
 
-def cached_cli_version(executable: str, environ: Mapping[str, str]) -> str | None:
-    """``cli_version`` cached by the executable's identity (realpath, device, inode, size, mtime_ns); bounded.
+def cached_cli_version(executable: str, environ: Mapping[str, str], preexec=None) -> str | None:
+    """``cli_version`` cached by the executable's identity; bounded, never raises.
 
-    Replacing or modifying the binary changes the key, so the next spawn re-checks. A failed stat is never cached.
+    Key: realpath, device, inode, size, mtime_ns and ctime_ns (an in-place rewrite that restores the mtime still
+    changes the ctime), so a replaced or modified binary is re-checked. A successful result is kept while the key
+    holds; a failed probe (None) only for _VERSION_FAILURE_TTL_SECONDS (monotonic), so a transient failure is retried.
+    A failed stat is never cached.
     """
     try:
         real = os.path.realpath(executable)
         st = os.stat(real)
     except OSError:
         return None
-    key = (real, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+    key = (real, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    now = time.monotonic()
     with _VERSION_CACHE_LOCK:
-        if key in _VERSION_CACHE:
-            return _VERSION_CACHE[key]
-    version = cli_version(executable, environ)
+        hit = _VERSION_CACHE.get(key)
+        if hit is not None and (hit[1] is None or hit[1] > now):
+            return hit[0]
+    version = cli_version(executable, environ, preexec)
     with _VERSION_CACHE_LOCK:
-        if len(_VERSION_CACHE) >= _VERSION_CACHE_MAX:
+        _VERSION_CACHE.pop(key, None)
+        while len(_VERSION_CACHE) >= _VERSION_CACHE_MAX:
             _VERSION_CACHE.pop(next(iter(_VERSION_CACHE)))
-        _VERSION_CACHE[key] = version
+        _VERSION_CACHE[key] = (version, None if version is not None else time.monotonic() + _VERSION_FAILURE_TTL_SECONDS)
     return version
 
 
@@ -362,12 +391,19 @@ class CodexCliProvider:
         return ProviderHealth(profile_id, "healthy" if version in VERIFIED_CLI_VERSIONS else "unverified_version")
 
     def _cli_version(self) -> str | None:
-        """Run `<executable> --version` with a scrubbed environment; None on any failure."""
-        return cli_version(self._profile.executable, self._environ)
+        """Run `<executable> --version` with a scrubbed environment and the spawn's rlimits; None on any failure."""
+        return cli_version(self._profile.executable, self._environ, self._version_preexec())
 
     def cached_cli_version(self) -> str | None:
-        """``_cli_version`` cached per executable identity (path, inode, size, mtime); see ``cached_cli_version``."""
-        return cached_cli_version(self._profile.executable, self._environ)
+        """``_cli_version`` cached per executable identity; see ``cached_cli_version``. Never raises."""
+        return cached_cli_version(self._profile.executable, self._environ, self._version_preexec())
+
+    def _version_preexec(self):
+        """The same rlimits as an agent spawn (CPU bounded by the probe deadline); None if they cannot be computed."""
+        try:
+            return self._preexec(int(_VERSION_TIMEOUT_SECONDS) + 1)
+        except Exception:
+            return None
 
     async def capabilities(self, profile_id: str) -> ProviderCapabilities:
         validate_id(profile_id)
