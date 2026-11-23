@@ -53,3 +53,22 @@ agent-desktop --state-dir ~/.local/state/synapse
 ```
 
 Needs the `desktop` extra and a graphical session (or `QT_QPA_PLATFORM=offscreen` for headless smoke tests). See `desktop.md`.
+
+## One-command local start for real agent runs
+
+From a checkout, `python scripts/synapse_up.py up /path/to/your/repo` sets up and starts everything for real,
+sandboxed agent runs on this machine, and `python scripts/synapse_up.py down` stops it again:
+
+- creates the private state directory (`~/.local/state/synapse`, or `$SYNAPSE_STATE`) and a sibling
+  `...-worktrees` directory (the daemon refuses worktrees inside the state dir);
+- finds `claude` (`$SYNAPSE_CLAUDE_EXE` or on `PATH`). The native install lives under `~/.local/share`, which the
+  sandbox protects, so the binary is copied to `~/.local/lib/synapse/claude` and refreshed when Claude updates;
+- writes `agent.json` (mode 0600, sandbox always on; a config you edited to turn the sandbox off is refused, not
+  overwritten) and adds the repo to its `repos` allowlist;
+- starts the daemon with `--allow-same-user-agents` (agents run as you; the sandbox is the boundary, see ADR 019)
+  and, unless `--no-desktop`, the desktop console. Running `up` again for another repo is safe; restart with
+  `down` then `up` for the daemon to pick up a new repo.
+
+It prints the `agentctl agent-start` command to use. No approver token is needed for ordinary runs. Logs and pid
+files are in the state directory (`daemon.log`, `desktop.log`, `*.pid`); `down` only signals a pid that is
+verifiably a Synapse process.
