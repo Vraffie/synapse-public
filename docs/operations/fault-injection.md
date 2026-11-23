@@ -23,6 +23,7 @@ Use `python -m pytest` (not bare `pytest`): `tests/test_fault_injection.py` impo
 | `test_fault_injection_approvals.py` | parked approval across a crash and forward-only expiry; decision made while the daemon was down; rejected approval; decision bound to a changed candidate or policy |
 | `test_fault_injection_messaging.py` | lease expiry and clock jumps; exhausted deliveries dead-letter; duplicate completion; publisher crash before ACK; duplicate event rows |
 | `test_fault_injection_processes.py` | killed lock owner; real daemon SIGKILLed while parked |
+| `test_fault_injection_clients.py` | HTTP and WebSocket clients dropped abruptly while a run is parked: no cancellation, run still finishes after approval (invariant 8) |
 | `test_invariants.py` | the checker itself: each invariant is shown to fire on a hand-corrupted database |
 
 ## Invariants checked (`check_invariants`, one SQLite snapshot)
@@ -32,6 +33,8 @@ state histories match their events and terminal states; no attempt live in a qui
 deliveries (leases, dead letters); approvals (decision matches binding); verification results;
 usage ledger; artifact blobs match recorded hashes. `quiescent=True` additionally asserts nothing
 can still be running. Violations are returned, not raised; `assert_invariants` raises.
+
+See [invariant-coverage.md](invariant-coverage.md) for which test asserts each of the ten section 13 invariants.
 
 ## Known gaps
 
