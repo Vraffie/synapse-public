@@ -48,6 +48,7 @@ from synapse.orchestration.review_independence import (
     record_review_verdict, review_context)
 from synapse.persistence.agent_tasks import spec_hash
 from synapse.persistence.artifact_store import publish_artifact
+from synapse.persistence.attempt_resume import mark_spawn_begun
 from synapse.persistence.mock_execution_store import record_verification, set_attempt
 from synapse.persistence.run_store import write_run_transition
 from synapse.persistence.state_store import StateConflict
@@ -71,6 +72,8 @@ RAW_OUTPUT_KIND = "agent_raw_output"
 _ATTEMPT_STATE = {"succeeded": "completed", "failed": "failed", "timed_out": "failed",
                   "cancelled": "cancelled", "unknown": "unknown"}
 VERIFIER_ID = "builtin.agent.process-outcome-verifier.v1"
+# Attempts per task: a gated task spends one on the approval wait. Startup re-queue (ADR 024) stays within it.
+AGENT_MAX_ATTEMPTS = 2
 
 
 async def process_outcome_verifier(task_id: str, candidate: bytes) -> bool:
@@ -251,9 +254,10 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                  raw_blobs: ArtifactBlobStore | None = None,
                  routing_dry_run: RoutingDryRunConfig | None = RoutingDryRunConfig(),
                  review_nodes: Mapping[str, ReviewNode] | None = None):
-        # max_attempts=2: a gated task spends one attempt on the approval wait.
+        # A gated task spends one attempt on the approval wait (see AGENT_MAX_ATTEMPTS).
         super().__init__(connection, router, blobs, verify, verifier_id=verifier_id,
-                         max_concurrency=max_concurrency, max_attempts=2, approval_requester=approval_requester)
+                         max_concurrency=max_concurrency, max_attempts=AGENT_MAX_ATTEMPTS,
+                         approval_requester=approval_requester)
         self.router, self.specs, self._prompts = router, specs, prompts
         self._worktree_check = worktree_check
         self._profile_check = profile_check  # profile_id -> refusal reason or None; only asked for named profiles
@@ -623,6 +627,11 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                 request = ExecutionRequest(profile_id, task_id, {
                     "prompt": prompt, "worktree": spec["worktree"],
                     "timeout_seconds": spec["timeout_seconds"], "max_output_bytes": _PROVIDER_OUTPUT_CAP})
+                # ADR 024: from this commit on the attempt MAY have run. Without it, startup recovery may prove it
+                # never spawned and re-queue it. Nothing below may reach the provider unless this row is durable.
+                with self._transaction():
+                    self._check_running(run_id)
+                    mark_spawn_begun(self.db, attempt_id=attempt_id)
                 try:
                     await self.provider.execute(request, emit)
                 except BaseException:

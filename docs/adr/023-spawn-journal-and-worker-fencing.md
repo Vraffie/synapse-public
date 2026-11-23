@@ -33,8 +33,8 @@ The provider spawns on a worker thread, and the SQLite connection must not be wr
 ## Not done in this slice (future work)
 
 - `daemon_epoch` and rejection of stale writes from a previous daemon.
-- The `starting` attempt state in the database (the journal's `starting` entry is not mirrored in SQLite).
-- Automatic resumption of attempts provably never spawned.
+- The `starting` attempt state in the database: superseded by the `attempt_spawn_marks` row of ADR 024 (no new attempt state).
+- Automatic resumption of attempts provably never spawned: done in ADR 024 (re-queue with a new attempt, bounded).
 - Relaxing the `agent-abandon` operator assertion when the fence was `all_clear`. The assertion stays mandatory.
 - Per-attempt association. The fence is global: its counts are written to every run with unresolved attempts, so an `unverified` entry from one run shows on all of them.
 

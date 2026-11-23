@@ -31,12 +31,13 @@ from synapse.domain.runs import RunChange, RunState
 from synapse.infrastructure.artifact_blobs import ArtifactBlobStore
 from synapse.infrastructure.spawn_journal import FenceReport, SpawnJournal
 from synapse.orchestration.agent_engine import (
-    AgentProviderRouter, AgentWorkflowEngine, process_outcome_verifier,
+    AGENT_MAX_ATTEMPTS, AgentProviderRouter, AgentWorkflowEngine, process_outcome_verifier,
 )
 from synapse.orchestration.approval_gates import ApprovalStepSpec
 from synapse.persistence import agent_tasks as at
 from synapse.persistence import mock_scenarios as ms
 from synapse.persistence.agent_abandon import abandon_agent_run
+from synapse.persistence.attempt_resume import requeue_never_spawned
 from synapse.persistence.agent_cancellation import (
     cancellation_requested, finalize_agent_cancellation, request_agent_cancellation,
 )
@@ -385,7 +386,8 @@ class AgentRuntime:
         # A detached child CAN outlive the daemon, so recovery never trusts that nothing runs: in-flight attempts
         # become unknown, nothing is resumed, and an operator ends the run. The startup fence (ADR 023) kills
         # surviving process groups and records what it could not prove in the agent.worker_fence event; its
-        # result informs the operator, it does not make anything resumable.
+        # result informs the operator, it does not make anything resumable. Only work that provably never
+        # reached a provider is re-queued, and that happens before this, in _requeue_never_spawned (ADR 024).
         # Both real providers: a task of an agent run is claimed under the built-in claude row or a registry claude or
         # codex row (ADR 016 decision 4). Always both, so a codex attempt is reconciled even after its profile left
         # the registry; nothing else is relaxed (mock rows and unknown profiles still refuse the whole recovery).
@@ -411,8 +413,10 @@ class AgentRuntime:
         """Invoke only after acquiring exclusive daemon ownership at startup.
 
         Tasks that were in flight become unknown/blocked and the run moves to
-        ``recovering``. Nothing is re-spawned. A run left with only parked
-        approval gates is re-driven by ``resume_parked`` instead.
+        ``recovering``. Nothing that may have run is re-spawned. A run left with
+        only parked approval gates is re-driven by ``resume_parked`` instead, and
+        so is a run whose only in-flight work is provably never spawned (ADR 024):
+        those attempts are closed and their tasks re-queued for a NEW attempt.
         """
         runs = self.db.execute("SELECT run_id FROM mock_run_config WHERE profile_id=?", (at.AGENT_PROFILE,)).fetchall()
         self._fence_prior_workers()
@@ -427,10 +431,35 @@ class AgentRuntime:
                         self._recover_run(run_id)
                 elif self._pending_redrive is None and self._parked_only(run_id):
                     self._pending_redrive = run_id
+                elif self._pending_redrive is None and self._requeue_never_spawned(run_id):
+                    self._pending_redrive = run_id
                 else:
                     self._recover_run(run_id)
             except Exception:
                 _LOG.exception("Agent startup recovery failed for run %s", run_id)
+
+    def _requeue_never_spawned(self, run_id: str) -> bool:
+        """Re-queue a running run whose only in-flight work provably never reached a provider (ADR 024).
+
+        Requires the spawn journal and an all-clear fence: an unverified entry means some process (of this or
+        another run) might still be live, and then nothing is re-driven. Any doubt returns False, which sends the
+        run down today's recovery path unchanged.
+        """
+        report = self.fence_report
+        if self._journal is None or report is None or not report.all_clear:
+            return False
+        try:
+            if not at.is_agent_run(self.db, run_id):
+                return False
+            requeued = requeue_never_spawned(self.db, run_id=run_id, principal="agent-recovery",
+                                             max_attempts=AGENT_MAX_ATTEMPTS)
+        except Exception:
+            _LOG.exception("Never-spawned re-queue failed for run %s; recovering it instead", run_id)
+            return False
+        if requeued is None:
+            return False
+        _LOG.info("Run %s re-driven at startup: %d never-spawned attempt(s) re-queued", run_id, len(requeued))
+        return True
 
     def _fence_prior_workers(self) -> None:
         """Prove or enforce that no agent process of a previous daemon survives (ADR 023), before any recovery.
