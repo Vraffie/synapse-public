@@ -181,20 +181,33 @@ Existing base: hash, policy and expiry binding with execution-time recheck; syst
 ## M8 — Post-v1 (P2, not planned in detail)
 Knowledge index, optional browser client, remote workers, additional plugins, semantic caching only after an evaluation.
 
-## Fast path: XML config tool working on the BSS repos (owner decision 2026-11-23)
-The tool only produces XML config for product-config, portfolio and tenant-specification, then deploys to dev with one approved CLI command. This path is the only work scheduled now; everything under "Later" is parked and not planned. Owners: A = integrator and trust lane, B = clients, routes, CLI, you = owner inputs. No checkboxes here; the boxes above stay the source of truth.
-1. Land in flight: #41 auto-resume (migration 0017), ADR 026 trimmed to its first slice (#43). [A]
-2. Repo registry and per-repo worktrees (ADR 026 slice, migration 0019): object entries in `agent.json`, pinned baseline refs, one worktree per attempt per repo, read-only worktrees for read repos, writes limited to an XML path pattern, host-side commit at attempt end, protected paths. [A]
-3. Candidate manifest v2 and approval binding: one immutable object listing every repo's baseline and candidate SHA and diff hash; approvals bind to its hash; invalidated if a baseline moves. [A]
-4. Validators: XML well-formed check plus the Catalog Validator adapter as exact argv (no shell), results stored as evidence. Needs the validator command from the owner. [A and B]
-5. Dev deploy adapter: one operator-configured command, approval bound to environment, manifest hash and command, recheck right before running, intent record before and outcome after, `UNKNOWN` when unclear. Needs the deploy command from the owner. [A]
-6. Surfaces: run creation with repos, manifest show, approve, deploy and status in the API, `agentctl` and desktop. [B]
-7. Proof: independent security review of the new surface, then one real end-to-end run on the BSS repos (asks the owner first), results recorded in the docs. [A, B, owner]
-Owner inputs needed: repo paths and the XML file pattern agents may edit; the Catalog Validator command and what pass or fail looks like; the dev deploy command (one repo or all, any status check, how it logs in); approval for the first real run.
+## Fast path: XML config tool working on the BSS repos (owner decisions 2026-11-23)
+The tool only produces XML config for product-config, portfolio and tenant-specification, then deploys to dev with one approved CLI command. Only this path is scheduled; "Later" is parked. Owners: A = integrator and trust lane, B = clients, routes, CLI, desktop; owner = inputs. No checkboxes here; the boxes above stay the source of truth.
+
+Decisions from the owner's 20 answers:
+- Agents may edit any `**/*.xml` in the three repos; everything else is refused at host-side commit. Runs usually touch two or three repos. Up to two or three runs in parallel (engine cap 2 is enough to start).
+- No validator in v1: XML well-formed plus path checks, and the owner reads the diff. The Catalog Validator is added later as an extra check; auto-deploy stays off until a real validator exists.
+- Deploy: one operator-configured command for all repos together, reading the candidate worktrees from disk (no push), with a status command to verify afterwards (no dry-run). Every deploy needs explicit approval for now.
+- Approver is the owner only, with no passphrase and no extra approval secret (owner accepts that any process running as the same user could approve; the existing approver token file stays as the transport). Human-identity work is dropped.
+- Providers: three Claude profiles (`claude-work`, `claude-personal`, `claude-personal-ios`), chosen per run, no automatic fallback. Config directories are separate; the daemon is pointed at them by path and never reads credential files. Codex is later.
+- Surface: the desktop app first, with `agentctl` alongside.
+- Commits: the host commits each attempt to a local `synapse/` branch only; Synapse never pushes and never touches the owner's branches. The first real run goes straight to the real repos.
+- Recovery: current behaviour (never-spawned work auto-resumes, anything else waits for `agent-abandon`).
+
+Steps:
+1. Land in flight: #41 auto-resume merged; ADR 026 (#43) trimmed to its first slice with the decisions above. [A]
+2. Repo registry and per-repo worktrees (ADR 026 slice, migration 0019): object entries in `agent.json`, pinned baselines, one worktree per attempt per repo, read-only worktrees for read repos, XML-only write pattern, host-side commit at attempt end, protected paths. [A]
+3. Profile selection per run for the three Claude profiles (per-task profiles and `agentctl profiles` already exist; add run-level choice and the config-dir wiring). [A]
+4. Candidate manifest v2 and approval binding: one immutable object with every repo's baseline and candidate SHA and diff hash; approvals bind to its hash; invalidated if a baseline moves. [A]
+5. XML checks: well-formed, within allowed paths, no symlinks, diff size reported. (Validator adapter is Later.) [A]
+6. Dev deploy adapter: one configured command, approval recheck right before running, intent record before and outcome after, status command afterwards, `UNKNOWN` when unclear. Needs the deploy command from the owner. [A]
+7. Surfaces: run creation with repos and profile, per-repo diffs, manifest, approve, deploy and status in the API, `agentctl` and desktop. [B]
+8. Proof: independent security review of the new surface, then one real run on the BSS repos (asks the owner first), results recorded in the docs. [A, B, owner]
+Owner inputs still needed: the repo paths, the deploy command and its status command, the profile-to-directory mapping (assumed `claude-work` = `~/.claude`, `claude-personal` = `~/.claude-personal`, `claude-personal-ios` = `~/.claude-personal-ios`; to confirm), and a yes for the first real run.
 
 ## Later (parked, not planned; the owner builds a backlog from this)
 - Providers: second and third Claude profiles with fallback and cooldowns, per-profile CLI authentication, Codex real run and edits, `claude --version` fixture per version, per-profile concurrency up to 6.
-- Trust: secure session credentials and live MCP messaging, review independence wiring (ADR 025; fix the `skip-worktree` bypass and FIFO hang first), `daemon_epoch` and setsid/cgroup containment (F7), F10, hardware key or OS confirmation for human identity, plugin process isolation.
+- Trust: secure session credentials and live MCP messaging, review independence wiring (ADR 025; fix the `skip-worktree` bypass and FIFO hang first), `daemon_epoch` and setsid/cgroup containment (F7), F10, the Catalog Validator adapter and auto-deploy, automatic profile fallback, stronger human identity (the owner chose no approval secret), plugin process isolation.
 - M5 extras: cache storage (migration 0018) and wiring, handoff wiring (M5.6), analytics desktop pane (M5.7), routing judge, `on_unknown: allow` budget gap and ADR 020 amendment.
 - M6/M7 extras: cross-repo barrier (M6.6), Domain role workflow beyond the first run, retention sweep and worktree GC, STAGING transport and reconciliation beyond the single command, full ten-invariant fault-injection harness.
 - Owner-only GitHub settings: require a pull request and narrow admin bypass on `block main`, fork-workflow approval, Dependabot and scanning, Wiki and Projects off.
