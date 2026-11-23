@@ -37,12 +37,13 @@ same model family behind the same account. Independence can therefore only be **
 | Different provider session | yes: attempt = session today (see `AgentIdentity.session_key`); if a session id is ever recorded, equal ids are refused too |
 | Fresh context: the reviewer prompt carries only the author's **verified summary artifact**, fenced as untrusted data, plus its SHA-256. It never carries the raw output artifact or a transcript | yes |
 | Read-only reviewer (`permission_mode=plan`, tools ⊆ {Read, Glob, Grep}, the core `reviewer` role) | yes |
-| Different registry profile (another account, or Codex) | only with `Independence.DISTINCT_PROFILE` |
+| Different registry profile (another account, or Codex) | only with `Independence.DISTINCT_PROFILE`, and only as **registry ids**: two profile ids that point at the same account or credentials pass this check |
 | Different model, different vendor, different uid, isolation from a hostile author | **no** |
 
 **A same-model reviewer is not model-independent.** It shares the author's blind spots and can be prompt-injected
-by the candidate it reads. The verdict format (below) stops injected text from *flipping* a verdict mechanically. It
-does not stop a model from being persuaded to approve. Same-uid code can also edit the database (see
+by the candidate it reads. Nothing here defends against prompt injection. The single-occurrence verdict rule (below)
+only means that a verdict line the reviewer copies from the candidate makes the output ambiguous, so it cannot be
+counted as a second, mechanical verdict. A persuaded reviewer can still write a valid approve. Same-uid code can also edit the database (see
 `agent-runtime.md`, security limit). This is an accountability control, not a security boundary.
 
 ## Decision
@@ -76,8 +77,10 @@ so an old summary cannot be replayed. The author candidate is re-read. A differe
   fully match `SYNAPSE-REVIEW-VERDICT v1 (approve|reject) <64 lowercase hex>` (`review_verdict_invalid`);
 - the hash must equal the candidate hash the reviewer was given (`review_candidate_mismatch`).
 
-A candidate that embeds a fake verdict line can only produce an ambiguous output, and so a block. The author cannot
-choose the right hash in advance, because the summary hash covers its own attempt id and output.
+The SHA-256 binding is a **staleness and mismatch** control, not an injection defence: it ties the verdict to the
+exact bytes the reviewer was shown, so a verdict cannot be reused for another candidate. It does nothing against a
+reviewer that the candidate has persuaded. A copied verdict line only turns into `review_verdict_ambiguous`, because
+of the single-occurrence rule.
 
 A valid `approve` (AND the normal process-outcome verifier) completes the review task, recorded with verifier id
 `builtin.agent.independent-review.v1`. A valid `reject` leaves it `changes_required`. The author task is already
@@ -97,25 +100,41 @@ configured nodes it always runs the process-outcome check first, then:
 - **candidate hash**: SHA-256 of the bytes must equal exactly one `agent_summary` artifact of the task's current
   completed attempt (`candidate_hash_mismatch`, `candidate_not_current_attempt`);
 - **HEAD**: if the spec records `worktree_head`, HEAD must still equal it (`head_moved`: the agent committed or reset);
-- **diff**: `git status --porcelain=v1 -z --no-renames --untracked-files=all` through `WorktreeManager`'s hardened
-  git (`GitWorktreeEvidence`). Non-empty when `require_changes` (`no_changes`). Every path, tracked or untracked,
+- **diff**: `git status --porcelain=v1 -z --no-renames --untracked-files=all --ignored=matching` through
+  `WorktreeManager`'s hardened git (`GitWorktreeEvidence`; `_HARDEN` now also sets `core.excludesFile=/dev/null`).
+  Ignored files are listed on purpose, so a `.gitignore` the agent writes (for example `*` then `!src/**`), the
+  repo's own ignore rules or `info/exclude` cannot hide a file from the path check. Ignored build output in the
+  worktree therefore fails the check (fail closed). Non-empty when `require_changes` (`no_changes`). Every path, tracked or untracked,
   must be a plain relative path inside `allowed_paths`, matched component-wise (`path_outside_allowed`). Changed
   symlinks are refused (`symlink_changed`). Truncated status output raises (`evidence_unavailable`);
 - **check command** (optional, run only if everything above passed): `CheckCommand(argv: tuple, timeout_seconds,
-  max_output_bytes)`. The argv is a tuple with an absolute normalized executable, never a shell string. It runs host
+  max_output_bytes, sandbox_launchers, experimental_unsandboxed, memory_limit_bytes, file_size_limit_bytes)`. The argv
+  is a tuple with an absolute normalized executable, never a shell string. **The constructor refuses it unless
+  `argv[0]` is in the operator's `sandbox_launchers` allowlist** (for example a bwrap wrapper), or
+  `experimental_unsandboxed=True` is set explicitly. That flag defaults to off. The child also gets rlimits:
+  `RLIMIT_CPU` = timeout + 1 s, `RLIMIT_CORE` = 0, `RLIMIT_NOFILE` ≤ 1024, `RLIMIT_FSIZE` (default 64 MiB), and
+  optionally `RLIMIT_AS`. These are set through `preexec_fn`, which only calls `setrlimit`. It runs host
   side with `shell=False`, stdin closed, a scrubbed environment (fixed `PATH`, `HOME=/nonexistent`, `LC_ALL=C`, git
   global/system config off, no inherited variables, so no OAuth token), cwd = the worktree, and its own process
   group. The group is SIGKILLed on timeout, on output overflow, and after exit (descendants). The leader is observed
   with `WNOWAIT` so its pgid cannot be reused before the kill. Reasons: `check_failed`, `check_timed_out`,
   `check_output_exceeded`, `check_not_started`.
+- **re-check after the command**: the check runs code with write access to the worktree. HEAD and every changed path
+  (tracked, untracked, ignored) are snapshotted, with a SHA-256 of each file's content or symlink target and its
+  mode, both before and after the command. Any difference is `check_modified_worktree`, even inside the allowed
+  paths.
 
 Each evaluation publishes a bounded JSON evidence artifact (reasons, HEAD, up to 50 changed paths, last 4 KiB of
-check output). It also writes a `verification.evidence` event with ids, hashes and reason codes only. The
+check output). The check-output tail is kept only for a launcher-sandboxed check. For an `experimental_unsandboxed` check it is
+`null`: that output is text from an unconfined agent-code process. Each evaluation also writes a
+`verification.evidence` event with ids, hashes and reason codes only. The
 `verification_results.evidence_artifact_id` column is **not** filled: that needs a change to
 `persistence/mock_execution_store.py`, which was out of scope.
 
-**Security limit:** a check command such as a test runner executes agent-written code as the daemon's uid, unsandboxed.
-Point `argv` at a sandboxing launcher for untrusted worktrees. A pass is evidence, not proof.
+**Security limit:** a check command such as a test runner executes agent-written code. The launcher allowlist only
+proves that the operator *named* a launcher. This module does not verify what that launcher confines. Under
+`experimental_unsandboxed` the code runs as the daemon's uid with only rlimits, a scrubbed environment and a process
+group kill. A pass is evidence, not proof.
 
 ## Alternatives considered
 

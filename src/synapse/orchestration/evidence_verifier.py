@@ -8,18 +8,19 @@ evidence the daemon gathers itself, host side:
 2. the candidate bytes are exactly the summary artifact recorded for the task's current completed attempt
    (SHA-256 match, run/task/attempt provenance);
 3. the worktree still sits on the recorded HEAD (the agent did not commit or reset) when the spec records one;
-4. the worktree has changes (``require_changes``) and every changed path, tracked or untracked, is inside the
-   node's ``allowed_paths``, is not a symlink and is a plain relative path;
-5. an optional check command (exact absolute executable + argument list, no shell, hardened environment, wall-clock
-   timeout, bounded output, whole process group killed on expiry) exits 0.
+4. the worktree has changes (``require_changes``) and every changed path, tracked, untracked or ignored (so no
+   .gitignore can hide one), is inside the node's ``allowed_paths``, is not a symlink and is a plain relative path;
+5. an optional check command (exact absolute executable + argument list, no shell, hardened environment, rlimits,
+   wall-clock timeout, bounded output, whole process group killed on expiry) exits 0, AND HEAD plus every changed
+   path's content are identical afterwards (the check ran with write access to the worktree).
 
 Every evaluation of a configured node publishes an evidence artifact (bounded) and a ``verification.evidence``
 event with ids and reason codes only. Nodes without a policy are delegated unchanged to the fallback verifier, so
 the default behaviour of the engine does not change.
 
-SECURITY LIMIT: the check command runs as the daemon's uid in the agent-written worktree. A test command executes
-code the agent wrote. It is NOT sandboxed by this module; point ``argv`` at a sandboxing launcher if the worktree is
-untrusted, and treat a pass as evidence, not proof.
+SECURITY LIMIT: a test command executes code the agent wrote. ``CheckCommand`` refuses any argv[0] that is not an
+operator-allowlisted sandbox launcher unless ``experimental_unsandboxed=True`` (default off); this module does not
+verify what a launcher confines. Unsandboxed output is not kept in the evidence artifact. A pass is evidence, not proof.
 """
 from __future__ import annotations
 
@@ -30,7 +31,9 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import os
+import resource
 import signal
+import stat
 import sqlite3
 import subprocess
 import threading
@@ -68,6 +71,16 @@ class CheckCommand:
     argv: tuple[str, ...]
     timeout_seconds: float = 300.0
     max_output_bytes: int = 64 * 1024
+    # argv[0] must be one of these operator-allowlisted sandbox launchers (absolute paths; e.g. a bwrap wrapper)...
+    sandbox_launchers: frozenset[str] = frozenset()
+    # ...unless this explicit, default-off flag accepts running agent-written code unsandboxed as the daemon uid.
+    experimental_unsandboxed: bool = False
+    memory_limit_bytes: int | None = None  # RLIMIT_AS; opt-in (JS runtimes reserve address space)
+    file_size_limit_bytes: int = 64 * 1024 * 1024  # RLIMIT_FSIZE
+
+    @property
+    def sandboxed(self) -> bool:
+        return self.argv[0] in self.sandbox_launchers
 
     def __post_init__(self) -> None:
         if not isinstance(self.argv, tuple) or not 1 <= len(self.argv) <= MAX_ARGV:
@@ -83,6 +96,20 @@ class CheckCommand:
             raise ValueError("timeout_seconds must be in (0, %d]" % MAX_CHECK_TIMEOUT)
         if type(self.max_output_bytes) is not int or not 1 <= self.max_output_bytes <= MAX_CHECK_OUTPUT:
             raise ValueError("max_output_bytes must be in [1, %d]" % MAX_CHECK_OUTPUT)
+        if not isinstance(self.sandbox_launchers, frozenset) or any(
+                not isinstance(x, str) or "\x00" in x or not os.path.isabs(x) or os.path.normpath(x) != x
+                for x in self.sandbox_launchers):
+            raise ValueError("sandbox_launchers must be a frozenset of absolute, normalized paths")
+        if type(self.experimental_unsandboxed) is not bool:
+            raise ValueError("experimental_unsandboxed must be bool")
+        if not self.sandboxed and not self.experimental_unsandboxed:
+            raise ValueError("argv[0] must be an operator-allowlisted sandbox launcher; running a check command "
+                             "unsandboxed needs experimental_unsandboxed=True")
+        if self.memory_limit_bytes is not None and (type(self.memory_limit_bytes) is not int
+                                                    or self.memory_limit_bytes < 64 * 1024 * 1024):
+            raise ValueError("memory_limit_bytes must be None or an int of at least 64 MiB")
+        if type(self.file_size_limit_bytes) is not int or not 1024 <= self.file_size_limit_bytes <= 1 << 34:
+            raise ValueError("file_size_limit_bytes must be in [1 KiB, 16 GiB]")
 
 
 def _check_rel_path(path: str) -> str:
@@ -149,7 +176,7 @@ class GitWorktreeEvidence:
     def changed_paths(self, run_id: str, task_id: str) -> tuple[str, ...]:
         path, repo = self._found(run_id, task_id)
         _, out, truncated = self._m._tree_git(repo, path, ["status", "--porcelain=v1", "-z", "--no-renames",
-                                                           "--untracked-files=all", "--ignored=no"],
+                                                           "--untracked-files=all", "--ignored=matching"],
                                               max_bytes=self._max)
         if truncated:
             raise ValueError("worktree status exceeds the evidence bound")
@@ -157,6 +184,8 @@ class GitWorktreeEvidence:
         for entry in out.split("\x00"):
             if not entry:
                 continue
+            # "!! path" entries are ignored files: listed on purpose, so a .gitignore the agent wrote (or the
+            # repo's own, or info/exclude) cannot hide a file from the allowed-paths check.
             if len(entry) < 4 or entry[2] != " ":
                 raise ValueError("unexpected git status entry")
             paths.append(entry[3:])
@@ -173,6 +202,23 @@ class CheckResult:
     seconds: float = 0.0
 
 
+def _limits(command: CheckCommand) -> list[tuple[int, int]]:
+    out = [(resource.RLIMIT_CPU, int(command.timeout_seconds) + 1), (resource.RLIMIT_CORE, 0),
+           (resource.RLIMIT_NOFILE, 1024), (resource.RLIMIT_FSIZE, command.file_size_limit_bytes)]
+    if command.memory_limit_bytes is not None:
+        out.append((resource.RLIMIT_AS, command.memory_limit_bytes))
+    return out
+
+
+def _preexec(limits: list[tuple[int, int]]) -> Callable[[], None]:
+    def apply() -> None:  # runs in the forked child before exec: only getrlimit/setrlimit, no imports or locks
+        for which, value in limits:
+            hard = resource.getrlimit(which)[1]
+            value = value if hard == resource.RLIM_INFINITY else min(value, hard)
+            resource.setrlimit(which, (value, value))
+    return apply
+
+
 def run_check(command: CheckCommand, cwd: str) -> CheckResult:
     """Run the command host side: argv only, no shell, hardened env, own process group, bounded output.
 
@@ -183,8 +229,8 @@ def run_check(command: CheckCommand, cwd: str) -> CheckResult:
     try:
         proc = subprocess.Popen(list(command.argv), cwd=cwd, env=_hardened_env(), shell=False,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                close_fds=True, start_new_session=True)
-    except (OSError, ValueError):
+                                close_fds=True, start_new_session=True, preexec_fn=_preexec(_limits(command)))
+    except (OSError, ValueError, subprocess.SubprocessError):
         return CheckResult(None, start_failed=True, seconds=time.monotonic() - started)
     tail = bytearray()
     total = 0
@@ -321,12 +367,13 @@ class EvidenceVerifier:
         if path != os.path.realpath(spec["worktree"]):
             ev.reasons.append("worktree_mismatch")
             return
-        head = src.head(run_id, task_id)
+        before = self._snapshot(run_id, task_id, path)
+        head = before[0]
         ev.facts["head"] = head
         expected = spec.get("worktree_head")
         if isinstance(expected, str) and head != expected:
             ev.reasons.append("head_moved")
-        changed = src.changed_paths(run_id, task_id)
+        changed = tuple(p for p, _ in before[1])
         ev.facts["changed_count"] = len(changed)
         ev.facts["changed_paths"] = [p[:MAX_LISTED_PATH_CHARS] for p in changed[:MAX_LISTED_PATHS]]
         if policy.require_changes and not changed:
@@ -339,11 +386,24 @@ class EvidenceVerifier:
         if links:
             ev.reasons.append("symlink_changed")
         if policy.check is not None and not ev.reasons:
+            if not policy.check.sandboxed and not policy.check.experimental_unsandboxed:
+                ev.reasons.append("check_not_sandboxed")  # unreachable via the constructor; fail closed anyway
+                return
             result = run_check(policy.check, path)
             ev.facts["check"] = {"exit_code": result.exit_code, "timed_out": result.timed_out,
                                  "output_exceeded": result.output_exceeded, "start_failed": result.start_failed,
-                                 "seconds": round(result.seconds, 3),
-                                 "output_tail": result.tail.decode("utf-8", "replace").replace("\x00", "�")}
+                                 "seconds": round(result.seconds, 3), "sandboxed": policy.check.sandboxed,
+                                 # unsandboxed output is text from an unconfined agent-code process: not kept
+                                 "output_tail": result.tail.decode("utf-8", "replace").replace("\x00", "�")
+                                 if policy.check.sandboxed else None}
+            # The check ran code with write access to the worktree: the evidence gathered before it must still hold.
+            try:
+                after = self._snapshot(run_id, task_id, path)
+            except Exception:
+                after = None
+            if after != before:
+                ev.reasons.append("check_modified_worktree")
+                return
             if result.start_failed:
                 ev.reasons.append("check_not_started")
             elif result.timed_out:
@@ -352,6 +412,12 @@ class EvidenceVerifier:
                 ev.reasons.append("check_output_exceeded")
             elif result.exit_code != 0:
                 ev.reasons.append("check_failed")
+
+    def _snapshot(self, run_id: str, task_id: str, path: str) -> tuple[str, tuple[tuple[str, str], ...]]:
+        """HEAD plus every changed path (tracked, untracked, ignored) with a digest of what is there now."""
+        head = self.evidence.head(run_id, task_id)
+        changed = self.evidence.changed_paths(run_id, task_id)
+        return head, tuple((p, _digest(path, p)) for p in changed)
 
     def _record(self, task_id: str, candidate: bytes, summary: dict | None, ev: _Evidence) -> None:
         run_id = summary["run_id"] if summary else self.db.execute("SELECT run_id FROM tasks WHERE id=?",
@@ -384,6 +450,26 @@ class EvidenceVerifier:
             if self.db.in_transaction:
                 self.db.execute("ROLLBACK")
             raise
+
+
+def _digest(root: str, rel: str) -> str:
+    """Content identity of one changed path, never following a symlink out of the worktree."""
+    if not _plain(rel):
+        return "invalid"
+    full = os.path.join(root, rel)
+    try:
+        st = os.lstat(full)
+    except FileNotFoundError:
+        return "missing"
+    if stat.S_ISLNK(st.st_mode):
+        return "link:" + hashlib.sha256(os.fsencode(os.readlink(full))).hexdigest()
+    if not stat.S_ISREG(st.st_mode):
+        return "other:%o" % st.st_mode
+    h = hashlib.sha256()
+    with os.fdopen(os.open(full, os.O_RDONLY | os.O_NOFOLLOW), "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return "file:%o:%s" % (st.st_mode & 0o7777, h.hexdigest())
 
 
 def _plain(path: str) -> bool:
