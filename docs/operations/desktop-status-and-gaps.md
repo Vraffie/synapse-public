@@ -49,7 +49,7 @@ acceptance tests), #131 (demo launcher). Do not duplicate them.
 
 ## Missing, ranked
 
-Backend routes that exist on main: `agent-runs`, `agent-cancel`, `agent-abandon`, `agent-worktree-remove`, `runs/{id}/usage`,
+Backend routes that exist on main: `agent-runs`, `agent-cancel`, `agent-abandon`, `agent-worktree-remove`, `agent-worktree-commit`, `runs/{id}/usage`,
 `runs/{id}/agent`, approvals, events, threads/messages, `mock-*`. The desktop client (`connection.py`) calls none of
 `agent-abandon`, `agent-worktree-remove`, `usage` (grep: no match for abandon/cooldown/environment/audit/before_id in `src/synapse/desktop`).
 
@@ -66,7 +66,7 @@ Backend routes that exist on main: `agent-runs`, `agent-cancel`, `agent-abandon`
 
 | # | Gap | Scope | Files |
 |---|---|---|---|
-| 5 | Worktree removal after terminal run | Button for `agent-worktree-remove` with confirm and result | `connection.py`, `agent_view.py` |
+| 5 | Worktree removal after terminal run | Button for `agent-worktree-remove` with confirm and result (done; the matching "Commit changes..." action for `agent-worktree-commit` is also implemented) | `connection.py`, `agent_view.py` |
 | 6 | Usage/token ledger | Panel from `GET /runs/{id}/usage` (tokens, cost, per profile); ADR 017/020 budget state | `connection.py`, `agent_view.py`, `narrative.py` |
 | 7 | Multi-task DAG of real agent runs | `agent_view` shows one run detail only (single tools/worktree block); per-task status, tools and permission mode per task; form starts a single task | `agent_view.py`, `agent_form.py`, `topology_view.py` |
 | 8 | Profile/registry display (ADR 015/016) | Profile column and cooldown/availability; `assigned_profile_id` is fetched (`runs_view.py`) but only shown for mock | `runs_view.py`, `narrative.py` |

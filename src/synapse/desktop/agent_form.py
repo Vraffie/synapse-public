@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from PySide6.QtCore import QSettings, Qt, Signal
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
     QSpinBox, QVBoxLayout, QWidget,
 )
 
@@ -329,3 +329,42 @@ class AgentRunForm(QWidget):
             self.status.setText("The daemon's response was not understood; retrying reuses the same request key.")
         else:
             self.status.setText("Start failed or the response was lost; retrying reuses the same request key.")
+
+
+MAX_COMMIT_MESSAGE = 2000
+
+
+def valid_commit_message(text: str) -> str | None:
+    """The message to send (surrounding whitespace trimmed), or None when it is empty or longer than the daemon accepts."""
+    text = text.strip()
+    return text if text and len(text) <= MAX_COMMIT_MESSAGE else None
+
+
+def ask_commit_message(parent) -> str | None:
+    """Modal multi-line commit message prompt; None when cancelled. Module-level so tests can replace it.
+    The text is returned to the caller and never logged or stored here."""
+    dialog = QDialog(parent)
+    dialog.setWindowTitle("Commit changes")
+    note = QLabel("Commit message for the uncommitted changes in each task worktree of this run "
+                  f"(required, at most {MAX_COMMIT_MESSAGE} characters). Your own checkout is not touched and nothing is pushed.")
+    note.setWordWrap(True)
+    edit = QPlainTextEdit()
+    count = QLabel("")
+    buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+    ok = buttons.button(QDialogButtonBox.StandardButton.Ok)
+
+    def changed():
+        text = edit.toPlainText().strip()
+        count.setText(f"{len(text)} / {MAX_COMMIT_MESSAGE}")
+        ok.setEnabled(valid_commit_message(text) is not None)
+    edit.textChanged.connect(changed)
+    buttons.accepted.connect(dialog.accept)
+    buttons.rejected.connect(dialog.reject)
+    layout = QVBoxLayout(dialog)
+    for widget in (note, edit, count, buttons):
+        layout.addWidget(widget)
+    changed()
+    try:
+        return valid_commit_message(edit.toPlainText()) if dialog.exec() == QDialog.DialogCode.Accepted else None
+    finally:
+        dialog.deleteLater()

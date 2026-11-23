@@ -14,7 +14,7 @@ from PySide6.QtCore import QThread, Signal
 from synapse.cli.__main__ import DaemonHTTPError, _get, _request
 from synapse.desktop import approval_decision
 from synapse.desktop.agent_usage import sanitize_usage
-from synapse.desktop.agent_view import UNAVAILABLE_STATUSES, sanitize_detail
+from synapse.desktop.agent_view import UNAVAILABLE_STATUSES, clean, sanitize_detail
 from synapse.desktop.mock_resume import ASSERTION, collect_evidence
 
 API_VERSION = "v1"  # the only API prefix this client speaks (/api/v1/...)
@@ -39,7 +39,24 @@ def _op_response_ok(action, run_id, result) -> bool:
         return False
     if action == 'abandon':
         return result.get('state') == 'failed'
+    if action == 'commit':
+        return _commit_tasks(result) is not None
     return isinstance(result.get('removed'), bool) and isinstance(result.get('tasks'), list)
+
+
+def _commit_tasks(result):
+    """Bounded, control-free [(branch, head12)] from a commit response, or None when it is not the documented shape."""
+    tasks = result.get('tasks')
+    if not isinstance(tasks, list) or not tasks or len(tasks) > 200:
+        return None
+    rows = []
+    for task in tasks:
+        if (not isinstance(task, dict) or not isinstance(task.get('task_id'), str) or not isinstance(task.get('branch'), str)
+                or not isinstance(task.get('head'), str) or not task['branch'] or not task['head']
+                or not isinstance(task.get('paths'), list)):
+            return None
+        rows.append((clean(task['branch'], 200), clean(task['head'], 64)[:12]))
+    return rows
 
 
 class Poller(QThread):
@@ -61,7 +78,8 @@ class Poller(QThread):
     approval_decided = Signal(str, str)
     agent_started = Signal(str, object, str)  # outcome ('accepted' | 'unavailable' | 'invalid' | 'failed'), result dict | None, key
     agent_cancel_finished = Signal(str, str)  # run id, outcome
-    agent_op_finished = Signal(str, str, str)  # action ('abandon' | 'remove'), run id, outcome
+    agent_op_finished = Signal(str, str, str)  # action ('abandon' | 'remove' | 'commit'), run id, outcome
+    agent_commit_done = Signal(str, object)  # run id, [(branch, short head)]; emitted just before agent_op_finished
     agent_usage = Signal(str, object, object)  # run id, generation, sanitized usage
     agent_usage_error = Signal(str, object, str)  # run id, generation, 'unavailable' | 'failed'
     agent_detail = Signal(str, object, object)  # run id, generation, sanitized detail
@@ -187,6 +205,14 @@ class Poller(QThread):
             self._command = ("agent-" + action, run_id, key, body, key)
             return True
 
+    def request_agent_commit(self, run_id: str, key: str, message: str) -> bool:
+        """agent-worktree-commit with {"message": ...}; the text is only held in the pending command until it is sent."""
+        with self._command_lock:
+            if self._command is not None:
+                return False
+            self._command = ("agent-commit", run_id, key, json.dumps({"message": message}).encode("utf-8"), key)
+            return True
+
     def prepare_mock_resume(self, run_id: str, generation: int) -> bool:
         with self._command_lock:
             if self._command is not None:
@@ -267,9 +293,13 @@ class Poller(QThread):
         """Abandon / remove a worktree off the UI thread; the outcome is a coarse word, never response or exception text."""
         outcome = 'failed'
         try:
-            path = '/api/v1/runs/' + quote(run_id, safe='') + ('/agent-abandon' if action == 'abandon' else '/agent-worktree-remove')
+            suffix = {'abandon': '/agent-abandon', 'commit': '/agent-worktree-commit'}.get(action, '/agent-worktree-remove')
+            path = '/api/v1/runs/' + quote(run_id, safe='') + suffix
             result = self.send(self.state_dir, path, body=body, idempotency_key=key, correlation_id=key)
+            body = None  # may hold the commit message: drop it
             outcome = 'accepted' if _op_response_ok(action, run_id, result) else 'invalid'
+            if action == 'commit' and outcome == 'accepted':
+                self.agent_commit_done.emit(run_id, _commit_tasks(result))
         except DaemonHTTPError as exc:
             outcome = {404: 'unavailable', 503: 'unavailable', 409: 'conflict', 422: 'rejected'}.get(exc.status, 'failed')
         except Exception:
@@ -377,9 +407,9 @@ class Poller(QThread):
                 if action == 'decide':
                     self._decide(run_id, key, body, generation, json.loads(body)['decision'])
                     command = generation = None
-                elif action in ('agent-abandon', 'agent-remove'):
+                elif action in ('agent-abandon', 'agent-remove', 'agent-commit'):
                     self._agent_op(action[6:], run_id, key, body)
-                    command = generation = None
+                    command = generation = body = None
                 elif action in ('agent-start', 'agent-cancel'):
                     self._agent_command(action, run_id, key, body, generation)
                     command = generation = None
