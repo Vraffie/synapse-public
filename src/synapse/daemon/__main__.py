@@ -31,6 +31,7 @@ from synapse.persistence.agent_tasks import AGENT_PROFILE
 from synapse.persistence.budget_binding import BudgetPolicyError, load_budget_policy
 from synapse.daemon.agent_config import AgentConfigError, load_agent_config
 from synapse.daemon.agent_profiles import build_registry, load_agent_profiles, sync_profiles
+from synapse.infrastructure.spawn_journal import SpawnJournal
 from synapse.daemon.agent_runtime import AgentRuntime
 from synapse.daemon.same_user_gate import ENV as ALLOW_ENV, SameUserAgentsRefused, check_same_user_agents, record_acknowledgement
 from synapse.daemon.agent_service import AgentRunService, worktree_checker
@@ -311,7 +312,8 @@ def run(state_dir: Path, migrations: Path, *, enable_mock_mcp_ipc: bool = False,
                 connection, artifacts, profile=claude_profile,
                 approval_policy=None if agent_config is None else agent_config.approval_policy,
                 worktree_check=None if worktrees is None else worktree_checker(worktrees),
-                budget_policy=budget_policy, registry=profile_registry)
+                budget_policy=budget_policy, registry=profile_registry,
+                spawn_journal=SpawnJournal(state_dir / "spawn-journal"))
             agent_runtime.recover_interrupted()
             if profile_registry is not None:
                 sync_profiles(connection, profile_registry)

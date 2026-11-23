@@ -14,6 +14,7 @@ every mock-only guard (mock cancel/resume/recovery) refuses to touch it.
 from __future__ import annotations
 
 import asyncio
+import functools
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import logging
@@ -25,9 +26,10 @@ from synapse.daemon.agent_profiles import REGISTRY_REF_PREFIX, mode_within
 from synapse.daemon.profile_registry import Cooldowns
 from synapse.application.approval_requests import DaemonApprovalRequester
 from synapse.application.budget_policy import BudgetPolicy
-from synapse.domain.contracts import RunId, new_id, validate_id
+from synapse.domain.contracts import EventEnvelope, RunId, encode_payload, new_id, validate_id
 from synapse.domain.runs import RunChange, RunState
 from synapse.infrastructure.artifact_blobs import ArtifactBlobStore
+from synapse.infrastructure.spawn_journal import FenceReport, SpawnJournal
 from synapse.orchestration.agent_engine import (
     AgentProviderRouter, AgentWorkflowEngine, process_outcome_verifier,
 )
@@ -58,13 +60,18 @@ class AgentRuntime:
                  max_concurrency: int = 2, provider_factory=ClaudeCliProvider,
                  approval_policy: ApprovalPolicy | None = None,
                  worktree_check: Callable[[str, str, str], tuple[str, bool]] | None = None,
-                 budget_policy: BudgetPolicy | None = None, registry=None):
+                 budget_policy: BudgetPolicy | None = None, registry=None,
+                 spawn_journal: SpawnJournal | None = None):
         if profile is not None and not isinstance(profile, ClaudeCliProfile):
             raise TypeError("profile must be a ClaudeCliProfile")
         if type(max_concurrency) is not int or not 1 <= max_concurrency <= 6:
             raise ValueError("max_concurrency must be between 1 and 6")
         self.db = connection
-        self.profile, self._verify, self._factory, self._max_concurrency = profile, verify, provider_factory, max_concurrency
+        self.profile, self._verify, self._max_concurrency = profile, verify, max_concurrency
+        self._journal = spawn_journal
+        self.fence_report: FenceReport | None = None  # result of the startup fence, None until it ran
+        # With a journal every real spawn is recorded durably so a restart can prove or enforce that none survives.
+        self._factory = provider_factory if spawn_journal is None else functools.partial(provider_factory, spawn_journal=spawn_journal)
         self.registry = registry  # ProfileRegistry or None: named profiles resolve here and nowhere else
         self.cooldowns = Cooldowns()  # operator-set, in memory: a restart forgets them (ADR 016 decision 6)
         self.approval_policy = approval_policy or ApprovalPolicy()
@@ -346,8 +353,10 @@ class AgentRuntime:
         approval gates is re-driven by ``resume_parked`` instead.
         """
         runs = self.db.execute("SELECT run_id FROM mock_run_config WHERE profile_id=?", (at.AGENT_PROFILE,)).fetchall()
+        self._fence_prior_workers()
         for (run_id,) in runs:
             try:
+                self._audit_fence(run_id)
                 if cancellation_requested(self.db, run_id):
                     self._reconcile(run_id)
                     try:
@@ -360,6 +369,56 @@ class AgentRuntime:
                     self._recover_run(run_id)
             except Exception:
                 _LOG.exception("Agent startup recovery failed for run %s", run_id)
+
+    def _fence_prior_workers(self) -> None:
+        """Prove or enforce that no agent process of a previous daemon survives (ADR 023), before any recovery.
+
+        Orphans are killed with their whole process group. What cannot be proven dead (a spawn that crashed before
+        its pid was recorded, an ambiguous pid, a group that would not die) is reported ``unverified``: recovery
+        still marks the attempt unknown and the run recovering, but the audit event says the operator must check.
+        """
+        if self._journal is None:
+            return
+        try:
+            self.fence_report = self._journal.fence_all()
+        except Exception:
+            _LOG.exception("Startup worker fence failed; treating every prior worker as unverified")
+            self.fence_report = FenceReport(unverified=1)
+        report = self.fence_report
+        if report.total:
+            (_LOG.info if report.all_clear else _LOG.error)(
+                "Startup worker fence: %d provably gone, %d killed, %d UNVERIFIED", report.verified_dead,
+                report.killed, report.unverified)
+
+    def _audit_fence(self, run_id: str) -> None:
+        """Record the fence result on every run that had unresolved work, so abandon decisions can rely on it."""
+        report = self.fence_report
+        if report is None or not report.total:
+            return
+        try:
+            unresolved = self.db.execute(
+                "SELECT 1 FROM task_attempts a JOIN tasks t ON t.id=a.task_id WHERE t.run_id=? "
+                "AND a.state IN ('created','starting','running') LIMIT 1", (run_id,)).fetchone()
+            if unresolved is None:
+                return
+            event = EventEnvelope.create(aggregate_type="run", aggregate_id=run_id, event_type="agent.worker_fence",
+                                         payload={"run_id": run_id, "principal": "agent-recovery",
+                                                  "verified_dead": report.verified_dead, "killed": report.killed,
+                                                  "unverified": report.unverified, "all_clear": report.all_clear})
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                self.db.execute("INSERT INTO events(id,aggregate_type,aggregate_id,run_id,type,schema_version,payload_json,occurred_at) "
+                                "VALUES(?,?,?,?,?,?,?,?)",
+                                (event.id, event.aggregate_type, run_id, run_id, event.event_type, event.schema_version,
+                                 encode_payload(event.payload), event.occurred_at))
+                self.db.execute("INSERT INTO outbox(event_id) VALUES(?)", (event.id,))
+                self.db.execute("COMMIT")
+            except BaseException:
+                if self.db.in_transaction:
+                    self.db.execute("ROLLBACK")
+                raise
+        except Exception:
+            _LOG.exception("Worker fence result for run %s could not be recorded", run_id)
 
     def resume_parked(self):
         """Re-drive the run left parked at startup (call from the daemon's event loop)."""
