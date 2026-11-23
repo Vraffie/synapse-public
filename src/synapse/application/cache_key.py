@@ -7,9 +7,9 @@ a migration that is blocked on migration numbering, so nothing is ever cached to
 
 Rules (every "no" is a bypass with a reason, never an error the caller must handle):
 
-- Default is **no**: a task is cacheable only if its class is ``read_only_analysis`` or
-  ``validation`` *and* an operator policy marked it cacheable. Edit, review, verification and
-  independent-check tasks are never cacheable; an unknown class is not cacheable.
+- Default is **no**: a task is cacheable only if its class is ``read_only_analysis`` *and* an
+  operator policy marked it cacheable. Edit, review, verification, validation and independent-check
+  tasks are never cacheable; an unknown class is not cacheable.
 - Any approval-gated task bypasses with ``approval_gated``.
 - Tools: only the read-only allowlist below. ``Bash`` in any form, write-capable tools and unknown
   tools bypass. ``acceptEdits`` / ``bypassPermissions`` / ``auto`` / unknown permission modes bypass.
@@ -38,8 +38,10 @@ from synapse.application.context_manifest import ContextManifest
 from synapse.persistence.idempotency import canonical_request_hash
 
 CACHE_SCHEMA_VERSION = 1
-CACHEABLE_CLASSES = frozenset({"read_only_analysis", "validation"})
-NEVER_CACHEABLE_CLASSES = frozenset({"edit", "review", "verification", "independent_check"})
+# ADR 017 D6 lists only read-only analysis (operator-marked) among task results that may be cached; a
+# "validation" task is a check on a candidate, which D6 puts with verifications: never cacheable.
+CACHEABLE_CLASSES = frozenset({"read_only_analysis"})
+NEVER_CACHEABLE_CLASSES = frozenset({"edit", "review", "verification", "validation", "independent_check"})
 READ_ONLY_TOOLS = frozenset({"Read", "Grep", "Glob", "LS"})
 WRITE_CAPABLE_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit", "Bash", "WebFetch", "WebSearch", "Task"})
 CACHEABLE_MODES = frozenset({"plan", "dontAsk", "manual"})
