@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from synapse.domain.contracts import validate_id
-from synapse.persistence.run_list import InvalidCursor, decode_cursor, encode_cursor
+from synapse.persistence.paging import decode_page_cursor, encode_page_cursor, page_scope
 from synapse.persistence.run_snapshot import RunNotFound
 
 USAGE_FIELDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "cost_usd")
@@ -36,7 +36,7 @@ MAX_ATTEMPTS = 20_000
 MAX_OBSERVATIONS = 100_000
 MAX_EVENTS = 200_000
 MAX_PROFILES = 200
-_CURSOR_MARK = "task"
+_CURSOR_KIND = "analytics"  # page_scope(kind, run_id) binds a cursor to this view of THIS run
 _STATE_EVENTS = ("task_attempt.state_changed", "task_attempt.unknown", "task_attempt.mock_reconciled",
                  "task_attempt.mock_cancelled_after_stop")
 _DELIVERY_EVENTS = ("delivery.claimed", "delivery.acknowledged", "delivery.dead_letter", "delivery.dead_lettered",
@@ -222,7 +222,7 @@ def _build(run_id: str, source: str, facts: _Facts, limit: int, after: str | Non
     remaining = [t for t in sorted(by_task) if after is None or t > after]
     page = tuple(TaskAnalytics(t, count(len(by_task[t])), count(len(by_task[t]) - 1), mix(by_task[t]), usage_of(by_task[t]))
                  for t in remaining[:limit])  # per-task work only for the page
-    next_cursor = encode_cursor(_CURSOR_MARK, page[-1].task_id) if len(remaining) > limit else None
+    next_cursor = encode_page_cursor(page_scope(_CURSOR_KIND, run_id), page[-1].task_id) if len(remaining) > limit else None
 
     total_attempts = len(facts.attempts)
     estimated: dict[str, dict[str, Quantity]] = {}
@@ -261,15 +261,16 @@ def _build(run_id: str, source: str, facts: _Facts, limit: int, after: str | Non
         ignored_estimate_events=facts.ignored_estimates)
 
 
-def _page_args(limit: int, cursor: str | None) -> str | None:
+def _page_args(run_id: str, limit: int, cursor: str | None) -> str | None:
+    """Validate the page size and return the last task id of the previous page.
+
+    A malformed cursor, or one issued for another run or route, raises ``InvalidPageCursor`` (API: 422).
+    """
     if type(limit) is not int or not 1 <= limit <= MAX_PAGE:
         raise ValueError("Invalid page size")
     if cursor is None:
         return None
-    mark, task_id = decode_cursor(cursor)
-    if mark != _CURSOR_MARK:
-        raise InvalidCursor("Invalid cursor")
-    return task_id
+    return decode_page_cursor(cursor, page_scope(_CURSOR_KIND, run_id), 1)[0]
 
 
 def _begin(connection: sqlite3.Connection, run_id: str) -> None:
@@ -295,7 +296,7 @@ def _capped(rows: list[Any], cap: int, what: str) -> list[Any]:
 def read_run_analytics(connection: sqlite3.Connection, run_id: str, *, limit: int = DEFAULT_PAGE,
                        cursor: str | None = None) -> RunAnalytics:
     """Build the view from the tables. Unknown runs raise RunNotFound; oversized runs raise AnalyticsTooLarge."""
-    after = _page_args(limit, cursor)
+    after = _page_args(run_id, limit, cursor)
     _begin(connection, run_id)
     try:
         attempts = _capped(connection.execute(
@@ -364,7 +365,7 @@ def _payload_or_none(raw: Any) -> dict[str, Any] | None:
 def replay_run_analytics(connection: sqlite3.Connection, run_id: str, *, limit: int = DEFAULT_PAGE,
                          cursor: str | None = None) -> RunAnalytics:
     """Rebuild the view by folding the run's events in sequence order. See ``NOT_REPRODUCIBLE_FROM_EVENTS``."""
-    after = _page_args(limit, cursor)
+    after = _page_args(run_id, limit, cursor)
     _begin(connection, run_id)
     try:
         marks = ",".join("?" * len(_EVENT_TYPES))

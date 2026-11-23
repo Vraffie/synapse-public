@@ -89,3 +89,52 @@ def test_run_queries_over_real_daemon(tmp_path):
             proc.send_signal(signal.SIGTERM)
         proc.communicate(timeout=8)
     assert proc.returncode == 0
+
+
+def test_run_analytics_over_real_daemon(tmp_path):
+    with daemon_database(tmp_path / 'synapse.sqlite', ROOT / 'migrations') as db:
+        db.execute("INSERT INTO workflow_versions VALUES('wf','1','{}','hash','now')")
+        db.execute("INSERT INTO runs VALUES('run','wf','1','created',0,'now','now')")
+        db.execute("INSERT INTO tasks(id,run_id,node_id,state,created_at,updated_at) VALUES('task','run','node','created','now','now')")
+        db.execute("INSERT INTO task_attempts(id,task_id,attempt_no,state) VALUES('attempt','task',1,'unknown')")
+    proc = subprocess.Popen([sys.executable, '-m', 'synapse.daemon', '--state-dir', str(tmp_path),
+                             '--migrations', str(ROOT / 'migrations')], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        deadline = time.monotonic() + 8
+        while not (tmp_path / 'agentd.sock').exists():
+            if proc.poll() is not None:
+                raise AssertionError(proc.stderr.read().decode())
+            if time.monotonic() > deadline:
+                raise AssertionError('daemon did not start')
+            time.sleep(0.02)
+        headers = {'Authorization': 'Bearer ' + (tmp_path / 'operator.token').read_text()}
+        with httpx.Client(transport=httpx.HTTPTransport(uds=str(tmp_path / 'agentd.sock')), base_url='http://localhost') as client:
+            while True:
+                try:
+                    if client.get('/api/v1/system/health', headers=headers).status_code == 200:
+                        break
+                except httpx.ConnectError:
+                    pass
+                if time.monotonic() > deadline:
+                    raise AssertionError('daemon did not become ready')
+                time.sleep(0.02)
+            assert client.get('/api/v1/runs/run/analytics').status_code == 401
+            body = client.get('/api/v1/runs/run/analytics?limit=5', headers=headers)
+            assert body.status_code == 200
+            view = body.json()
+            assert view['attempts']['value'] == 1 and view['attempts']['kind'] == 'measured'
+            assert view['usage']['input_tokens']['kind'] == 'unknown' and view['usage']['input_tokens']['value'] is None
+            assert view['estimated'] == {} and view['next_cursor'] is None
+            assert view['tasks'][0]['task_id'] == 'task' and view['source'] == 'tables'
+            assert set(view) == {  # the daemon reader returns RunAnalytics.to_dict(), not the dataclass
+                'run_id', 'source', 'attempts', 'retries', 'outcome_mix', 'usage', 'attempts_with_any_usage', 'estimated',
+                'messages', 'tasks', 'next_cursor', 'per_profile', 'per_profile_truncated', 'not_reproducible',
+                'replay_ignored_events', 'ignored_estimate_events'}
+            assert client.get('/api/v1/runs/missing/analytics', headers=headers).status_code == 404
+            assert client.get('/api/v1/runs/run/analytics?limit=0', headers=headers).status_code == 422
+            assert client.get('/api/v1/runs/run/analytics?cursor=!!', headers=headers).status_code == 422
+    finally:
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+        proc.communicate(timeout=8)
+    assert proc.returncode == 0
