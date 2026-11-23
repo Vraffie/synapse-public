@@ -217,3 +217,33 @@ def test_operator_token_failures_log_warning_without_secret(system, caplog):
     recs = [x for x in caplog.records if x.levelno == logging.WARNING and "Operator authentication failed" in x.getMessage()]
     assert recs
     assert "q" * 40 not in caplog.text and TOKEN not in caplog.text
+
+
+def test_dropped_denials_are_counted_in_the_next_written_row(tmp_path):
+    from synapse.application import approval_service as svc
+    now = [0.0]
+    with closing(open_database(tmp_path / "db")) as db:
+        apply_migrations(db, ROOT / "migrations")
+        service = svc.ApprovalService(db, object(), clock=lambda: now[0])
+        written = [service.record_denied("unauthenticated", correlation_id="c%d" % i, http_status=401)
+                   for i in range(svc.DENIAL_MAX_PER_WINDOW + 7)]
+        # MAX rows plus one rate_limited marker are written; the other 6 attempts are dropped
+        assert written.count(True) == svc.DENIAL_MAX_PER_WINDOW + 1 and written.count(False) == 6
+        now[0] += svc.DENIAL_WINDOW_SECONDS  # next window
+        assert service.record_denied("unauthenticated", correlation_id="next", http_status=401) is True
+        assert service.record_denied("unauthenticated", correlation_id="after", http_status=401) is True
+        rows = [json.loads(r[0]) for r in db.execute(
+            "SELECT details_json FROM audit_entries WHERE decision='denied' ORDER BY rowid DESC LIMIT 2")]
+        assert rows[1].get("suppressed_before") == 6  # "next" reports the hidden attempts
+        assert "suppressed_before" not in rows[0]  # and only once
+
+
+def test_suppressed_counters_stay_bounded(tmp_path):
+    from synapse.application import approval_service as svc
+    with closing(open_database(tmp_path / "db")) as db:
+        apply_migrations(db, ROOT / "migrations")
+        service = svc.ApprovalService(db, object(), clock=lambda: 0.0)
+        for i in range(svc.DENIAL_MAX_SUPPRESSED_BUCKETS + 30):
+            for _ in range(svc.DENIAL_MAX_PER_WINDOW + 2):
+                service.record_denied("not_permitted", correlation_id="c", http_status=403, principal="p%d" % i)
+        assert len(service._denial_suppressed) <= svc.DENIAL_MAX_SUPPRESSED_BUCKETS
