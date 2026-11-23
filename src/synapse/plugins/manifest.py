@@ -6,6 +6,8 @@ import json
 import re
 from typing import Any
 
+from synapse.plugins.safe_text import bounded
+
 MANIFEST_NAME = "manifest.json"
 API_VERSION = 1
 MAX_MANIFEST_BYTES = 16 * 1024
@@ -39,7 +41,7 @@ def _no_duplicates(pairs):
     out = {}
     for key, value in pairs:
         if key in out:
-            raise ManifestError(f"duplicate manifest key: {key}")
+            raise ManifestError(f"duplicate manifest key: {bounded(key, 64)}")
         out[key] = value
     return out
 
@@ -68,5 +70,5 @@ def parse_manifest(data: bytes) -> PluginManifest:
         raise ManifestError("capabilities must be a list of at most 16 distinct strings")
     unknown = sorted(set(caps) - KNOWN_CAPABILITIES)
     if unknown:
-        raise ManifestError("unknown capability: " + ", ".join(unknown))
+        raise ManifestError("unknown capability: " + bounded(", ".join(unknown[:4]), 160))
     return PluginManifest(doc["id"], doc["version"], doc["entrypoint"], doc["description"], frozenset(caps))

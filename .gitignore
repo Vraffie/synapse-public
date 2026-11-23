@@ -11,3 +11,7 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+
+# Scratch directories: Python tempfile falls back to the current directory when no temp dir is
+# writable (e.g. inside a sandbox), so an ad-hoc probe run at the repo root lands here.
+/tmp*/

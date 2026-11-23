@@ -12,6 +12,7 @@ from synapse.plugins.manifest import ManifestError, parse_manifest
 from synapse.plugins.package import PackageError, snapshot_package
 from synapse.plugins.policy import Decision, DenyAllPolicy
 
+SHA = "a" * 64
 GOOD = '''
 from synapse.agents.roles import AgentRole, DRAFT_BANNER, GUARD_TEXT
 from synapse.plugins.api import PluginRegistration
@@ -48,8 +49,8 @@ class Recorder:
     def __init__(self, answer=None):
         self.audit, self.calls, self.answer = [], [], answer
 
-    def authorize(self, principal, action, resource):
-        self.calls.append((principal, action, resource))
+    def authorize(self, principal, action, resource, *, version, package_sha256):
+        self.calls.append((principal, action, resource, version, package_sha256))
         if isinstance(self.answer, Exception):
             raise self.answer
         return self.answer
@@ -129,7 +130,7 @@ def test_enablement_file_must_be_private_user_owned_and_not_a_symlink(tmp_path):
     os.chmod(path, 0o600)
     link = tmp_path / "link.json"
     link.symlink_to(path)
-    with pytest.raises(OSError):
+    with pytest.raises(EnablementError):
         load_enablement(link)
     assert load_enablement(tmp_path / "missing.json") == {}
 
@@ -247,7 +248,7 @@ def test_privileged_requests_fail_closed_on_every_path(tmp_path):
     allow = Decision(True, "ok")
 
     def gate(granted, policy):
-        return PluginPolicyGate("demo", frozenset(granted), policy, log.append)
+        return PluginPolicyGate("demo", frozenset(granted), policy, log.append, version="1.0.0", package_sha256=SHA)
 
     # not granted: the policy is never asked
     rec = Recorder(allow)
@@ -267,12 +268,14 @@ def test_privileged_requests_fail_closed_on_every_path(tmp_path):
     # an explicit allow passes only for a granted, known action, and is audited with the principal
     rec = Recorder(allow)
     assert gate({"repo.write"}, rec).request("repo.write", {"path": "a"}).allowed is True
-    assert rec.calls == [("plugin:demo", "repo.write", {"path": "a"})]
-    assert log[-1] == {"principal": "plugin:demo", "action": "repo.write", "allowed": True, "reason": "ok"}
+    assert rec.calls == [("plugin:demo", "repo.write", {"path": "a"}, "1.0.0", SHA)]
+    assert log[-1] == {"principal": "plugin:demo", "version": "1.0.0", "package_sha256": SHA,
+                       "action": "repo.write", "allowed": True, "reason": "ok"}
     # if the audit record cannot be written, nothing is allowed
     def broken(_):
         raise OSError("disk full")
-    assert PluginPolicyGate("demo", frozenset({"repo.write"}), Recorder(allow), broken).request("repo.write", {}).reason == "audit_failed"
+    assert PluginPolicyGate("demo", frozenset({"repo.write"}), Recorder(allow), broken, version="1.0.0",
+                            package_sha256=SHA).request("repo.write", {}).reason == "audit_failed"
 
 
 def test_a_plugin_reads_only_its_own_verified_package_bytes(tmp_path):
@@ -309,7 +312,7 @@ def test_changes_to_classes_and_function_code_are_undone_and_refused(tmp_path):
             hostile_load(tmp_path / str(i), body + "\ndef register(ctx):\n    return None\n")
         assert err.value.code == "core_tampering"
     assert roles.validate_role.__code__ is real_code and policy.PluginPolicyGate._decide is real_decide
-    assert policy.DenyAllPolicy().authorize("p", "repo.write", {}).allowed is False
+    assert policy.DenyAllPolicy().authorize("p", "repo.write", {}, version="1", package_sha256=SHA).allowed is False
 
 
 def test_a_plugin_cannot_switch_the_check_off_through_the_loader_module(tmp_path):
@@ -376,3 +379,251 @@ def test_a_package_file_with_a_non_utf8_name_is_a_package_error(tmp_path):
         pytest.skip("filesystem refuses non-UTF-8 names")
     with pytest.raises(PackageError):
         snapshot_package(pkg)
+
+
+# --------------------------------------------------------------------------- findings from review on PR #16
+FAKE_SHA = '''
+import hashlib
+class Fake:
+    def __init__(self, data=b""):
+        pass
+    def update(self, data):
+        pass
+    def hexdigest(self):
+        return "{pinned}"
+'''
+
+
+def test_another_plugin_patching_hashlib_cannot_make_a_changed_package_load(tmp_path, monkeypatch):
+    """A's scenario: plugin F replaces hashlib.sha256; plugin E's bytes changed after enablement."""
+    import hashlib
+    real = hashlib.sha256
+    victim = make(tmp_path / "e", plugin_id="victim")
+    enabled_e = enable(tmp_path / "e", victim)
+    pinned = enabled_e["victim"].package_sha256
+    (victim / "plugin.py").write_text(GOOD + "\nimport os  # changed after the operator reviewed it\n")
+    fake = FAKE_SHA.format(pinned=pinned)
+    # F patches hashlib during register(): seen as tampering, refused, and undone
+    with pytest.raises(PluginLoadError) as err:
+        hostile_load(tmp_path / "f", fake + "hashlib.sha256 = Fake\ndef register(ctx):\n    return None\n")
+    assert err.value.code == "core_tampering"
+    assert hashlib.sha256 is real
+    with pytest.raises(PluginLoadError) as err:
+        load(victim, enabled_e)
+    assert err.value.code == "hash_mismatch"
+    # a patch the tripwire never sees (for example made later from a thread F started) still does not
+    # reach verification, because package.py bound sha256 at import time
+    ns: dict = {}
+    exec(compile(fake, "fake", "exec"), ns)
+    monkeypatch.setattr(hashlib, "sha256", ns["Fake"])
+    with pytest.raises(PluginLoadError) as err:
+        load(victim, enabled_e)
+    assert err.value.code == "hash_mismatch"
+
+
+def test_patches_to_os_json_and_stat_during_register_are_undone_and_refused(tmp_path):
+    import json as json_module
+    import os as os_module
+    import stat as stat_module
+    real = (os_module.open, json_module.loads, stat_module.S_ISREG, json_module.decoder.JSONDecoder.decode)
+    bodies = ("import os\nos.open = lambda *a, **k: 0\n",
+              "import json\njson.loads = lambda *a, **k: {}\n",
+              "import stat\nstat.S_ISREG = lambda m: True\n",
+              "import json.decoder as d\nd.JSONDecoder.decode = lambda self, s: {}\n")
+    for i, body in enumerate(bodies):
+        with pytest.raises(PluginLoadError) as err:
+            hostile_load(tmp_path / str(i), body + "\ndef register(ctx):\n    return None\n")
+        assert err.value.code == "core_tampering", body
+    assert real == (os_module.open, json_module.loads, stat_module.S_ISREG, json_module.decoder.JSONDecoder.decode)
+
+
+def test_the_policy_and_the_audit_row_see_the_exact_version_and_package_hash(tmp_path):
+    source = ("from synapse.plugins.api import PluginRegistration\n"
+              "def register(ctx):\n    ctx.request('repo.write', {'p': 1})\n    return PluginRegistration()\n")
+    rec = Recorder(Decision(True, "ok"))
+    pkg = make(tmp_path / "v1", source=source, caps=("repo.write",), version="1.0.0")
+    v1 = load(pkg, enable(tmp_path / "v1", pkg), policy=rec, rec=rec)
+    pkg2 = make(tmp_path / "v2", source=source + "# v2\n", caps=("repo.write",), version="2.0.0")
+    v2 = load(pkg2, enable(tmp_path / "v2", pkg2), policy=rec, rec=rec)
+    assert [c[3:] for c in rec.calls] == [("1.0.0", v1.package_sha256), ("2.0.0", v2.package_sha256)]
+    assert v1.package_sha256 != v2.package_sha256
+    assert [(r["version"], r["package_sha256"]) for r in rec.audit] == [c[3:] for c in rec.calls]
+
+
+def _clean(text):
+    return "\n" not in text and "\x1b" not in text and "\r" not in text
+
+
+def test_a_huge_hostile_exception_class_name_never_reaches_the_error(tmp_path):
+    body = 'def register(ctx):\n    raise type("A" * 100_000 + "\\n\\x1b[31mFAKE: ok", (Exception,), {})()\n'
+    with pytest.raises(PluginLoadError) as err:
+        hostile_load(tmp_path, body)
+    assert err.value.code == "plugin_raised"
+    assert str(err.value) == "plugin_raised: plugin-defined exception"
+    with pytest.raises(PluginLoadError) as err:
+        hostile_load(tmp_path / "b", "def register(ctx):\n    raise ValueError('x')\n")
+    assert str(err.value) == "plugin_raised: ValueError"
+
+
+def test_hostile_file_names_are_escaped_and_bounded_in_errors(tmp_path):
+    pkg = make(tmp_path)
+    (pkg / "evil\n\x1b[31mINJECTED").symlink_to("/etc/passwd")
+    with pytest.raises(PackageError) as err:
+        snapshot_package(pkg)
+    assert _clean(str(err.value)) and "\\n" in str(err.value)
+    with pytest.raises(PluginLoadError) as err:
+        load(pkg, {})
+    assert err.value.code == "package_unreadable" and _clean(str(err.value)) and len(str(err.value)) < 1000
+    (pkg / "evil\n\x1b[31mINJECTED").unlink()
+    os.mkfifo(pkg / ("p\r\n" + "x" * 200))
+    with pytest.raises(PackageError) as err:
+        snapshot_package(pkg)
+    assert _clean(str(err.value)) and len(str(err.value)) < 1000
+
+
+def test_hostile_manifest_values_are_escaped_in_errors(tmp_path):
+    pkg = make(tmp_path, caps=("register.roles", "x\n\x1b[2J" * 1000))
+    with pytest.raises(PluginLoadError) as err:
+        load(pkg, {})
+    assert err.value.code == "manifest_invalid" and _clean(str(err.value)) and len(str(err.value)) < 1000
+
+
+def test_only_allowlisted_actions_reach_the_audit_row_and_reasons_are_bounded(tmp_path):
+    from synapse.plugins.policy import PluginPolicyGate
+    log = []
+
+    class Liar(str):
+        def __eq__(self, other):
+            return True
+
+        def __hash__(self):
+            return hash("repo.write")
+
+    gate = PluginPolicyGate("demo", frozenset({"repo.write"}), Recorder(Decision(True, "ok\n\x1b[2J" + "y" * 5000)),
+                            log.append, version="1.0.0", package_sha256=SHA)
+    huge = "x" * 10_000_000 + "\n\x1b[31m"
+    for action in (huge, Liar("repo.write"), "repo.write\n", b"repo.write"):
+        assert gate.request(action, {}) == Decision(False, "unknown_action")
+    assert [row["action"] for row in log] == [None, None, None, None]
+    assert all(row["reason"] == "unknown_action" for row in log)
+    allowed = gate.request("repo.write", {})
+    assert allowed.allowed is True and _clean(allowed.reason) and len(allowed.reason) <= 4 * 200 + 20
+    assert log[-1]["action"] == "repo.write" and log[-1]["reason"] == allowed.reason
+
+
+def test_requests_beyond_the_budget_are_denied_and_do_not_flood_the_audit(tmp_path):
+    from synapse.plugins import policy as P
+    log = []
+    gate = P.PluginPolicyGate("demo", frozenset({"repo.write"}), Recorder(Decision(True, "ok")), log.append,
+                              version="1.0.0", package_sha256=SHA)
+    answers = [gate.request("repo.write", {}) for _ in range(P.MAX_REQUESTS + 50)]
+    assert all(a.allowed for a in answers[:P.MAX_REQUESTS])
+    assert all(a == Decision(False, "request_limit") for a in answers[P.MAX_REQUESTS:])
+    assert len(log) == P.MAX_REQUESTS + 1 and log[-1]["reason"] == "request_limit"
+
+
+def test_enablement_file_digest_makes_a_silent_edit_visible(tmp_path):
+    from synapse.plugins.enablement import read_enablement
+    pkg = make(tmp_path, caps=("register.roles", "git.push"))
+    snap = snapshot_package(pkg)
+    manifest = parse_manifest(snap.files["manifest.json"])
+    path = tmp_path / "plugins.json"
+    assert read_enablement(path).sha256 is None
+    written = enable_plugin(path, manifest, snap.sha256, frozenset({"register.roles"}))
+    assert read_enablement(path).sha256 == written
+    # what an enabled plugin running as the same user could do: raise its own grants in place
+    doc = json.loads(path.read_text())
+    doc["plugins"][0]["granted"] = ["git.push", "register.roles"]
+    path.write_text(json.dumps(doc, sort_keys=True))
+    after = read_enablement(path)
+    assert after.entries["demo"].granted == {"git.push", "register.roles"}  # not prevented ...
+    assert after.sha256 != written  # ... but no longer matches what the operator recorded
+
+
+def test_enable_package_computes_the_hash_and_refuses_a_package_that_changed_since_review(tmp_path):
+    from synapse.plugins.enablement import enable_package
+    pkg = make(tmp_path)
+    reviewed = snapshot_package(pkg).sha256
+    path = tmp_path / "plugins.json"
+    (pkg / "plugin.py").write_text(GOOD + "\n# swapped after review\n")
+    with pytest.raises(EnablementError):
+        enable_package(path, pkg, reviewed, frozenset({"register.roles"}))
+    assert not path.exists()
+    (pkg / "plugin.py").write_text(GOOD)
+    digest = enable_package(path, pkg, reviewed, frozenset({"register.roles"}))
+    assert len(digest) == 64 and load(pkg, load_enablement(path)).registration.roles
+
+
+def test_the_package_walk_limits_depth_directory_count_and_entries(tmp_path, monkeypatch):
+    from synapse.plugins import package as P
+    deep = make(tmp_path / "deep")
+    (deep / "/".join(["d"] * (P.MAX_DEPTH + 1))).mkdir(parents=True)
+    with pytest.raises(PackageError, match="too deep"):
+        snapshot_package(deep)
+    wide = make(tmp_path / "wide")
+    for i in range(P.MAX_DIRS):
+        (wide / f"d{i}").mkdir()
+    with pytest.raises(PackageError, match="too many directories"):
+        snapshot_package(wide)
+    many = make(tmp_path / "many")
+    monkeypatch.setattr(P, "MAX_ENTRIES", 10)
+    for i in range(10):
+        (many / f"f{i}").write_text("x")
+    with pytest.raises(PackageError, match="too many directory entries"):
+        snapshot_package(many)
+
+
+def test_the_opened_fd_is_checked_so_a_swap_after_the_scan_is_refused(tmp_path):
+    from synapse.plugins import package as P
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    st = os.lstat(fifo)
+    with pytest.raises(PackageError, match="special file"):
+        P._read_regular(str(fifo), (st.st_dev, st.st_ino), "pipe")
+    regular = tmp_path / "file"
+    regular.write_text("x")
+    st = os.lstat(regular)
+    with pytest.raises(PackageError, match="changed while"):
+        P._read_regular(str(regular), (st.st_dev, st.st_ino + 1), "file")
+    assert P._read_regular(str(regular), (st.st_dev, st.st_ino), "file") == b"x"
+
+
+def test_no_scratch_directories_are_tracked_at_the_repository_root():
+    import subprocess
+    root = Path(__file__).resolve().parents[1]
+    try:
+        out = subprocess.run(["git", "-C", str(root), "ls-files"], capture_output=True, text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        pytest.skip("not a git checkout")
+    assert [p for p in out.splitlines() if p.startswith("tmp")] == []
+
+
+def test_cli_enable_verifies_the_reviewed_hash_and_digest_reports_the_file(tmp_path, capsys):
+    from synapse.plugins.__main__ import main
+    pkg = make(tmp_path)
+    reviewed = snapshot_package(pkg).sha256
+    state = tmp_path / "plugins.json"
+    assert main(["enable", str(state), str(pkg), "0" * 64, "register.roles"]) == 1
+    assert not state.exists()
+    assert main(["enable", str(state), str(pkg), reviewed, "register.roles"]) == 0
+    written = capsys.readouterr().out.split("sha256=")[1].split()[0]
+    assert main(["digest", str(state)]) == 0
+    out = capsys.readouterr().out
+    assert f"sha256={written}" in out and reviewed in out and "register.roles" in out
+    assert main(["nope"]) == 2
+
+
+def test_a_plugin_cannot_raise_its_own_load_error_codes_or_text(tmp_path):
+    bodies = ("from synapse.plugins.loader import PluginLoadError\n"
+              "def register(ctx):\n    raise PluginLoadError('\\x1b[31mhash_mismatch\\nfake' * 30000, 'd')\n",
+              "from synapse.plugins.loader import PluginLoadError\n"
+              "class E(PluginLoadError):\n    def __str__(self):\n        return '\\x1b[2J' * 100000\n"
+              "def register(ctx):\n    raise E('not_enabled')\n",
+              "from synapse.plugins.loader import PluginLoadError\n"
+              "def register(ctx):\n    raise PluginLoadError('hash_mismatch')\n")
+    for i, body in enumerate(bodies):
+        with pytest.raises(PluginLoadError) as err:
+            hostile_load(tmp_path / str(i), body)
+        assert type(err.value) is PluginLoadError
+        assert str(err.value) == "plugin_raised: plugin-defined exception", i
+    assert PluginLoadError("x\n" * 50000).code == "invalid_code"

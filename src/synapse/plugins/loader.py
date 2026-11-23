@@ -9,12 +9,21 @@ Limits (see docs/operations/plugin-framework.md): the entrypoint is trusted Pyth
 daemon process. The hash pin proves WHICH code runs, not that the code is harmless, and an
 in-process plugin can still import modules. The tamper check on core modules is best effort. Real
 isolation needs a subprocess and is not built.
+
+Error details never carry raw plugin-chosen text: ``PluginLoadError`` caps and escapes every detail,
+and a plugin's own exception class is reported only as ``plugin-defined exception``.
 """
 from __future__ import annotations
 
 import builtins
 import dataclasses
+import hashlib
 import inspect
+import json
+import json.decoder
+import json.encoder
+import os
+import stat
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,23 +36,50 @@ from synapse.plugins import enablement as enablement_module
 from synapse.plugins import manifest as manifest_module
 from synapse.plugins import package as package_module
 from synapse.plugins import policy as policy_module
+from synapse.plugins import safe_text as safe_text_module
 from synapse.plugins.api import PluginContext, PluginRegistration
 from synapse.plugins.enablement import Enabled
 from synapse.plugins.manifest import MANIFEST_NAME, ManifestError, PluginManifest, parse_manifest
 from synapse.plugins.package import PackageError, snapshot_package
 from synapse.plugins.policy import PluginPolicyGate, PolicyPort
+from synapse.plugins.safe_text import bounded
 
 MAX_VALIDATORS = 32
 import sys as _sys
 
+# Framework modules plus the standard-library modules the verification path relies on. package.py also
+# binds its primitives at import time, so a later patch of e.g. hashlib.sha256 does not reach it; this
+# list makes such a patch *during* register() visible (core_tampering) and undoes it.
 _GUARDED = (roles_module, api_module, policy_module, manifest_module, package_module, enablement_module,
-            _sys.modules[__name__])
+            safe_text_module, hashlib, json, json.decoder, json.encoder, os, stat, _sys.modules[__name__])
+
+# Exception classes whose names are safe to report (identity check only: a plugin class is never asked
+# for its name, hash or repr).
+_BUILTIN_EXCEPTIONS = tuple((cls, cls.__name__) for cls in vars(builtins).values()
+                            if isinstance(cls, type) and issubclass(cls, BaseException))
+
+
+LOAD_ERROR_CODES = frozenset({
+    "bad_registration", "capability_not_granted", "core_tampering", "directory_name_mismatch",
+    "entrypoint_missing", "grant_exceeds_request", "hash_mismatch", "manifest_invalid", "no_register_function",
+    "not_enabled", "package_unreadable", "plugin_raised", "reserved_id", "role_duplicate", "role_invalid",
+    "role_namespace"})
 
 
 class PluginLoadError(Exception):
     def __init__(self, code: str, detail: str = "") -> None:
+        code = code if type(code) is str and code in LOAD_ERROR_CODES else "invalid_code"
         self.code = code
+        detail = bounded(detail, 200) if detail else ""
         super().__init__(f"{code}: {detail}" if detail else code)
+
+
+def _exception_name(exc: BaseException) -> str:
+    cls = type(exc)
+    for known, name in _BUILTIN_EXCEPTIONS:
+        if cls is known:
+            return name
+    return "plugin-defined exception"
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,8 +163,11 @@ def load_plugin(directory: Path, enabled: Mapping[str, Enabled], policy: PolicyP
                 audit: Callable[[dict], None]) -> LoadedPlugin:
     try:
         package = snapshot_package(Path(directory))
-    except (PackageError, OSError) as exc:
+    except PackageError as exc:
         raise PluginLoadError("package_unreadable", str(exc)) from exc
+    except OSError as exc:  # never the file name: it is chosen by whoever wrote the package
+        errno = exc.errno if type(exc.errno) is int else None
+        raise PluginLoadError("package_unreadable", f"os error (errno {errno})") from exc
     try:
         manifest = parse_manifest(package.files.get(MANIFEST_NAME, b""))
     except ManifestError as exc:
@@ -148,27 +187,35 @@ def load_plugin(directory: Path, enabled: Mapping[str, Enabled], policy: PolicyP
     if source is None:
         raise PluginLoadError("entrypoint_missing")
 
-    gate = PluginPolicyGate(manifest.id, entry.granted, policy, audit)
+    gate = PluginPolicyGate(manifest.id, entry.granted, policy, audit, version=manifest.version,
+                            package_sha256=package.sha256)
     ctx = PluginContext(manifest.id, manifest.version, entry.granted, gate, package.files)
     namespace: dict = {"__name__": f"synapse_plugin_{manifest.id}", "__builtins__": builtins}
     # Bind everything the check needs locally so the plugin cannot swap it out through module globals.
-    undo, validate, snapshot = _undo_tampering, _validated, _snapshot
+    undo, validate, snapshot, guarded = _undo_tampering, _validated, _snapshot, _GUARDED
     before = snapshot()
     registration = None
     failure: PluginLoadError | None = None
+    # Anything raised by plugin code, including a PluginLoadError (or subclass) the plugin raised itself,
+    # becomes plugin_raised: only the framework's own checks below produce other codes.
+    result = None
     try:
         code = compile(source, f"<plugin {manifest.id}/{manifest.entrypoint}>", "exec", dont_inherit=True)
         exec(code, namespace)  # noqa: S102 - trusted, hash-pinned code; see module docstring
-        register = namespace.get("register")
-        if not callable(register):
-            raise PluginLoadError("no_register_function")
-        # Copy what came back to exact builtin values while still inside the guarded window.
-        registration = validate(manifest, entry.granted, register(ctx))
-    except PluginLoadError as exc:
-        failure = exc
+        register = dict.get(namespace, "register")
+        if callable(register):
+            result = register(ctx)
+        else:
+            failure = PluginLoadError("no_register_function")
     except BaseException as exc:  # SystemExit, KeyboardInterrupt and GeneratorExit included
-        failure = PluginLoadError("plugin_raised", type(exc).__name__)
-    tampered = undo(before)
+        failure = PluginLoadError("plugin_raised", _exception_name(exc))
+    if failure is None:
+        try:
+            # Copy what came back to exact builtin values while still inside the guarded window.
+            registration = validate(manifest, entry.granted, result)
+        except BaseException as exc:
+            failure = exc if type(exc) is PluginLoadError else PluginLoadError("plugin_raised", _exception_name(exc))
+    tampered = undo(before, _guarded=guarded)
     if tampered:
         raise PluginLoadError("core_tampering", "the plugin changed builtins or a guarded core module (restored)")
     if failure is not None:
