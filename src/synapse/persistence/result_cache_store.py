@@ -57,7 +57,10 @@ def _decode(entry_json: object, invalidated_at: object) -> CacheEntry:
         raise CorruptCacheEntry("entry_json is not JSON") from exc
     if type(data) is not dict or set(data) != _ENTRY_FIELDS:
         raise CorruptCacheEntry("entry_json has the wrong fields")
-    material_json = json.dumps(data["key_material"], sort_keys=True, separators=(",", ":"), allow_nan=False)
+    try:  # json.loads turns 1e400 into inf, which canonical JSON cannot carry
+        material_json = json.dumps(data["key_material"], sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except ValueError as exc:
+        raise CorruptCacheEntry("key_material is not canonical JSON") from exc
     return CacheEntry(
         key_sha256=data["key_sha256"], result_sha256=data["result_sha256"],
         result_size=data["result_size"], origin_attempt_id=data["origin_attempt_id"],
@@ -70,8 +73,11 @@ def _decode(entry_json: object, invalidated_at: object) -> CacheEntry:
 class SqliteCacheStore:
     """First-writer-wins ``CacheStore`` on a daemon-owned connection (``open_database`` defaults).
 
-    If the connection is already inside a transaction, ``put`` joins it; otherwise it runs its own
-    ``BEGIN IMMEDIATE`` ... ``COMMIT`` so concurrent writers on other connections serialize.
+    If the connection is already inside a transaction, ``put`` and ``invalidate`` join it (a failed
+    statement is rolled back by SQLite alone and the caller's transaction stays open); otherwise they
+    run their own ``BEGIN IMMEDIATE`` ... ``COMMIT`` so concurrent writers on other connections
+    serialize. This assumes ``isolation_level=None`` (as ``open_database`` sets): with the sqlite3
+    module's implicit transactions, ``in_transaction`` would not mean what this class relies on.
     """
 
     def __init__(self, connection: sqlite3.Connection) -> None:
@@ -94,21 +100,9 @@ class SqliteCacheStore:
             raise ValueError("a new entry cannot be stored already invalidated")
         params = (key_sha256, entry.entry_json(), entry.result_sha256, entry.origin_attempt_id,
                   entry.created_marker)
-        own = not self._db.in_transaction
-        if own:
-            self._db.execute("BEGIN IMMEDIATE")
-        try:
-            cursor = self._db.execute(
-                "INSERT INTO result_cache(key_sha256, entry_json, result_artifact_id, origin_attempt_id,"
-                " created_at) VALUES (?, ?, ?, ?, ?)", params)
-            stored = cursor.rowcount == 1
-            if own:
-                self._db.execute("COMMIT")
-        except BaseException:
-            if own and self._db.in_transaction:
-                self._db.execute("ROLLBACK")
-            raise
-        return stored
+        return self._write(
+            "INSERT INTO result_cache(key_sha256, entry_json, result_artifact_id, origin_attempt_id,"
+            " created_at) VALUES (?, ?, ?, ?, ?)", params) == 1
 
     def invalidate(self, key_sha256: str, marker: str) -> bool:
         """Set the one-way invalidation marker. False if the key is absent or already invalidated.
@@ -116,18 +110,21 @@ class SqliteCacheStore:
         Not part of the port and not an audited operator action yet; tests and a future daemon
         command use it. The table trigger refuses any other change.
         """
+        return self._write(
+            "UPDATE result_cache SET invalidated_at = ? WHERE key_sha256 = ? AND invalidated_at IS NULL",
+            (marker, key_sha256)) == 1
+
+    def _write(self, sql: str, params: tuple[object, ...]) -> int:
+        """Run one write statement; own the transaction only if the caller has none open."""
         own = not self._db.in_transaction
-        if own:
-            self._db.execute("BEGIN IMMEDIATE")
         try:
-            cursor = self._db.execute(
-                "UPDATE result_cache SET invalidated_at = ? WHERE key_sha256 = ? AND invalidated_at IS NULL",
-                (marker, key_sha256))
-            changed = cursor.rowcount == 1
+            if own:
+                self._db.execute("BEGIN IMMEDIATE")
+            changes = self._db.execute(sql, params).rowcount
             if own:
                 self._db.execute("COMMIT")
         except BaseException:
             if own and self._db.in_transaction:
                 self._db.execute("ROLLBACK")
             raise
-        return changed
+        return changes

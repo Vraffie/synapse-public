@@ -96,9 +96,42 @@ def assert_never_authority(decision) -> None:
 
 # --- migration -----------------------------------------------------------------------------------
 
-def test_upgrade_from_0017_adds_only_the_cache_table_and_triggers(tmp_path):
+def _seed_v17(db) -> None:
+    """Rows a schema-17 daemon could have written: workflow, profile, run, task, attempts, mark, event."""
+    db.execute("BEGIN")
+    db.execute("INSERT INTO workflow_versions VALUES ('wf', '1', '{\"nodes\":[]}', ?, '2026-01-01T00:00:00Z')",
+               (H("wf"),))
+    db.execute("INSERT INTO profiles(id, provider, display_name, config_ref, created_at)"
+               " VALUES ('default', 'mock', 'Default \u00e6\u00f8\u00e5', 'cfg', '2026-01-01T00:00:00Z')")
+    db.execute("INSERT INTO runs VALUES ('run-1', 'wf', '1', 'running', 3, '2026-01-01T00:00:00Z',"
+               " '2026-01-01T00:00:01Z')")
+    db.execute("INSERT INTO tasks VALUES ('task-1', 'run-1', 'n1', 'running', 2, 'default', 2,"
+               " '2026-01-01T00:00:00Z', '2026-01-01T00:00:01Z')")
+    db.execute("INSERT INTO task_attempts VALUES ('att-1', 'task-1', 1, 'default', 'failed', 'sess-1', '/w/1',"
+               " '2026-01-01T00:00:00Z', '2026-01-01T00:00:01Z', 1)")
+    db.execute("INSERT INTO task_attempts(id, task_id, attempt_no, profile_id, state)"
+               " VALUES ('att-2', 'task-1', 2, 'default', 'running')")
+    db.execute("INSERT INTO attempt_spawn_marks VALUES ('att-1', '2026-01-01T00:00:00Z')")
+    db.execute("INSERT INTO events(id, aggregate_type, aggregate_id, run_id, type, schema_version, payload_json,"
+               " occurred_at) VALUES ('ev-1', 'run', 'run-1', 'run-1', 'run.started', 1, '{\"a\":1}',"
+               " '2026-01-01T00:00:00Z')")
+    db.execute("COMMIT")
+
+
+def _all_rows(db) -> dict[str, list[tuple]]:
+    tables = [r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'"
+                                       " AND name NOT IN ('schema_migrations') ORDER BY name")]
+    return {t: sorted(db.execute(f'SELECT * FROM "{t}"').fetchall(), key=repr)  # some are WITHOUT ROWID
+            for t in tables if t != "result_cache"}
+
+
+def test_upgrade_from_0017_keeps_existing_rows_and_adds_only_the_cache_table(tmp_path):
     with closing(open_database(tmp_path / "v17.db")) as old:
         assert apply_migrations(old, MIGRATIONS, limit=17)[-1] == 17
+        _seed_v17(old)
+        rows_before = _all_rows(old)
+        assert rows_before["attempt_spawn_marks"] == [("att-1", "2026-01-01T00:00:00Z")]
+        assert len(rows_before["task_attempts"]) == 2 and rows_before["events"]
         before = {r[0] for r in old.execute("SELECT name FROM sqlite_master")}
         assert "result_cache" not in before
         assert apply_migrations(old, MIGRATIONS) == [18]
@@ -107,6 +140,8 @@ def test_upgrade_from_0017_adds_only_the_cache_table_and_triggers(tmp_path):
         assert after - before == {"result_cache", "sqlite_autoindex_result_cache_1", "result_cache_first_writer_wins",
                                   "result_cache_no_update", "result_cache_no_delete"}
         assert max(r[0] for r in old.execute("SELECT version FROM schema_migrations")) == 18
+        assert _all_rows(old) == rows_before  # every pre-existing row is unchanged, byte for byte
+        assert old.execute("SELECT count(*) FROM result_cache").fetchone() == (0,)
     with closing(open_database(tmp_path / "v17.db")) as upgraded:
         fresh = schema_fingerprint(MIGRATIONS, 18)
         actual = {(k, n): (t, " ".join(s.split()) if s else None) for k, n, t, s in upgraded.execute(
@@ -262,6 +297,57 @@ def test_put_refuses_inconsistent_arguments_and_rolls_back(db):
     assert store.get(entry.key_sha256) is None
 
 
+def _seed_caller_work(db):
+    db.execute("INSERT INTO workflow_versions VALUES ('wf', '1', '{}', ?, 't')", (H("wf"),))
+
+
+def test_failed_put_inside_a_caller_transaction_leaves_it_open_and_intact(db):
+    store = SqliteCacheStore(db)
+    entry = entry_for()
+    store.put(entry.key_sha256, entry)
+    store.invalidate(entry.key_sha256, "inv:1")
+    db.execute("BEGIN IMMEDIATE")
+    _seed_caller_work(db)
+    oversized = replace(entry_for(), key_sha256=key_of(model="model-b"),
+                        key_material_json=json.dumps({"x": "y" * rc.MAX_ENTRY_BYTES}))
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+        store.put(oversized.key_sha256, oversized)
+    assert db.in_transaction
+    assert store.put(entry.key_sha256, entry) is False  # the transaction is still usable
+    db.execute("COMMIT")
+    assert db.execute("SELECT count(*) FROM workflow_versions WHERE workflow_id = 'wf'").fetchone() == (1,)
+    assert db.execute("SELECT count(*) FROM result_cache").fetchone() == (1,)
+    assert store.get(entry.key_sha256).invalidated_marker == "inv:1"
+
+
+def test_invalidate_that_fails_inside_a_caller_transaction_keeps_the_callers_work(db):
+    store = SqliteCacheStore(db)
+    entry = entry_for()
+    store.put(entry.key_sha256, entry)
+    db.execute("BEGIN IMMEDIATE")
+    _seed_caller_work(db)
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+        store.invalidate(entry.key_sha256, "x" * 257)
+    assert db.in_transaction
+    assert store.invalidate(entry.key_sha256, "inv:ok") is True  # the transaction is still usable
+    db.execute("COMMIT")
+    assert db.execute("SELECT count(*) FROM workflow_versions WHERE workflow_id = 'wf'").fetchone() == (1,)
+    assert store.get(entry.key_sha256).invalidated_marker == "inv:ok"
+
+
+def test_put_inside_a_caller_transaction_that_rolls_back_leaves_no_row(db):
+    store = SqliteCacheStore(db)
+    entry = entry_for()
+    db.execute("BEGIN IMMEDIATE")
+    _seed_caller_work(db)
+    assert store.put(entry.key_sha256, entry) is True
+    assert db.in_transaction
+    db.execute("ROLLBACK")
+    assert store.get(entry.key_sha256) is None
+    assert db.execute("SELECT count(*) FROM workflow_versions WHERE workflow_id = 'wf'").fetchone() == (0,)
+    assert store.put(entry.key_sha256, entry) is True  # nothing left behind to block a later first writer
+
+
 def test_store_error_on_put_is_a_store_error_record_outcome(db):
     store = SqliteCacheStore(db)
     db.execute("DROP TABLE result_cache")  # scratch database: simulate a broken store
@@ -296,24 +382,23 @@ def test_two_connections_racing_first_writer_exactly_one_wins(db_path):
             assert hit.is_hit and hit.hit.origin_attempt_id == winner and hit.result_sha256 == H(winner)
 
 
-def test_writer_blocked_behind_an_uncommitted_first_writer_reports_already_present(db_path):
-    outcome = {}
-
-    def second_writer():
-        with closing(open_database(db_path)) as second:  # sqlite3 connections stay on their own thread
-            outcome["b"] = rec(SqliteCacheStore(second), request(), result(origin_attempt_id="att-b")).status
-
-    with closing(open_database(db_path)) as first:
+def test_writer_behind_an_uncommitted_first_writer_cannot_decide_until_it_commits(db_path):
+    # Deterministic, no timing: with busy_timeout 0 the second writer fails fast instead of waiting, which
+    # shows it needs the write lock before it decides anything (no decision on a stale snapshot).
+    with closing(open_database(db_path)) as first, closing(open_database(db_path)) as second:
+        second.execute("PRAGMA busy_timeout = 0")
+        late = SqliteCacheStore(second)
+        assert late.get(key_of()) is None  # its snapshot before the first writer
         first.execute("BEGIN IMMEDIATE")
         assert rec(SqliteCacheStore(first), request(), result(origin_attempt_id="att-a")).status is RecordStatus.STORED
-        thread = threading.Thread(target=second_writer)
-        thread.start()
-        thread.join(timeout=0.5)
-        assert thread.is_alive()  # waiting on the write lock, not deciding on a stale snapshot
+        entry_b = replace(entry_for(), origin_attempt_id="att-b")
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            late.put(key_of(), entry_b)
+        assert not second.in_transaction
+        assert rec(late, request(), result(origin_attempt_id="att-b")).status is RecordStatus.STORE_ERROR
         first.execute("COMMIT")
-        thread.join(timeout=10)
-        assert outcome == {"b": RecordStatus.ALREADY_PRESENT}
-        assert lookup(SqliteCacheStore(first), request()).hit.origin_attempt_id == "att-a"
+        assert rec(late, request(), result(origin_attempt_id="att-b")).status is RecordStatus.ALREADY_PRESENT
+        assert lookup(late, request()).hit.origin_attempt_id == "att-a"
 
 
 # --- tamper --------------------------------------------------------------------------------------
@@ -367,6 +452,17 @@ def test_wrong_field_set_is_rejected_on_read(db, change):
     doc = json.loads(entry_for().entry_json())
     assert insert(db, key_of(), json.dumps(change(doc))) == 1
     with pytest.raises(CorruptCacheEntry):
+        store.get(key_of())
+    assert lookup(store, request()).reason == MissReason.STORE_ERROR
+
+
+def test_overflowing_number_in_key_material_is_corrupt_not_a_crash(db):
+    store = SqliteCacheStore(db)
+    good = entry_for().entry_json()
+    assert '"worktree_clean":true' in good
+    tampered = good.replace('"worktree_clean":true', '"worktree_clean":1e400')
+    assert insert(db, key_of(), tampered) == 1  # json_valid accepts it
+    with pytest.raises(CorruptCacheEntry, match="canonical"):
         store.get(key_of())
     assert lookup(store, request()).reason == MissReason.STORE_ERROR
 
