@@ -27,6 +27,7 @@ import logging
 import sqlite3
 from typing import Any
 
+from synapse.application.context_manifest import ManifestEntry, build_manifest, record_manifest
 from synapse.domain.contracts import EventEnvelope, encode_payload, new_id
 from synapse.domain.runs import RunChange, RunState
 from synapse.application.output_reducer import reduce_output
@@ -34,6 +35,7 @@ from synapse.domain.workflow import State
 from synapse.infrastructure.artifact_blobs import ArtifactBlobStore
 from synapse.orchestration.mock_engine import MockWorkflowEngine, _RunInterrupted
 from synapse.persistence.budget_binding import check_claim_budget
+from synapse.persistence.agent_tasks import spec_hash
 from synapse.persistence.artifact_store import publish_artifact
 from synapse.persistence.mock_execution_store import record_verification, set_attempt
 from synapse.persistence.run_store import write_run_transition
@@ -148,6 +150,15 @@ def _fit_summary(summary: dict) -> dict:
         keep = min(keep - 1, int(keep * MAX_SUMMARY_JSON_BYTES / size * 0.95))
     fitted["output_text"] = _CLIP_MARKER
     return fitted
+
+
+def _manifest_head(head: object) -> str | None:
+    """A 40-hex worktree head, lowercased; anything else is recorded as unknown (None) so the manifest is kept."""
+    if isinstance(head, str) and len(head) == 40:
+        lowered = head.lower()
+        if all(c in "0123456789abcdef" for c in lowered):
+            return lowered
+    return None
 
 
 def _clip_text(text: str) -> tuple[str, bool]:
@@ -370,6 +381,23 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                 "reduction": {"rules": list(reduced.rules_applied), "dropped_lines": reduced.dropped_lines,
                               "kept_failures": len(reduced.kept_failures), "over_budget": reduced.over_budget}}
 
+    def _record_manifest(self, run_id: str, task_id: str, attempt_id: str, spec: Mapping[str, Any]) -> None:
+        """Record (never act on) the daemon-owned context for this attempt (ADR 017 D5, record only).
+
+        A failure is logged and does not change the run: the manifest is an audit and cache-key input,
+        not a gate. Unknown facts are recorded as unknown: the tree cleanliness is not checked here.
+        """
+        try:
+            head = spec.get("worktree_head")
+            entries = [ManifestEntry("spec", task_id, spec_hash(dict(spec))),
+                       ManifestEntry("artifact", str(spec["prompt_artifact_id"]), spec["prompt_sha256"], spec.get("prompt_bytes"))]
+            manifest = build_manifest(task_id, repo_head=_manifest_head(head),
+                                      worktree_clean=None, entries=entries)
+            with self._transaction():
+                record_manifest(self.db, run_id=run_id, attempt_id=attempt_id, manifest=manifest)
+        except Exception:
+            _LOG.exception("Could not record the context manifest for task %s", task_id)
+
     async def _execute(self, run_id: str, task_id: str, attempt_id: str, profile_id: str, scenario: str,
                        version: int, attempt_no: int) -> None:
         spec = self.specs[task_id]
@@ -421,6 +449,7 @@ class AgentWorkflowEngine(MockWorkflowEngine):
             if problem is not None:
                 terminal = ProviderEvent("failed", problem)  # refused before any spawn
             else:
+                self._record_manifest(run_id, task_id, attempt_id, spec)
                 request = ExecutionRequest(profile_id, task_id, {
                     "prompt": self._prompts(task_id).decode("utf-8"), "worktree": spec["worktree"],
                     "timeout_seconds": spec["timeout_seconds"], "max_output_bytes": _PROVIDER_OUTPUT_CAP})

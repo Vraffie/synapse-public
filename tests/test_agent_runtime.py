@@ -1099,3 +1099,38 @@ def test_the_summary_is_sized_on_its_serialised_json_so_escaped_text_cannot_over
     (summary,) = env.summaries()
     assert summary["clipped"] is True and "[clipped" in summary["output_text"] and summary["raw_artifact_id"]
     assert env.db.execute("SELECT outcome FROM verification_results").fetchall() == [("approved",)]
+
+
+def test_attempt_records_a_context_manifest_without_changing_the_run(env):
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(prompt="ok"))
+        await finish(env)
+    asyncio.run(go())
+    assert env.states() == ("succeeded", {"work": "completed"})
+    ((doc, digest, attempt),) = env.db.execute("SELECT manifest_json, manifest_sha256, task_attempt_id FROM context_manifests").fetchall()
+    manifest = json.loads(doc)
+    spec = at.load_task_specs(env.db, env.run_id)["work"]
+    assert hashlib.sha256(doc.encode()).hexdigest() == digest and manifest["worktree_clean"] is None
+    assert {(e["kind"], e["sha256"]) for e in manifest["entries"]} == {("spec", at.spec_hash(spec)), ("artifact", spec["prompt_sha256"])}
+    (event,) = env.db.execute("SELECT aggregate_id, payload_json FROM events WHERE type='context.manifest_recorded'").fetchall()
+    assert event[0] == attempt and json.loads(event[1])["manifest_sha256"] == digest
+
+
+def test_manifest_recording_failure_does_not_fail_the_attempt(env, monkeypatch):
+    import synapse.orchestration.agent_engine as ae
+    def boom(*a, **k):
+        raise RuntimeError("no")
+    monkeypatch.setattr(ae, "record_manifest", boom)
+    async def go():
+        env.runtime.start(env.run_id, "s", env.specs(prompt="ok"))
+        await finish(env)
+    asyncio.run(go())
+    assert env.states() == ("succeeded", {"work": "completed"})
+    assert env.db.execute("SELECT count(*) FROM context_manifests").fetchone()[0] == 0
+
+
+def test_a_worktree_head_is_lowercased_and_an_invalid_one_becomes_unknown_not_a_lost_manifest():
+    from synapse.orchestration.agent_engine import _manifest_head
+    assert _manifest_head("A" * 40) == "a" * 40 and _manifest_head("ab12" * 10) == "ab12" * 10
+    for bad in ("g" * 40, "a" * 39, "a" * 41, "", None, 7, "A" * 39 + "Z"):
+        assert _manifest_head(bad) is None
