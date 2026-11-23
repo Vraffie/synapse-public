@@ -22,7 +22,7 @@ Screenshots are rendered from fixture data (never shown by the real view) with `
 
 - The header shows `Connected` or `Disconnected — reconnecting (attempt N, retry in Ns)`, with a detail line explaining what is stale.
 - Reconnect uses exponential backoff starting at the poll interval (1 s), doubling up to 15 s, and resets on the first successful poll. Panes keep their last result while disconnected.
-- Event replay uses a single cursor (last delivered sequence). It only advances after an event is delivered to the UI, so a drop or daemon restart resumes with `after=<cursor>`: no event is skipped or shown twice. A malformed event aborts the page and the page is re-requested from the cursor.
+- Event replay uses a single cursor (last delivered sequence), persisted across restarts (`desktop-cursor.md`). It only advances after an event is delivered to the UI, so a drop or daemon restart resumes with `after=<cursor>`: no event is skipped or shown twice. A malformed event aborts the page and the page is re-requested from the cursor.
 - Catching up on a backlog fetches the next 100-event page immediately rather than waiting a full interval.
 
 ## Runs

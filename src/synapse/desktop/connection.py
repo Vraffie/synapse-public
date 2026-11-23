@@ -15,6 +15,7 @@ from synapse.cli.__main__ import DaemonHTTPError, _get, _request
 from synapse.desktop import approval_decision
 from synapse.desktop.agent_usage import sanitize_usage
 from synapse.desktop.agent_view import UNAVAILABLE_STATUSES, clean, sanitize_detail
+from synapse.desktop.cursor_store import Cursor, CursorError, cursor_path, read_cursor, valid_event_id, write_cursor
 from synapse.desktop.mock_resume import ASSERTION, collect_evidence
 
 API_VERSION = "v1"  # the only API prefix this client speaks (/api/v1/...)
@@ -87,6 +88,7 @@ class Poller(QThread):
     runs_list = Signal(object)  # recent runs (GET /api/v1/runs) for the Control Center switcher
     run_feed = Signal(str, object, object)  # run id, generation, new messages across the run's threads
     cc_approvals = Signal(object)  # approval rows for the Control Center gate, independent of the Developer tab's page
+    cursor_notice = Signal(str)  # user-visible cursor persistence status; '' clears it
     health_info = Signal(object)  # {'status': str, 'version': str | None}: only fields safe to display
 
     def __init__(self, state_dir: Path, *, fetch=_get, send=_request, interval: float = 1.0):
@@ -100,6 +102,9 @@ class Poller(QThread):
         self.stop_event = Event()
         self._wake = Event()
         self.cursor = 0
+        self._cursor_path = cursor_path(state_dir)
+        self._cursor_resumed = False  # saved cursor loaded and verified (or none/untrusted) for this process
+        self._save_failed = False
         self.failures = 0
         self.max_backoff = MAX_BACKOFF
         self._run_lock = Lock()
@@ -451,15 +456,23 @@ class Poller(QThread):
                 health = self.fetch(self.state_dir, "/api/v1/system/health")
                 if not isinstance(health, dict) or health.get("status") != "ok":
                     raise ValueError("invalid health response")
+                if not self._cursor_resumed:
+                    self._resume_cursor()
                 page = self.fetch(self.state_dir, "/api/v1/events?" + urlencode({"after": self.cursor, "limit": 100}))
                 if not isinstance(page, dict) or not isinstance(page.get("events"), list):
                     raise ValueError("invalid event response")
-                for event in page["events"]:
-                    sequence = event.get("sequence") if isinstance(event, dict) else None
-                    if type(sequence) is not int or sequence <= self.cursor:
-                        raise ValueError("invalid event sequence")
-                    self.event.emit(event)
-                    self.cursor = sequence
+                last = None
+                try:
+                    for event in page["events"]:
+                        sequence = event.get("sequence") if isinstance(event, dict) else None
+                        if type(sequence) is not int or sequence <= self.cursor:
+                            raise ValueError("invalid event sequence")
+                        self.event.emit(event)
+                        self.cursor = sequence
+                        last = event
+                finally:
+                    if last is not None:
+                        self._save_cursor(last)
                 self.failures = 0
                 version = health.get("version")
                 self.health_info.emit({"status": "ok", "version": version[:32] if isinstance(version, str) else None})
@@ -532,6 +545,49 @@ class Poller(QThread):
             # so commands and the other panes keep being serviced) instead of sleeping a full interval.
             if not full_page:
                 self._sleep(self.interval)
+
+    def _resume_cursor(self):
+        """Load the saved cursor once and verify it against the daemon's log; any doubt means replay from 0."""
+        try:
+            saved = read_cursor(self._cursor_path)
+        except CursorError as exc:
+            self.cursor = 0
+            self.cursor_notice.emit(f"Saved event cursor ignored ({exc}); replaying events from the start.")
+            self._cursor_resumed = True
+            return
+        if saved is not None:
+            page = self.fetch(self.state_dir, "/api/v1/events?" + urlencode({"after": saved.sequence - 1, "limit": 1}))
+            if not isinstance(page, dict) or not isinstance(page.get("events"), list):
+                raise ValueError("invalid event response")
+            events = page["events"]
+            first = events[0] if events and isinstance(events[0], dict) else None
+            if first is None:
+                self.cursor = 0
+                self.cursor_notice.emit("Saved event cursor is ahead of the daemon's event log (database recreated or "
+                                        "restored?); replaying events from the start.")
+            elif first.get("sequence") != saved.sequence or first.get("id") != saved.event_id:
+                self.cursor = 0
+                self.cursor_notice.emit("Saved event cursor belongs to a different event log; replaying events from the start.")
+            else:
+                self.cursor = saved.sequence
+                self.cursor_notice.emit(f"Resumed event stream after saved cursor {saved.sequence}.")
+        self._cursor_resumed = True
+
+    def _save_cursor(self, event):
+        """At-least-once: called after delivery. A failure never stops polling; it is shown once."""
+        sequence, event_id = event.get("sequence"), event.get("id")
+        try:
+            if not valid_event_id(event_id):
+                raise ValueError("event has no usable id")
+            write_cursor(self._cursor_path, Cursor(sequence, event_id))
+        except (OSError, ValueError) as exc:
+            if not self._save_failed:
+                self._save_failed = True
+                self.cursor_notice.emit(f"Event cursor is not being saved ({type(exc).__name__}); a restart will replay events.")
+            return
+        if self._save_failed:
+            self._save_failed = False
+            self.cursor_notice.emit("")
 
     def _sleep(self, seconds: float):
         # Interruptible by stop() and request_refresh(); a refresh also shortens a reconnect backoff.
