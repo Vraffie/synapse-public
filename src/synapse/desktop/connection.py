@@ -5,6 +5,7 @@ Panes never talk to the daemon; they react to this thread's signals.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from threading import Event, Lock
 from urllib.parse import quote, urlencode
@@ -85,6 +86,8 @@ class Poller(QThread):
     agent_usage_error = Signal(str, object, str)  # run id, generation, 'unavailable' | 'failed'
     agent_detail = Signal(str, object, object)  # run id, generation, sanitized detail
     agent_detail_error = Signal(str, object, str)  # run id, generation, 'unavailable' | 'failed'
+    profiles_list = Signal(object)  # raw GET /api/v1/profiles answer for the run-start pickers; None: explicit 404/503 (unavailable)
+    profiles_failed = Signal(str)  # the profiles could not be loaded (not 404/503): short fixed reason, pickers stay disabled
     runs_list = Signal(object)  # recent runs (GET /api/v1/runs) for the Control Center switcher
     run_feed = Signal(str, object, object)  # run id, generation, new messages across the run's threads
     cc_approvals = Signal(object)  # approval rows for the Control Center gate, independent of the Developer tab's page
@@ -103,6 +106,7 @@ class Poller(QThread):
         self._wake = Event()
         self.cursor = 0
         self._cursor_path = cursor_path(state_dir)
+        self._profiles_loaded = False
         self._cursor_resumed = False  # saved cursor loaded and verified (or none/untrusted) for this process
         self._save_failed = False
         self.failures = 0
@@ -272,7 +276,15 @@ class Poller(QThread):
                     outcome, result = 'invalid', None
                 else:
                     outcome = 'accepted'
+                    profile = result.get('profile')
+                    if profile is None:  # the daemon did not echo it: show the account the operator chose (what was sent)
+                        try:
+                            profile = json.loads(body).get('profile')
+                        except ValueError:
+                            profile = None
                     result = {'run_id': result['run_id'][:256], 'state': result['state'][:64]}
+                    if isinstance(profile, str) and re.fullmatch(r'[A-Za-z0-9._-]{1,64}', profile):
+                        result['profile'] = profile
             else:
                 result = self.send(self.state_dir, '/api/v1/runs/' + quote(run_id, safe='') + '/agent-cancel',
                                    body=b"", idempotency_key=key, correlation_id=key)  # the daemon refuses any cancel body
@@ -281,9 +293,11 @@ class Poller(QThread):
         except DaemonHTTPError as exc:
             if action == 'agent-start':
                 outcome = {404: 'unavailable', 503: 'unavailable', 409: 'active', 422: 'rejected'}.get(exc.status, 'failed')
+                if outcome == 'rejected':
+                    result = {'reason': getattr(exc, 'reason', None)}  # the daemon's own refusal text (already sanitized)
             else:
                 outcome = 'unavailable' if exc.status in UNAVAILABLE_STATUSES else 'failed'
-            result = None
+                result = None
         except Exception:
             outcome, result = 'failed', None
         finally:
@@ -341,6 +355,26 @@ class Poller(QThread):
             self.agent_detail_error.emit(run_id, generation, 'unavailable' if unavailable else 'failed')
         except Exception:
             self.agent_detail_error.emit(run_id, generation, 'failed')
+
+    def _poll_profiles(self):
+        """Fetch the accounts for the run-start pickers. Called right after connecting and retried every loop until it
+        succeeds (or the daemon says 404/503), then refreshed every FEED_EVERY cycles."""
+        try:
+            answer = self.fetch(self.state_dir, "/api/v1/profiles")
+            if not isinstance(answer, dict) or not isinstance(answer.get("profiles"), list):
+                raise ValueError("invalid profiles response")
+            self.profiles_list.emit(answer)
+            self._profiles_loaded = True
+        except DaemonHTTPError as exc:
+            if exc.status in (404, 503):
+                self.profiles_list.emit(None)
+                self._profiles_loaded = True
+            else:
+                self._profiles_loaded = False
+                self.profiles_failed.emit(f"HTTP {exc.status}")
+        except Exception:
+            self._profiles_loaded = False
+            self.profiles_failed.emit("unexpected answer or no connection")
 
     def _poll_control_center(self, run_id, generation, threads):
         """Best-effort reads for the Control Center; any failure is silent (the view keeps its last data)."""
@@ -483,6 +517,9 @@ class Poller(QThread):
                 # The cursor only advances after an event was emitted, so a retry resumes exactly after the
                 # last delivered event: nothing is skipped and nothing is replayed.
                 self.failures += 1
+                if self._profiles_loaded:
+                    self._profiles_loaded = False
+                    self.profiles_failed.emit("the daemon connection was lost")
                 delay = backoff_delay(self.interval, self.failures, self.max_backoff)
                 self.health.emit(f"Disconnected — reconnecting (attempt {self.failures}, retry in {delay:.0f}s)")
                 self.connection.emit("reconnecting", self.failures, delay)
@@ -497,6 +534,8 @@ class Poller(QThread):
                 continue
             if self.stop_event.is_set():
                 break
+            if not self._profiles_loaded or self._cycle % FEED_EVERY == 0:
+                self._poll_profiles()
             approval_cursor, approval_generation = self._selected_approval_page()
             try:
                 page = self.fetch(self.state_dir, "/api/v1/approvals?" + urlencode({"after": approval_cursor, "limit": 100}))
