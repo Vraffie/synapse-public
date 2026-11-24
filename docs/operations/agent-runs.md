@@ -38,6 +38,50 @@ approval_step for this run"; no run or worktree is created). The server never ad
 its own, because the operator must name the operation and target the human is shown. The default policy
 requires nothing.
 
+### Multi-repository runs (ADR 026, first slice)
+
+A `repos` entry may also be an object; only object entries can take part in a multi-repository run, plain path
+strings keep working exactly as before for single-repository runs:
+
+```json
+{"repos": [
+  {"id": "product-config", "path": "/home/me/work/product-config",
+   "baseline_refs": ["refs/heads/main", "refs/heads/release"], "default_baseline_ref": "refs/heads/main",
+   "protected_paths": [".github/**", "CODEOWNERS"]},
+  "/home/me/work/legacy-repo"],
+ "worktree_root": "/home/me/.local/share/synapse/worktrees"}
+```
+
+`id` follows the safe-id rule and must be unique; `path` gets every allowlist rule above; `baseline_refs` are
+full `refs/heads/<branch>` names (no SHAs, no remote refs), `default_baseline_ref` must be one of them (alone it
+is the only allowed ref); `protected_paths` (at most 64) narrows what an agent may change (see worktrees.md). At
+most 16 object entries; unknown keys refuse startup. The daemon records `registry_sha256` (the validated object
+entries) and their ids in an `agent.repo_registry_loaded` audit row at start. Only the operator edits the file.
+
+The daemon service (`AgentRunService.start`) accepts the multi-repository request; the HTTP route, `agentctl`
+flags and desktop views are B's lane and follow separately. Shape:
+`{"repos": [{"repo_id", "baseline_ref"?}], "tasks": [{..., "repos": [{"repo_id", "access": "write"|"read"}]}]}`,
+1 to 16 repositories, no `repo`/`base_ref`, Claude profiles only (Codex has no per-worktree mount control yet).
+Exactly one task per run may write a given repository; a task may write several. Multi-repository runs require `"sandbox": true`: without bwrap a same-uid agent could rewrite a worktree's index or refs between the host checks and the commit, or write to its read-only repositories. The operator can waive this explicitly with `"allow_multi_repo_unsandboxed": true` in the config (refused otherwise with `multi_repo_requires_sandbox`, at the request and again before each attempt). Refusals (422, nothing
+written): `repo_not_registered`, `baseline_ref_not_allowed`, `baseline_ref_unresolved`, `repo_unusable`, two
+writers, an undeclared repository. Each `baseline_ref` is resolved to a commit once, before anything is written,
+and stored with the run in `run_repo_bindings` (with the writer task and `bindings_sha256`) in the same
+transaction that records the task specs and starts the run. The task spec holds only `repos: [{repo_id,
+access}]` and the run's `bindings_sha256`: no path or HEAD.
+
+Per attempt: all worktrees are created (from the pinned baselines) and recorded before the single spawn, or
+none (`worktree_create_failed:<repo_id>`, nothing spawned); the spawn-time recheck refuses `worktree_mismatch`,
+`head_moved` or `worktree_dirty`; the agent's cwd is the attempt directory and the sandbox mounts exactly the
+declared worktrees, read repositories read-only. When the process succeeds, the daemon commits every write
+worktree on its local `synapse/<run>/<task>/<attempt>` branch (never pushed), in ascending `repo_id` order, with
+an `intent` row before and `done`/`unchanged`/`failed` after in `attempt_repo_commits`. A refused repository
+fails the attempt with `commit_failed:<repo_id>:<reason>` (codes in worktrees.md); commits already made stay on
+their branches as evidence. Failed, cancelled and unknown attempts are never committed. A gated multi-repository
+task shows the approval subject kind `agent_run_multi` (repositories, access, pinned baselines; no paths); its
+`spec_sha256` covers the bindings. Nodes with an ADR 025 evidence policy are refused before any worktree exists
+(`evidence_multi_repo_unsupported`) until per-repository evidence lands. Single-repository runs are unchanged
+(operator-requested commit, no bindings rows).
+
 Invalid values abort startup before any state is touched. Without `repos`/`worktree_root` (or with
 `enabled: false`, or no config) `POST /api/v1/agent-runs` returns **503** "Agent runs are not
 configured"; read and cancel endpoints still work for existing runs.
@@ -73,7 +117,8 @@ What happens when a prerequisite does not complete:
   `failed`.
 - **No established outcome** (`unknown`, or any attempt still unresolved). The dependents stay waiting and the run
   goes to `recovering` for an operator, exactly like a single task; nothing is auto-resolved (end it with
-  `agent-abandon`). If one run has both a failed branch and an `unknown` attempt, `recovering` wins.
+  `agent-abandon`). The one exception is an attempt that provably never reached a provider when the daemon
+  crashed: it is re-queued with a new attempt at restart (see agent-runtime.md, ADR 024). If one run has both a failed branch and an `unknown` attempt, `recovering` wins.
 
 Replaying an idempotency key with the same tasks listed in a different order is a different request and gets
 409; send the tasks in the same order when retrying. Response **201**/**200**: `{run_id, state, repo, base_ref, tasks: [{id, task_id, worktree_path}]}`
@@ -271,5 +316,5 @@ reviewed yet.
 Tests use a fake executable. The opt-in `SYNAPSE_REAL_CLAUDE=1 python scripts/demo_agent.py` runs a
 read-only prompt (tools Read/Glob/Grep) and an approval-gated variant against a throwaway repo with the
 real `claude`; it consumes a small amount of Claude CLI subscription usage. Default `python scripts/demo_agent.py` uses the fake.
-Only one run at a time (shared with mock runs). No resume of `recovering` agent runs exists yet. Finished worktrees are removed on request (above), never
+Only one run at a time (shared with mock runs). No resume of `recovering` agent runs exists yet; only never-spawned attempts are re-queued at restart (ADR 024, `attempts_resumed` in `agent-show`). Finished worktrees are removed on request (above), never
 automatically.

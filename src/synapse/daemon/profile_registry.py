@@ -64,6 +64,7 @@ class ProfileSpec:
     max_timeout_seconds: float = DEFAULT_MAX_TIMEOUT_SECONDS
     model: str | None = None
     permission_mode: str | None = None  # ceiling and default mode (agent-config profiles); None: no extra limit
+    claude_config_dir: str | None = None  # agent-config claude profiles: the account's config dir (path only)
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,7 +220,7 @@ def load_registry(path: Path, state_dir: Path) -> ProfileRegistry:
         raise RegistryError("primary must be a string and fallback a list of profile ids")
     cap = _int_in(data.get("max_concurrency", LEGACY_CONCURRENCY), 1, MAX_CONCURRENCY, "max_concurrency")
     try:
-        repos, root = _check_repos(data, Path(state_dir))
+        repos, root, _objects = _check_repos(data, Path(state_dir))  # object entries: see agent_config (ADR 026)
     except AgentConfigError as exc:
         raise RegistryError(str(exc)) from exc
     return validate_registry(ProfileRegistry(profiles, data["primary"], tuple(fallback), cap, repos, root))

@@ -31,18 +31,20 @@ from synapse.domain.runs import RunChange, RunState
 from synapse.infrastructure.artifact_blobs import ArtifactBlobStore
 from synapse.infrastructure.spawn_journal import FenceReport, SpawnJournal
 from synapse.orchestration.agent_engine import (
-    AgentProviderRouter, AgentWorkflowEngine, process_outcome_verifier,
+    AGENT_MAX_ATTEMPTS, AgentProviderRouter, AgentWorkflowEngine, process_outcome_verifier,
 )
 from synapse.orchestration.approval_gates import ApprovalStepSpec
 from synapse.persistence import agent_tasks as at
 from synapse.persistence import mock_scenarios as ms
 from synapse.persistence.agent_abandon import abandon_agent_run
+from synapse.persistence.attempt_resume import requeue_never_spawned
 from synapse.persistence.agent_cancellation import (
     cancellation_requested, finalize_agent_cancellation, request_agent_cancellation,
 )
 from synapse.persistence.budget_binding import bind_run
 from synapse.persistence.idempotency import execute_idempotent
 from synapse.persistence.mock_recovery import recover_mock_run
+from synapse.persistence.repo_bindings import RepoBinding, bind_run_repos, bindings_digest, check_workspace_specs
 from synapse.persistence.run_store import write_run_transition
 from synapse.persistence.state_store import StateConflict
 from synapse.providers.claude_cli import ClaudeCliProfile, ClaudeCliProvider
@@ -63,12 +65,18 @@ class AgentRuntime:
                  approval_policy: ApprovalPolicy | None = None,
                  worktree_check: Callable[[str, str, str], tuple[str, bool]] | None = None,
                  budget_policy: BudgetPolicy | None = None, registry=None,
-                 spawn_journal: SpawnJournal | None = None, codex_provider_factory=CodexCliProvider):
+                 spawn_journal: SpawnJournal | None = None, codex_provider_factory=CodexCliProvider,
+                 workspaces=None, commit_recovery: Callable[[sqlite3.Connection], object] | None = None):
         if profile is not None and not isinstance(profile, ClaudeCliProfile):
             raise TypeError("profile must be a ClaudeCliProfile")
         if type(max_concurrency) is not int or not 1 <= max_concurrency <= 6:
             raise ValueError("max_concurrency must be between 1 and 6")
         self.db = connection
+        dirs = tuple(sorted({s.claude_config_dir for s in getattr(registry, "profiles", ())
+                             if getattr(s, "claude_config_dir", None)}))
+        if profile is not None and dirs:
+            # Every child (default profile included) gets every profile's config dir denied and unmountable.
+            profile = replace(profile, protected_config_dirs=dirs)
         self.profile, self._verify, self._max_concurrency = profile, verify, max_concurrency
         self._journal = spawn_journal
         self.fence_report: FenceReport | None = None  # result of the startup fence, None until it ran
@@ -83,6 +91,10 @@ class AgentRuntime:
         self.budget_policy = budget_policy  # bound as an immutable copy to each run at start (ADR 020 D2)
         # (run_id, task_id) -> (HEAD sha, tree is clean); blocking, called in a worker thread.
         self._worktree_check = worktree_check
+        # Multi-repository runs (ADR 026): engine hooks that create/commit per-attempt worktrees, and the startup
+        # resolver for a commit phase interrupted by a crash. None: workspace tasks are refused before any spawn.
+        self._workspaces = workspaces
+        self._commit_recovery = commit_recovery
         self.blobs = ArtifactBlobStore(blob_directory, max_bytes=65536)
         self._active: asyncio.Task | None = None
         self._active_run: str | None = None
@@ -98,7 +110,8 @@ class AgentRuntime:
         return ((self._active is not None and not self._active.done())
                 or (self._cancelling is not None and not self._cancelling.done()))
 
-    def start(self, run_id: str, key: str, task_specs: dict):
+    def start(self, run_id: str, key: str, task_specs: dict, repo_bindings: list[RepoBinding] | None = None, *,
+              run_profile: str | None = None):
         """Validate, store immutably, then run the queued run's tasks with the real provider.
 
         ``task_specs`` is ``{node: {prompt, worktree, allowed_tools, permission_mode,
@@ -106,16 +119,26 @@ class AgentRuntime:
         and must name exactly the run's nodes. Raises ``AgentDisabled`` without an
         enabled operator profile and ``AgentSpecError`` (a ValueError) for any
         invalid spec, in both cases before any state change. Replays are receipts.
+        A multi-repository run (ADR 026) passes ``repo_bindings`` (each baseline already resolved to a SHA) and
+        specs declaring ``repos``; the bindings are inserted in the same transaction that records the specs and
+        moves the run to running, so a run never exists as an agent run without its pinned baselines.
+        ``run_profile`` is the run-level profile the request named (None: the default); it is recorded, ids only,
+        in an ``agent.run_profile_selected`` event in the same transaction as the run's start.
         """
         validate_id(run_id)
         profile = self.profile
         if profile is None or not profile.enabled:
             raise AgentDisabled("Real agent execution requires an enabled operator Claude CLI profile")
         parsed = at.parse_task_specs(task_specs, operator_tools=profile.allowed_tools,
-                                     max_timeout=profile.max_timeout_seconds, state_dir=profile.state_dir)
+                                     max_timeout=profile.max_timeout_seconds, state_dir=profile.state_dir,
+                                     bindings_sha256=bindings_digest(repo_bindings) if repo_bindings else None)
         for spec in parsed.specs.values():
             if spec["approval_step"] is None and self.approval_policy.required_for(spec["permission_mode"], spec["allowed_tools"]):
                 raise at.AgentSpecError("operator policy requires an approval_step for this task")
+        try:
+            check_workspace_specs(parsed.specs, repo_bindings)
+        except ValueError as exc:
+            raise at.AgentSpecError(str(exc)) from None
         for data in parsed.prompts.values():
             self.blobs.put([data])  # content-addressed and private; unreferenced until the txn commits
         artifact_ids = {node: new_id() for node in parsed.specs}
@@ -138,15 +161,40 @@ class AgentRuntime:
             db.execute("INSERT INTO mock_run_config(run_id,profile_id,fixture) VALUES(?,?,?)", (run_id, at.AGENT_PROFILE, ms.FIXED_KIND))
             tasks = {node: {**spec, "prompt_artifact_id": artifact_ids[node]} for node, spec in parsed.specs.items()}
             at.record_task_specs(db, run_id, tasks, parsed.prompts, artifact_ids, datetime.now(timezone.utc).isoformat())
+            if repo_bindings:
+                try:  # the writer recorded in each binding is the one task that declares write on it
+                    check_workspace_specs(parsed.specs, repo_bindings,
+                                          dict(db.execute("SELECT node_id,id FROM tasks WHERE run_id=?", (run_id,))))
+                except ValueError as exc:
+                    raise at.AgentSpecError(str(exc)) from None
+                bind_run_repos(db, run_id, repo_bindings)
+            self._record_run_profile(db, run_id, run_profile, parsed.specs)
             if self.budget_policy is not None:
                 bind_run(db, run_id, self.budget_policy)
             write_run_transition(db, RunChange(RunId(run_id), RunState.QUEUED, RunState.RUNNING, row[1]), principal="local-operator")
             return {"run_id": run_id, "state": "running", "kind": at.AGENT_KIND}
+        request = {"run_id": run_id, "kind": at.AGENT_KIND, "tasks": parsed.specs}
+        if repo_bindings:  # only then, so single-repository receipts keep their request hash
+            request["repos"] = [[b.repo_id, b.baseline_ref, b.baseline_sha, b.entry_sha256]
+                                for b in sorted(repo_bindings, key=lambda b: b.repo_id)]
         result = execute_idempotent(self.db, principal="local-operator", operation="agent.start", key=key,
-                                    request={"run_id": run_id, "kind": at.AGENT_KIND, "tasks": parsed.specs}, execute=write)
+                                    request=request, execute=write)
         if not result.replayed:
             self._launch(run_id)
         return result
+
+    @staticmethod
+    def _record_run_profile(db, run_id: str, run_profile: str | None, specs: dict) -> None:
+        """Audit the profile chosen for the run and each task's requested profile (ids only, no paths)."""
+        event = EventEnvelope.create(
+            aggregate_type="run", aggregate_id=run_id, event_type="agent.run_profile_selected",
+            payload={"run_id": run_id, "profile_id": run_profile or "default", "requested": run_profile,
+                     "task_profiles": {node: spec.get("profile_id") or "default" for node, spec in sorted(specs.items())},
+                     "fallback": None, "principal": "local-operator"})
+        db.execute("INSERT INTO events(id,aggregate_type,aggregate_id,run_id,type,schema_version,payload_json,occurred_at) "
+                   "VALUES(?,?,?,?,?,?,?,?)", (event.id, event.aggregate_type, run_id, run_id, event.event_type,
+                                               event.schema_version, encode_payload(event.payload), event.occurred_at))
+        db.execute("INSERT INTO outbox(event_id) VALUES(?)", (event.id,))
 
     def _launch(self, run_id: str) -> None:
         self._cancel_requested = None
@@ -248,7 +296,9 @@ class AgentRuntime:
                                    max_line_bytes=base.max_line_bytes, term_grace_seconds=base.term_grace_seconds)
         if spec.provider != "claude":
             raise ValueError("profile is not available")
-        return replace(self.profile, executable=spec.executable)
+        # The profile's own config dir, or None: the base credential handling. Never another profile's dir.
+        return replace(self.profile, executable=spec.executable,
+                       claude_config_dir=getattr(spec, "claude_config_dir", None))
 
     def _codex_allowed(self) -> bool:
         """Codex runs only when the base profile is explicitly unsandboxed.
@@ -351,7 +401,8 @@ class AgentRuntime:
                 max_concurrency=self._max_concurrency,
                 approval_requester=DaemonApprovalRequester(self.db) if gates else None,
                 worktree_check=self._worktree_check, profile_check=self._profile_problem,
-                profile_limits_check=self._profile_limits_problem)
+                profile_limits_check=self._profile_limits_problem, workspaces=self._workspaces,
+                workspace_sandboxed=bool(getattr(self.profile, "sandbox", False)))
             self._engine = engine
             scenarios = {t: ("agent",) for t in task_specs}
             while True:
@@ -385,7 +436,8 @@ class AgentRuntime:
         # A detached child CAN outlive the daemon, so recovery never trusts that nothing runs: in-flight attempts
         # become unknown, nothing is resumed, and an operator ends the run. The startup fence (ADR 023) kills
         # surviving process groups and records what it could not prove in the agent.worker_fence event; its
-        # result informs the operator, it does not make anything resumable.
+        # result informs the operator, it does not make anything resumable. Only work that provably never
+        # reached a provider is re-queued, and that happens before this, in _requeue_never_spawned (ADR 024).
         # Both real providers: a task of an agent run is claimed under the built-in claude row or a registry claude or
         # codex row (ADR 016 decision 4). Always both, so a codex attempt is reconciled even after its profile left
         # the registry; nothing else is relaxed (mock rows and unknown profiles still refuse the whole recovery).
@@ -411,11 +463,18 @@ class AgentRuntime:
         """Invoke only after acquiring exclusive daemon ownership at startup.
 
         Tasks that were in flight become unknown/blocked and the run moves to
-        ``recovering``. Nothing is re-spawned. A run left with only parked
-        approval gates is re-driven by ``resume_parked`` instead.
+        ``recovering``. Nothing that may have run is re-spawned. A run left with
+        only parked approval gates is re-driven by ``resume_parked`` instead, and
+        so is a run whose only in-flight work is provably never spawned (ADR 024):
+        those attempts are closed and their tasks re-queued for a NEW attempt.
         """
         runs = self.db.execute("SELECT run_id FROM mock_run_config WHERE profile_id=?", (at.AGENT_PROFILE,)).fetchall()
         self._fence_prior_workers()
+        if self._commit_recovery is not None:
+            try:  # after the fence (no surviving writer is assumed), before any run is recovered or re-driven
+                self._commit_recovery(self.db)
+            except Exception:
+                _LOG.exception("Interrupted repository commits could not be resolved")
         for (run_id,) in runs:
             try:
                 self._audit_fence(run_id)
@@ -427,10 +486,41 @@ class AgentRuntime:
                         self._recover_run(run_id)
                 elif self._pending_redrive is None and self._parked_only(run_id):
                     self._pending_redrive = run_id
+                elif self._pending_redrive is None and self._requeue_never_spawned(run_id):
+                    self._pending_redrive = run_id
                 else:
                     self._recover_run(run_id)
             except Exception:
                 _LOG.exception("Agent startup recovery failed for run %s", run_id)
+
+    def _requeue_never_spawned(self, run_id: str) -> bool:
+        """Re-queue a running run whose only in-flight work provably never reached a provider (ADR 024).
+
+        Requires the spawn journal and an all-clear fence: an unverified entry means some process (of this or
+        another run) might still be live, and then nothing is re-driven. Any doubt returns False, which sends the
+        run down today's recovery path unchanged.
+        """
+        report = self.fence_report
+        if self._journal is None or report is None or not report.all_clear:
+            return False
+        try:
+            if not at.is_agent_run(self.db, run_id):
+                return False
+            requeued = requeue_never_spawned(self.db, run_id=run_id, principal="agent-recovery",
+                                             max_attempts=AGENT_MAX_ATTEMPTS)
+        except Exception:
+            _LOG.exception("Never-spawned re-queue failed for run %s; recovering it instead", run_id)
+            return False
+        if requeued is None:
+            return False
+        _LOG.info("Run %s re-driven at startup: %d never-spawned attempt(s) re-queued", run_id, len(requeued))
+        cleanup = getattr(self._workspaces, "cleanup_never_spawned", None)
+        if requeued and cleanup is not None:
+            try:  # ADR 026 D4 step 8: no process ever ran in these trees, so they go now (never forced)
+                cleanup(self.db, requeued)
+            except Exception:
+                _LOG.exception("Worktrees of never-spawned attempts in run %s could not be removed", run_id)
+        return True
 
     def _fence_prior_workers(self) -> None:
         """Prove or enforce that no agent process of a previous daemon survives (ADR 023), before any recovery.

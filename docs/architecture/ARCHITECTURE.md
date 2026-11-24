@@ -163,6 +163,10 @@ CREATE TABLE task_attempts (
   worktree_path TEXT, started_at TEXT, ended_at TEXT, exit_code INTEGER,
   UNIQUE(task_id,attempt_no)
 );
+-- migration 0017 (ADR 024): append-only (no update/delete/replace triggers); a row = a spawn MAY have begun
+CREATE TABLE attempt_spawn_marks (
+  attempt_id TEXT PRIMARY KEY REFERENCES task_attempts(id), marked_at TEXT NOT NULL
+);
 CREATE TABLE agent_instances (
   id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
   definition_id TEXT NOT NULL, definition_version TEXT NOT NULL,

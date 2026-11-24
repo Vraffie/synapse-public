@@ -479,6 +479,10 @@ class CodexCliProvider:
         cap = data.get("max_output_bytes", p.max_output_bytes_limit)
         if type(cap) is not int or not 1 <= cap <= p.max_output_bytes_limit:
             raise ValueError("max_output_bytes out of range")
+        if data.get("workspace") is not None:
+            # ADR 026 slice 1: the Codex adapter has no per-worktree mount control, so multi-repository attempts
+            # are Claude-only. Refused before any spawn.
+            raise ValueError("multi-repository attempts are not supported by the codex adapter")
         cwd = validate_worktree(data.get("worktree"), p.state_dir)
         self._check_repo_config(cwd)
         self._credential_source(cwd)  # refuse an unsafe credential source at start(), before any spawn

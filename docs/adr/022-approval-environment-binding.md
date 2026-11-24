@@ -31,4 +31,4 @@ Callers must use the environment-aware verifier before any environment-specific 
 
 - The legacy key `''` and `'STAGING'` are different primary keys: a step recorded with `''` does not collide with the same step under `STAGING`. Deploy-class steps MUST therefore require a non-empty environment when wired; the ledger does not enforce it.
 - `source` and `actor` in `resolve_unknown` are caller-supplied and unauthenticated provenance. Authenticating who may resolve is the wiring layer's job.
-- The inline schemas and a future migration 0017 must not conflict: use IF NOT EXISTS / rename-copy and cover both the fresh and the pre-environment shapes.
+- The inline schemas and a future migration (next free number; 0017 is taken by ADR 024) must not conflict: use IF NOT EXISTS / rename-copy and cover both the fresh and the pre-environment shapes.

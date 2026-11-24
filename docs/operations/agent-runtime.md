@@ -147,7 +147,44 @@ cancellation, an `unknown` attempt is **not** discarded: such a run goes to
 `recover_interrupted()` (after the daemon lock is held) marks every in-flight
 attempt `unknown`, blocks its task and moves the run to `recovering` via the
 shared `recover_mock_run(provider_kind={"claude", "codex"})`: attempts of both real providers are reconciled the
-same way; a mock-profile or profile-less attempt still refuses the whole recovery. Nothing is re-spawned.
+same way; a mock-profile or profile-less attempt still refuses the whole recovery. Nothing that may have run is re-spawned.
+
+### Never-spawned attempts are re-queued (ADR 024)
+
+Right before handing an attempt to the provider, the engine commits an `attempt_spawn_marks` row (migration 0017).
+An attempt with no mark was provably never spawned. At startup, a `running` run whose only in-flight work is such
+attempts is re-driven instead of recovered: each attempt is closed `cancelled`, its task goes back to `ready`, an
+`agent.attempt_resumed` event (ids only) is written, and the next attempt is a new reservation that passes every
+normal check (profile, cooldown, per-profile concurrency, budget, approval, worktree HEAD). This needs the spawn
+journal and an `all_clear` fence, no cancellation request, at most 3 re-queues per run, and room in the task's
+attempt budget (2, so a gated task, which spends one attempt on its approval, is never re-queued). Anything with a
+mark (mark written, journal `begin`, pid recorded, mid-run, finished but not yet written) recovers exactly as
+above. A `running` run with no in-flight work at all (a crash before any claim) is re-driven the same way, with no
+event. `agent-show` reports the count as `attempts_resumed`.
+
+For a multi-repository attempt (ADR 026) the worktrees are created and recorded before the spawn mark, so a crash
+between them leaves a never-spawned attempt whose trees exist. When such an attempt is re-queued, its trees are
+removed right away without `--force` (clean and still at the pinned baseline only; one
+`attempt_worktree_removals` row each, `reason = never_spawned`); a dirty or moved tree is kept and logged by count.
+The next attempt gets fresh trees under `attempt_no + 1`.
+
+### Multi-repository runs (ADR 026, first slice)
+
+`AgentRuntime.start(run_id, key, specs, repo_bindings=[...])` takes the run's pinned bindings (each baseline already
+resolved to a SHA) and specs of the shape `{prompt, allowed_tools, permission_mode, timeout_seconds,
+repos: [{repo_id, access}][, profile_id][, approval_step]}` (no `worktree`, `worktree_head`, `repo`, `base_ref`).
+It cross-checks every declared repository against the bindings and the single writer per repository, records
+`bindings_sha256` in each spec (so the full-spec hash an approval binds covers the pinned baselines), and inserts
+`run_repo_bindings` in the same transaction as the specs and the `queued -> running` transition. A run is either
+all legacy or all multi-repository. The engine hooks (`workspaces=AttemptWorkspaces(manager)`) create, recheck and
+commit each attempt's worktrees; without them a multi-repository task is refused before any spawn
+(`multi_repo_unavailable`).
+
+Crash during the commit phase: the commit runs between an `intent` row and its result. At startup, after the fence
+and before any run is recovered, `resolve_commit_intents` gives every dangling intent exactly one result from what
+git shows, and never re-runs a commit: `not_done` (the attempt branch is still at `head_before`), `done` (exactly one
+commit on top of `head_before` whose tree equals the worktree's index) or `unknown` (`unverifiable`). The attempt
+itself had a spawn mark, so it recovers as above (`unknown`, task blocked, run `recovering`).
 
 ### Startup worker fence (ADR 023)
 
@@ -174,7 +211,8 @@ processes. Linux `/proc` only; with the sandbox off an agent can edit these file
 - A child is started in its own session and **can outlive a daemon crash**. After a
   restart the attempt is `unknown` precisely because that process may still be
   running and editing the worktree; the operator must check before doing anything.
-- There is no operator *resume* of `recovering` agent runs (`mock-resume` is fixed-fixture only). The only
+- There is no operator *resume* of `recovering` agent runs (`mock-resume` is fixed-fixture only); only
+  provably never-spawned work is re-queued automatically, before a run ever reaches `recovering`. The only
   exit is abandonment, which fails the run; see [agent-runs](agent-runs.md#abandoning-a-recovering-run).
 - The task's own prompt and transcript may contain sensitive text; summaries are
   artifacts, not events. The prompt text is never logged.
