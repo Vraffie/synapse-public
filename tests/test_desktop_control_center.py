@@ -157,6 +157,7 @@ def composer(app, tmp_path, monkeypatch):
     box.calls, box.answer = calls, answer
     box.sent = []
     box.submit_requested.connect(box.sent.append)
+    box.set_profiles(None)  # the daemon explicitly lists no accounts: the default account, so Start is not gated
     box.repo.setCurrentText('/work/repo')
     box.show()
     yield box

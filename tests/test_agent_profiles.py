@@ -328,17 +328,17 @@ def test_profiles_and_cooldown_end_to_end_through_a_real_daemon(env):
         while not (state / "agentd.sock").exists() and time.monotonic() < deadline:
             assert daemon.poll() is None, daemon.stderr.read()
             time.sleep(0.02)
-        listed = json.loads(ctl("profiles").stdout)["profiles"]
+        listed = json.loads(ctl("profiles", "--json").stdout)["profiles"]
         assert {p["id"] for p in listed} == {"default", "reader"} and "executable" not in repr(listed)
         assert json.loads(ctl("profile-cooldown", "reader", "--seconds", "120").stdout)["cooldown_remaining_seconds"] > 119
-        reader = {p["id"]: p for p in json.loads(ctl("profiles").stdout)["profiles"]}["reader"]
+        reader = {p["id"]: p for p in json.loads(ctl("profiles", "--json").stdout)["profiles"]}["reader"]
         assert reader["cooldown_remaining_seconds"] > 100
         bad = ctl("profile-cooldown", "default", "--seconds", "5")
         assert bad.returncode == 1 and "422" in bad.stderr
         assert json.loads(ctl("profile-cooldown", "reader", "--clear").stdout)["cooldown_remaining_seconds"] == 0.0
-        reader = {p["id"]: p for p in json.loads(ctl("profiles").stdout)["profiles"]}["reader"]
+        reader = {p["id"]: p for p in json.loads(ctl("profiles", "--json").stdout)["profiles"]}["reader"]
         assert reader["cooldown_remaining_seconds"] == 0.0
-        assert (state / "operator.token").read_text().strip() not in ctl("profiles").stdout
+        assert (state / "operator.token").read_text().strip() not in ctl("profiles", "--json").stdout
     finally:
         daemon.send_signal(signal.SIGTERM)
         daemon.communicate(timeout=10)
