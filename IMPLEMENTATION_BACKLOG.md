@@ -17,14 +17,14 @@ Progress below describes merged `main` as of 2026-11-21 (through the merge of PR
 | M2 — Communication and mock orchestration | 9 | 16 | 56% |
 | M3 — Local API and native clients | 4 | 10 | 40% |
 | M4 — Real provider adapters and profile isolation | 10 | 16 | 63% |
-| M2/M3 close-out required before M6 (cross-cutting trust work) | 0 | 4 | 0% |
+| M2/M3 close-out required before M6 (cross-cutting trust work) | 1 | 4 | 25% |
 | M5 — Token optimization and analytics | 7 | 10 | 70% |
 | M6 — Git and Domain plugin | 3 | 8 | 38% |
 | M7 — Deployment, packaging and hardening | 3 | 7 | 43% |
-| **Overall** | **52** | **87** | **60%** |
+| **Overall** | **53** | **87** | **61%** |
 
 ```text
-Overall  [###########---------] 60%  (52/87 checkboxes)
+Overall  [############--------] 61%  (53/87 checkboxes)
 ```
 
 Security findings F1-F14: 10 fixed, 4 open (list under M7.5).
@@ -120,7 +120,7 @@ Design: ADR 015 (PR #85) and ADR 016 (PR #95), both merged.
 
 ## M2/M3 close-out required before M6 (cross-cutting trust work)
 - [ ] Short-lived per-agent session credentials and live MCP/fallback messaging; credentials protected from same-user agent processes (OS-level isolation, building on ADR 014; privilege-boundary design is ADR 019, PR #112; first slice landed: opt-in bubblewrap sandbox for the Claude CLI child, PR #120, default off, same-uid mitigation only; credentials and live messaging remain).
-- [ ] Worker fencing, close the DB-to-provider launch race, automatic resumption.
+- [x] Worker fencing, close the DB-to-provider launch race, automatic resumption. Landed: PR #26 (spawn journal and startup fence, ADR 023) and PR #41 (re-queue of provably never-spawned attempts, ADR 024, migration 0017). The fence is process-group only; `daemon_epoch` and setsid/cgroup containment are parked under Later.
 - [ ] Independent review enforcement (reviewer differs from author) and a verifier stronger than `process_outcome_verifier`.
 - [ ] Human identity stronger than the same-user approver token. PRs #75–#77 (backup/restore guards, socket ownership, approval binding) and #89 (mock IPC socket lock) have landed; the approver token remains a same-user file (PRs #116 and #121 have landed: fail-closed same-user agent gate and opt-in passphrase verifier).
 - Exit: two real agents exchange messages and one reviews the other's work through the gateway, surviving a daemon restart.
@@ -195,9 +195,9 @@ Decisions from the owner's 20 answers:
 - Recovery: current behaviour (never-spawned work auto-resumes, anything else waits for `agent-abandon`).
 
 Steps:
-1. Land in flight: #41 auto-resume merged; ADR 026 (#43) trimmed to its first slice with the decisions above. [A]
-2. Repo registry and per-repo worktrees (ADR 026 slice, migration 0019): object entries in `agent.json`, pinned baselines, one worktree per attempt per repo, read-only worktrees for read repos, XML-only write pattern, host-side commit at attempt end, protected paths. [A]
-3. Profile selection per run for the three Claude profiles (per-task profiles and `agentctl profiles` already exist; add run-level choice and the config-dir wiring). [A]
+1. Land in flight: #41 auto-resume merged; ADR 026 slice 1 merged as #47 (registry objects, pinned baselines, per-attempt worktrees, XML-only host commit, migration 0018); the ADR text itself (#43) rides with the manifest PR. [A] DONE except the ADR text.
+2. Repo registry and per-repo worktrees (ADR 026 slice, migration 0018, PR #47, DONE): object entries in `agent.json`, pinned baselines, one worktree per attempt per repo, read-only worktrees for read repos, XML-only write pattern, host-side commit at attempt end, protected paths. [A]
+3. Profile selection per run for the three Claude profiles. [A, B] DONE: PR #45 (per-profile config dirs, deny rules, descriptor bind) and B's #46 (picker).
 4. Candidate manifest v2 and approval binding: one immutable object with every repo's baseline and candidate SHA and diff hash; approvals bind to its hash; invalidated if a baseline moves. [A]
 5. XML checks: well-formed, within allowed paths, no symlinks, diff size reported. (Validator adapter is Later.) [A]
 6. Dev deploy adapter: one configured command, approval recheck right before running, intent record before and outcome after, status command afterwards, `UNKNOWN` when unclear. Needs the deploy command from the owner. [A]
