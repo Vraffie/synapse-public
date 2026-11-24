@@ -309,6 +309,7 @@ class _Plan:
     timeout: float
     max_output: int
     cpu_seconds: int
+    binds: tuple[tuple[str, bool], ...] = ()  # multi-repository attempt: (worktree, writable); cwd is the attempt dir
 
 
 @dataclass(slots=True)
@@ -359,11 +360,49 @@ def validate_worktree(path: str, state_dir: str) -> str:
     return resolved
 
 
+MAX_WORKSPACE_REPOS = 16
+
+
+def validate_workspace(root: str, entries, state_dir: str) -> tuple[str, tuple[tuple[str, bool], ...]]:
+    """A multi-repository attempt (ADR 026): ``root`` is the attempt directory (no .git of its own) and ``entries``
+    lists ``{"path", "access"}`` per declared worktree, each a valid worktree that is a direct child of ``root``.
+    Returns (root, ((path, writable), ...)) or raises ValueError (fail closed)."""
+    if not isinstance(root, str) or not root or "\x00" in root or not os.path.isabs(root) or os.path.normpath(root) != root:
+        raise ValueError("workspace root must be an absolute normalized path")
+    try:
+        resolved = os.path.realpath(root, strict=True)
+    except OSError as exc:
+        raise ValueError("workspace root does not exist") from exc
+    st = os.lstat(root)
+    if resolved != root or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or root == os.sep:
+        raise ValueError("workspace root must be a symlink-free directory owned by the current user")
+    state = Path(os.path.realpath(state_dir))
+    if Path(root) == state or state in Path(root).parents or Path(root) in state.parents:
+        raise ValueError("workspace root must not overlap the state directory")
+    # ExecutionRequest freezes its input (lists become tuples, dicts read-only mappings).
+    if not isinstance(entries, (list, tuple)) or not 1 <= len(entries) <= MAX_WORKSPACE_REPOS:
+        raise ValueError("workspace must list 1 to %d worktrees" % MAX_WORKSPACE_REPOS)
+    binds = []
+    for e in entries:
+        if not isinstance(e, Mapping) or set(e) != {"path", "access"} or e["access"] not in ("write", "read"):
+            raise ValueError("workspace entries must be {path, access}")
+        path = validate_worktree(e["path"], state_dir)
+        if os.path.dirname(path) != root:
+            raise ValueError("workspace worktrees must be direct children of the workspace root")
+        binds.append((path, e["access"] == "write"))
+    if len({b[0] for b in binds}) != len(binds):
+        raise ValueError("workspace worktrees must be distinct")
+    return root, tuple(binds)
+
+
 class ClaudeCliProvider:
     """ProviderAdapter running the Claude Code CLI as a supervised subprocess.
 
     Request input keys: prompt (str), worktree (str), timeout_seconds (number,
-    optional), max_output_bytes (int, optional). One execution is one process.
+    optional), max_output_bytes (int, optional), workspace (optional list of
+    ``{path, access}``: a multi-repository attempt whose ``worktree`` is the attempt
+    directory; the sandbox then mounts exactly those worktrees, read-access ones
+    read-only). One execution is one process.
     """
 
     def __init__(self, profile: ClaudeCliProfile, *, environ: Mapping[str, str] | None = None,
@@ -487,7 +526,13 @@ class ClaudeCliProvider:
         cap = data.get("max_output_bytes", p.max_output_bytes_limit)
         if type(cap) is not int or not 1 <= cap <= p.max_output_bytes_limit:
             raise ValueError("max_output_bytes out of range")
-        cwd = validate_worktree(data.get("worktree"), p.state_dir)
+        binds: tuple[tuple[str, bool], ...] = ()
+        if data.get("workspace") is not None:
+            cwd, binds = validate_workspace(data.get("worktree"), data["workspace"], p.state_dir)
+            for tree, _ in binds:
+                self._check_repo_config(tree)
+        else:
+            cwd = validate_worktree(data.get("worktree"), p.state_dir)
         self._check_repo_config(cwd)
         self._credential_source(cwd)  # refuse an unsafe credential source at start(), before any spawn
         # No positional prompt: `-p` reads it from stdin (verified, claude 2.1.329), so it never
@@ -513,7 +558,7 @@ class ClaudeCliProvider:
         if p.api_key is not None:
             env["ANTHROPIC_API_KEY"] = p.api_key
         cpu = int(min(float(timeout) + p.term_grace_seconds + 60, 86_400 + 90))
-        return _Plan(argv, tail, prompt, cwd, env, float(timeout), cap, cpu)
+        return _Plan(argv, tail, prompt, cwd, env, float(timeout), cap, cpu, binds)
 
     def _disallowed_args(self) -> tuple[str, ...]:
         """Second layer for read-only profiles: explicitly deny the mutating tools."""
@@ -704,6 +749,8 @@ class ClaudeCliProvider:
             fds: list[int] = []  # O_PATH descriptors bwrap binds (credentials); closed here once the child has them
             try:
                 self._check_repo_config(plan.cwd)  # re-check: the worktree may change after start()
+                for tree, _ in plan.binds:
+                    self._check_repo_config(tree)
                 root, home, config = self._make_scratch(ex)
                 env = {**plan.env, "HOME": home, "CLAUDE_CONFIG_DIR": config, "TMPDIR": os.path.join(root, "tmp")}
                 argv = [*plan.argv, "--settings", os.path.join(root, "settings.json"), *plan.tail]
@@ -776,10 +823,19 @@ class ClaudeCliProvider:
             except ValueError:
                 raise SandboxUnavailable("profile credentials file changed before the sandbox started") from None
             ro_fds = ((fd, os.path.join(os.path.realpath(root), "config", CREDENTIALS_NAME)),)
+        binds = tuple(getattr(plan, "binds", ()))
+        if binds:
+            # Multi-repository attempt (ADR 026): one read-only common .git per declared worktree, each derived from
+            # the operator allowlist; only the declared worktrees are mounted (read-access ones read-only).
+            ro: list[str] = []
+            for tree, _ in binds:
+                ro += [d for d in git_readonly_dirs(tree, p.git_repos) if d not in ro]
+        else:
+            ro = git_readonly_dirs(plan.cwd, p.git_repos)
         return build_bwrap_argv(
             bwrap, worktree=plan.cwd, scratch=os.path.realpath(root), executable=exe,
             inner=[exe, *argv[1:]], forbidden=forbidden,
-            extra_ro_dirs=git_readonly_dirs(plan.cwd, p.git_repos), no_ancestor=homes, ro_fds=ro_fds)
+            extra_ro_dirs=ro, no_ancestor=homes, ro_fds=ro_fds, worktree_binds=binds)
 
     def _config_dirs(self) -> list[str]:
         """Every registry profile's config dir (lexical and resolved): never readable by tools, never mountable."""

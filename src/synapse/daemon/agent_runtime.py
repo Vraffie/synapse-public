@@ -44,6 +44,7 @@ from synapse.persistence.agent_cancellation import (
 from synapse.persistence.budget_binding import bind_run
 from synapse.persistence.idempotency import execute_idempotent
 from synapse.persistence.mock_recovery import recover_mock_run
+from synapse.persistence.repo_bindings import RepoBinding, bind_run_repos, bindings_digest, check_workspace_specs
 from synapse.persistence.run_store import write_run_transition
 from synapse.persistence.state_store import StateConflict
 from synapse.providers.claude_cli import ClaudeCliProfile, ClaudeCliProvider
@@ -64,7 +65,8 @@ class AgentRuntime:
                  approval_policy: ApprovalPolicy | None = None,
                  worktree_check: Callable[[str, str, str], tuple[str, bool]] | None = None,
                  budget_policy: BudgetPolicy | None = None, registry=None,
-                 spawn_journal: SpawnJournal | None = None, codex_provider_factory=CodexCliProvider):
+                 spawn_journal: SpawnJournal | None = None, codex_provider_factory=CodexCliProvider,
+                 workspaces=None, commit_recovery: Callable[[sqlite3.Connection], object] | None = None):
         if profile is not None and not isinstance(profile, ClaudeCliProfile):
             raise TypeError("profile must be a ClaudeCliProfile")
         if type(max_concurrency) is not int or not 1 <= max_concurrency <= 6:
@@ -89,6 +91,10 @@ class AgentRuntime:
         self.budget_policy = budget_policy  # bound as an immutable copy to each run at start (ADR 020 D2)
         # (run_id, task_id) -> (HEAD sha, tree is clean); blocking, called in a worker thread.
         self._worktree_check = worktree_check
+        # Multi-repository runs (ADR 026): engine hooks that create/commit per-attempt worktrees, and the startup
+        # resolver for a commit phase interrupted by a crash. None: workspace tasks are refused before any spawn.
+        self._workspaces = workspaces
+        self._commit_recovery = commit_recovery
         self.blobs = ArtifactBlobStore(blob_directory, max_bytes=65536)
         self._active: asyncio.Task | None = None
         self._active_run: str | None = None
@@ -104,7 +110,8 @@ class AgentRuntime:
         return ((self._active is not None and not self._active.done())
                 or (self._cancelling is not None and not self._cancelling.done()))
 
-    def start(self, run_id: str, key: str, task_specs: dict, *, run_profile: str | None = None):
+    def start(self, run_id: str, key: str, task_specs: dict, repo_bindings: list[RepoBinding] | None = None, *,
+              run_profile: str | None = None):
         """Validate, store immutably, then run the queued run's tasks with the real provider.
 
         ``task_specs`` is ``{node: {prompt, worktree, allowed_tools, permission_mode,
@@ -112,6 +119,9 @@ class AgentRuntime:
         and must name exactly the run's nodes. Raises ``AgentDisabled`` without an
         enabled operator profile and ``AgentSpecError`` (a ValueError) for any
         invalid spec, in both cases before any state change. Replays are receipts.
+        A multi-repository run (ADR 026) passes ``repo_bindings`` (each baseline already resolved to a SHA) and
+        specs declaring ``repos``; the bindings are inserted in the same transaction that records the specs and
+        moves the run to running, so a run never exists as an agent run without its pinned baselines.
         ``run_profile`` is the run-level profile the request named (None: the default); it is recorded, ids only,
         in an ``agent.run_profile_selected`` event in the same transaction as the run's start.
         """
@@ -120,10 +130,15 @@ class AgentRuntime:
         if profile is None or not profile.enabled:
             raise AgentDisabled("Real agent execution requires an enabled operator Claude CLI profile")
         parsed = at.parse_task_specs(task_specs, operator_tools=profile.allowed_tools,
-                                     max_timeout=profile.max_timeout_seconds, state_dir=profile.state_dir)
+                                     max_timeout=profile.max_timeout_seconds, state_dir=profile.state_dir,
+                                     bindings_sha256=bindings_digest(repo_bindings) if repo_bindings else None)
         for spec in parsed.specs.values():
             if spec["approval_step"] is None and self.approval_policy.required_for(spec["permission_mode"], spec["allowed_tools"]):
                 raise at.AgentSpecError("operator policy requires an approval_step for this task")
+        try:
+            check_workspace_specs(parsed.specs, repo_bindings)
+        except ValueError as exc:
+            raise at.AgentSpecError(str(exc)) from None
         for data in parsed.prompts.values():
             self.blobs.put([data])  # content-addressed and private; unreferenced until the txn commits
         artifact_ids = {node: new_id() for node in parsed.specs}
@@ -146,13 +161,24 @@ class AgentRuntime:
             db.execute("INSERT INTO mock_run_config(run_id,profile_id,fixture) VALUES(?,?,?)", (run_id, at.AGENT_PROFILE, ms.FIXED_KIND))
             tasks = {node: {**spec, "prompt_artifact_id": artifact_ids[node]} for node, spec in parsed.specs.items()}
             at.record_task_specs(db, run_id, tasks, parsed.prompts, artifact_ids, datetime.now(timezone.utc).isoformat())
+            if repo_bindings:
+                try:  # the writer recorded in each binding is the one task that declares write on it
+                    check_workspace_specs(parsed.specs, repo_bindings,
+                                          dict(db.execute("SELECT node_id,id FROM tasks WHERE run_id=?", (run_id,))))
+                except ValueError as exc:
+                    raise at.AgentSpecError(str(exc)) from None
+                bind_run_repos(db, run_id, repo_bindings)
             self._record_run_profile(db, run_id, run_profile, parsed.specs)
             if self.budget_policy is not None:
                 bind_run(db, run_id, self.budget_policy)
             write_run_transition(db, RunChange(RunId(run_id), RunState.QUEUED, RunState.RUNNING, row[1]), principal="local-operator")
             return {"run_id": run_id, "state": "running", "kind": at.AGENT_KIND}
+        request = {"run_id": run_id, "kind": at.AGENT_KIND, "tasks": parsed.specs}
+        if repo_bindings:  # only then, so single-repository receipts keep their request hash
+            request["repos"] = [[b.repo_id, b.baseline_ref, b.baseline_sha, b.entry_sha256]
+                                for b in sorted(repo_bindings, key=lambda b: b.repo_id)]
         result = execute_idempotent(self.db, principal="local-operator", operation="agent.start", key=key,
-                                    request={"run_id": run_id, "kind": at.AGENT_KIND, "tasks": parsed.specs}, execute=write)
+                                    request=request, execute=write)
         if not result.replayed:
             self._launch(run_id)
         return result
@@ -375,7 +401,8 @@ class AgentRuntime:
                 max_concurrency=self._max_concurrency,
                 approval_requester=DaemonApprovalRequester(self.db) if gates else None,
                 worktree_check=self._worktree_check, profile_check=self._profile_problem,
-                profile_limits_check=self._profile_limits_problem)
+                profile_limits_check=self._profile_limits_problem, workspaces=self._workspaces,
+                workspace_sandboxed=bool(getattr(self.profile, "sandbox", False)))
             self._engine = engine
             scenarios = {t: ("agent",) for t in task_specs}
             while True:
@@ -443,6 +470,11 @@ class AgentRuntime:
         """
         runs = self.db.execute("SELECT run_id FROM mock_run_config WHERE profile_id=?", (at.AGENT_PROFILE,)).fetchall()
         self._fence_prior_workers()
+        if self._commit_recovery is not None:
+            try:  # after the fence (no surviving writer is assumed), before any run is recovered or re-driven
+                self._commit_recovery(self.db)
+            except Exception:
+                _LOG.exception("Interrupted repository commits could not be resolved")
         for (run_id,) in runs:
             try:
                 self._audit_fence(run_id)
@@ -482,6 +514,12 @@ class AgentRuntime:
         if requeued is None:
             return False
         _LOG.info("Run %s re-driven at startup: %d never-spawned attempt(s) re-queued", run_id, len(requeued))
+        cleanup = getattr(self._workspaces, "cleanup_never_spawned", None)
+        if requeued and cleanup is not None:
+            try:  # ADR 026 D4 step 8: no process ever ran in these trees, so they go now (never forced)
+                cleanup(self.db, requeued)
+            except Exception:
+                _LOG.exception("Worktrees of never-spawned attempts in run %s could not be removed", run_id)
         return True
 
     def _fence_prior_workers(self) -> None:

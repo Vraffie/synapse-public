@@ -338,7 +338,7 @@ def test_migration_0017_marks_every_existing_attempt_so_an_upgrade_never_requeue
         db.execute("DETACH DATABASE src")
         db.execute("PRAGMA foreign_keys = ON")
         assert attempts(db) == ["running"]  # what a pre-0017 daemon left in flight
-        assert apply_migrations(db, root) == [17]
+        assert apply_migrations(db, root, limit=17) == [17]  # later migrations are not this test's subject
         assert db.execute("SELECT count(*) FROM attempt_spawn_marks").fetchone() == (1,)  # data kept, attempt marked
     finally:
         db.close()

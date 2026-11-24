@@ -238,7 +238,7 @@ def test_healthy_runtime_resets_restart_budget(tmp_path):
     supervisor = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     try:
         with pytest.raises(subprocess.TimeoutExpired):
-            supervisor.wait(timeout=3)  # budget keeps resetting, so it never gives up
+            supervisor.wait(timeout=8)  # budget keeps resetting, so it never gives up (8 s: daemon import alone ~2 s)
     finally:
         supervisor.terminate()
         stderr = supervisor.communicate(timeout=10)[1]

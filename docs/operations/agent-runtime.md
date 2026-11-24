@@ -162,6 +162,30 @@ mark (mark written, journal `begin`, pid recorded, mid-run, finished but not yet
 above. A `running` run with no in-flight work at all (a crash before any claim) is re-driven the same way, with no
 event. `agent-show` reports the count as `attempts_resumed`.
 
+For a multi-repository attempt (ADR 026) the worktrees are created and recorded before the spawn mark, so a crash
+between them leaves a never-spawned attempt whose trees exist. When such an attempt is re-queued, its trees are
+removed right away without `--force` (clean and still at the pinned baseline only; one
+`attempt_worktree_removals` row each, `reason = never_spawned`); a dirty or moved tree is kept and logged by count.
+The next attempt gets fresh trees under `attempt_no + 1`.
+
+### Multi-repository runs (ADR 026, first slice)
+
+`AgentRuntime.start(run_id, key, specs, repo_bindings=[...])` takes the run's pinned bindings (each baseline already
+resolved to a SHA) and specs of the shape `{prompt, allowed_tools, permission_mode, timeout_seconds,
+repos: [{repo_id, access}][, profile_id][, approval_step]}` (no `worktree`, `worktree_head`, `repo`, `base_ref`).
+It cross-checks every declared repository against the bindings and the single writer per repository, records
+`bindings_sha256` in each spec (so the full-spec hash an approval binds covers the pinned baselines), and inserts
+`run_repo_bindings` in the same transaction as the specs and the `queued -> running` transition. A run is either
+all legacy or all multi-repository. The engine hooks (`workspaces=AttemptWorkspaces(manager)`) create, recheck and
+commit each attempt's worktrees; without them a multi-repository task is refused before any spawn
+(`multi_repo_unavailable`).
+
+Crash during the commit phase: the commit runs between an `intent` row and its result. At startup, after the fence
+and before any run is recovered, `resolve_commit_intents` gives every dangling intent exactly one result from what
+git shows, and never re-runs a commit: `not_done` (the attempt branch is still at `head_before`), `done` (exactly one
+commit on top of `head_before` whose tree equals the worktree's index) or `unknown` (`unverifiable`). The attempt
+itself had a spawn mark, so it recovers as above (`unknown`, task blocked, run `recovering`).
+
 ### Startup worker fence (ADR 023)
 
 Every real spawn is journaled under `<state>/spawn-journal` (intent before `Popen`, pid, start ticks and boot id right

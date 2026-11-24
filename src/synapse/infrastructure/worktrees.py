@@ -15,10 +15,12 @@ import stat
 import subprocess
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
+from synapse.application.xml_wellformed import MAX_XML_BYTES, XmlRefused, check_xml
 from synapse.domain.contracts import validate_id
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -47,6 +49,22 @@ _locks: dict[str, threading.Lock] = {}
 
 class WorktreeError(RuntimeError):
     """Operation refused or git failed."""
+
+
+class CommitRefused(WorktreeError):
+    """The host-side commit refused the staged change (fixed ``reason`` code; ``count`` paths, never their names)."""
+
+    def __init__(self, reason: str, count: int = 0) -> None:
+        super().__init__("commit refused: %s" % reason)
+        self.reason, self.count = reason, count
+
+
+class AttemptCreateError(WorktreeError):
+    """Creating an attempt's worktrees failed for ``repo_id``; every worktree made for the attempt was removed."""
+
+    def __init__(self, repo_id: str) -> None:
+        super().__init__("worktree could not be created for %s" % repo_id)
+        self.repo_id = repo_id
 
 
 class RepoNotAllowlistedError(ValueError):
@@ -98,6 +116,111 @@ def _check_dir(path: str, what: str) -> str:
     return path
 
 
+# --- multi-repository runs (ADR 026 slice 1) ---------------------------------------------------------------------
+MAX_ATTEMPT_REPOS = 16
+MAX_ATTEMPT_NO = 10_000
+MAX_PROTECTED_PATTERNS = 64
+_MAX_PATTERN = 256
+_HEX_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+# Owner decision: in a multi-repository run an agent may change only XML files (``**/*.xml``); a staged path with any
+# other name refuses the whole commit for that repository. Regular files only (no symlinks, no gitlinks).
+EDITABLE_SUFFIX = ".xml"
+_EDITABLE_MODES = frozenset({"100644", "000000"})  # new mode: a regular non-executable file, or deleted
+
+
+def check_registry_id(value) -> str:
+    """A registry repository id: the safe-id rule (a path component and a ref-safe name)."""
+    if not isinstance(value, str):
+        raise ValueError("repository id must be a string")
+    return _safe_id(value, "repository id")
+
+
+def check_protected_patterns(patterns) -> tuple[str, ...]:
+    """Validate operator ``protected_paths``: anchored, repository-relative globs.
+
+    Grammar (a subset of git's ``:(glob)`` pathspec magic): ``/``-separated segments; ``*`` and ``?`` match within one
+    segment; a segment that is exactly ``**`` matches any number of segments. No character classes, no negation, no
+    leading ``/``, no empty, ``.`` or ``..`` segments. A pattern protects the paths it matches and everything below a
+    directory it matches (``.github`` protects ``.github/workflows/x.yml``).
+    """
+    if not isinstance(patterns, (list, tuple)) or len(patterns) > MAX_PROTECTED_PATTERNS:
+        raise ValueError("must be a list of at most %d patterns" % MAX_PROTECTED_PATTERNS)
+    out = []
+    for pat in patterns:
+        if (not isinstance(pat, str) or not pat or len(pat) > _MAX_PATTERN or pat.startswith("/")
+                or any(c in pat for c in "\x00\\[]!\n\r") or pat != pat.strip()):
+            raise ValueError("each pattern must be a nonempty relative glob without [ ] ! or backslash")
+        for seg in pat.split("/"):
+            if seg in ("", ".", "..") or ("**" in seg and seg != "**"):
+                raise ValueError("pattern segments must not be empty, '.' or '..', and ** must be a whole segment")
+        out.append(pat)
+    if len(set(out)) != len(out):
+        raise ValueError("patterns must not repeat")
+    return tuple(out)
+
+
+def _pattern_regex(pattern: str) -> re.Pattern:
+    segs = pattern.split("/")
+    parts = []
+    for i, seg in enumerate(segs):
+        last = i == len(segs) - 1
+        if seg == "**":
+            parts.append(".*" if last else "(?:[^/]+/)*")
+            continue
+        body = "".join("[^/]*" if c == "*" else "[^/]" if c == "?" else re.escape(c) for c in seg)
+        parts.append(body if last else body + "/")
+    return re.compile("".join(parts), re.DOTALL)
+
+
+def matches_protected(path: str, patterns: Sequence[str]) -> bool:
+    """True if repository-relative ``path`` or any of its parent directories matches a protected pattern."""
+    if not patterns:
+        return False
+    segs = path.split("/")
+    prefixes = ["/".join(segs[:i]) for i in range(1, len(segs) + 1)]
+    for pat in patterns:
+        rx = _pattern_regex(pat)
+        if any(rx.fullmatch(prefix) for prefix in prefixes):
+            return True
+    return False
+
+
+def check_staged_paths(records: Sequence[tuple[Sequence[str], str]], protected: Sequence[str]) -> None:
+    """The multi-repository path and mode rule (ADR 026 D3 rules 1 and 3, plus the operator's protected paths) over
+    ``git diff --cached --raw -z --no-renames`` records. Raises ``CommitRefused`` (a fixed reason and a count):
+
+    * ``path_not_editable``: not ``**/*.xml`` (case-sensitive), or not a plain relative path (empty, ``.``/``..``/
+      ``.git`` segment, leading ``/`` or ``-``, backslash or control character);
+    * ``path_not_allowed``: matches a protected pattern (protected paths only ever narrow the rule);
+    * ``mode_not_allowed``: an added or modified entry that is not a regular non-executable file (``100644``):
+      symlinks, executables and gitlinks are refused; a deletion is a deletion.
+
+    Checked in that order, over every record, before anything is committed. Well-formedness (rule 4) is checked on
+    the staged blobs by the caller.
+    """
+    def refuse(reason: str, bad: list) -> None:
+        if bad:
+            raise CommitRefused(reason, len(bad))
+
+    modes = [(f[0].lstrip(":") if f else "", f[1] if len(f) > 1 else "", name) for f, name in records]
+    refuse("path_not_editable", [n for _, _, n in modes
+                                 if not n or n.startswith(("/", "-")) or "\\" in n
+                                 or any(ord(c) < 32 or ord(c) == 127 for c in n)
+                                 or any(seg in ("", ".", "..", ".git") for seg in n.split("/"))
+                                 or not n.endswith(EDITABLE_SUFFIX)])
+    refuse("path_not_allowed", [n for _, _, n in modes if matches_protected(n, protected)])
+    refuse("mode_not_allowed", [n for _, m, n in modes if m not in _EDITABLE_MODES])
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptRepo:
+    """One repository of an attempt: where it lives, the pinned baseline commit and the task's access mode."""
+    repo_id: str
+    repo_path: str
+    baseline_sha: str
+    access: str  # "write" | "read"
+
+
 def _git_env() -> dict[str, str]:
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -111,6 +234,9 @@ def _git_env() -> dict[str, str]:
         # Never lazily fetch missing objects of a partial clone: that would run the repo-chosen
         # remote.<name>.uploadpack (or a transport) from a read-only query such as `status`.
         "GIT_NO_LAZY_FETCH": "1",
+        # Object identity must be what is stored: refs/replace/* and info/grafts could make a check see different
+        # (clean) objects than the ones a commit or deploy actually uses (ADR 026 re-review).
+        "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": "/dev/null",
         "GIT_AUTHOR_NAME": "synapse", "GIT_AUTHOR_EMAIL": "synapse@localhost",
         "GIT_COMMITTER_NAME": "synapse", "GIT_COMMITTER_EMAIL": "synapse@localhost",
     }
@@ -141,13 +267,13 @@ def _kill_group(proc: subprocess.Popen) -> None:
         pass
 
 
-def _git(cwd: str, args: Iterable[str], *, max_bytes: int = DEFAULT_MAX_BYTES,
-         check: bool = True, timeout: float | None = None) -> tuple[int, str, bool]:
+def _git_raw(cwd: str, args: Iterable[str], *, max_bytes: int = DEFAULT_MAX_BYTES,
+             check: bool = True, timeout: float | None = None) -> tuple[int, bytes, bool]:
     """Run git (argv list, no shell, scrubbed env). Output is bounded and the whole call has a
     wall-clock deadline enforced by reader threads; on expiry the entire process group dies."""
     args = list(args)
     deadline = time.monotonic() + (_GIT_TIMEOUT if timeout is None else timeout)
-    argv = ["git", "--no-lazy-fetch", *_HARDEN, *args]
+    argv = ["git", "--no-lazy-fetch", "--no-replace-objects", *_HARDEN, *args]
     try:
         proc = subprocess.Popen(argv, cwd=cwd, env=_git_env(), shell=False,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -225,6 +351,12 @@ def _git(cwd: str, args: Iterable[str], *, max_bytes: int = DEFAULT_MAX_BYTES,
     if check and rc != 0 and not truncated:
         msg = bytes(err).decode("utf-8", "replace").strip().splitlines()[:1]
         raise WorktreeError(f"git {args_name(args)} failed: {msg[0] if msg else rc}")
+    return rc, data, truncated
+
+
+def _git(cwd: str, args: Iterable[str], *, max_bytes: int = DEFAULT_MAX_BYTES,
+         check: bool = True, timeout: float | None = None) -> tuple[int, str, bool]:
+    rc, data, truncated = _git_raw(cwd, args, max_bytes=max_bytes, check=check, timeout=timeout)
     return rc, data.decode("utf-8", "replace"), truncated
 
 
@@ -275,7 +407,426 @@ def refuse_unsafe_repo_config(repo: str, cwd: str | None = None) -> None:
             raise WorktreeError("repository info/attributes is not allowed")
 
 
-class WorktreeManager:
+class AttemptWorktrees:
+    """Mixin: per-(attempt, repository) worktrees for multi-repository runs (ADR 026 D4, slice 1).
+
+    Layout ``<root>/<run_id>/<task_id>/<attempt_no>/<repo_id>``. A write-access repository gets the Synapse branch
+    ``synapse/<run_id>/<task_id>/<attempt_no>``; a read-access one is a detached checkout of the pinned baseline.
+    Nothing here writes a ref outside ``refs/heads/synapse/``, pushes, fetches or touches the owner's checkout.
+    """
+
+    # --- layout ------------------------------------------------------------------------------------------------
+    def attempt_dir(self, run_id: str, task_id: str, attempt_no: int) -> str:
+        if type(attempt_no) is not int or not 1 <= attempt_no <= MAX_ATTEMPT_NO:
+            raise ValueError("attempt_no out of range")
+        return os.path.join(self._root, _safe_id(run_id, "run_id"), _safe_id(task_id, "task_id"), str(attempt_no))
+
+    def attempt_worktree_path(self, run_id: str, task_id: str, attempt_no: int, repo_id: str) -> str:
+        return os.path.join(self.attempt_dir(run_id, task_id, attempt_no), check_registry_id(repo_id))
+
+    @staticmethod
+    def attempt_branch(run_id: str, task_id: str, attempt_no: int) -> str:
+        return f"synapse/{run_id}/{task_id}/{attempt_no}"
+
+    @staticmethod
+    def _guard_ref(branch: str) -> str:
+        """The single ref-write guard: Synapse creates, moves or deletes branches only under refs/heads/synapse/."""
+        if not isinstance(branch, str) or not branch.startswith("synapse/") or ".." in branch or "\x00" in branch:
+            raise WorktreeError("refusing to write a ref outside refs/heads/synapse/")
+        return branch
+
+    def _contained_attempt(self, path: str) -> None:
+        """``path`` is exactly <root>/<run>/<task>/<attempt>/<repo> and no level below root is a symlink."""
+        cur = path
+        for _ in range(4):
+            if os.path.islink(cur):
+                raise WorktreeError("symlink inside root_dir")
+            cur = os.path.dirname(cur)
+        if cur != self._root:
+            raise WorktreeError("path outside root_dir")
+
+    def _mkdirs_private(self, directory: str) -> None:
+        """Create each level under root (0700) one at a time, refusing a symlink or foreign directory at any level
+        (``os.makedirs`` would follow a planted symlink)."""
+        rel = os.path.relpath(directory, self._root)
+        if rel.startswith("..") or os.path.isabs(rel):
+            raise WorktreeError("path outside root_dir")
+        cur = self._root
+        for part in rel.split(os.sep):
+            cur = os.path.join(cur, part)
+            try:
+                os.mkdir(cur, 0o700)
+            except FileExistsError:
+                pass
+            st = os.lstat(cur)
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+                raise WorktreeError("attempt directory is not a private directory")
+
+    def _attempt_tree(self, run_id: str, task_id: str, attempt_no: int, repo_id: str, repo: str) -> str:
+        path = self.attempt_worktree_path(run_id, task_id, attempt_no, repo_id)
+        if not os.path.lexists(path):
+            raise WorktreeError("worktree does not exist")
+        self._contained_attempt(path)
+        if self._repo_of(path) != repo:
+            raise WorktreeError("worktree belongs to a different repository")
+        return path
+
+    def _allowlisted(self, repo: str) -> str:
+        if not isinstance(repo, str) or repo not in self._repos:
+            raise RepoNotAllowlistedError("repo is not on the operator allowlist")
+        self._check_repo(repo)
+        return repo
+
+    def _lock_all(self, stack: ExitStack, repos: Sequence[tuple[str, str]]) -> None:
+        """Take the locks of ``(repo_id, repo_path)`` pairs in ONE global order: ascending (resolved path, repo_id).
+        The order must not depend on repo_id alone: a run's bindings outlive registry edits, so two runs may map the
+        same ids to different paths. Locks are keyed by the resolved path (``_lock``), so one repository reached
+        through two spellings is still one lock, taken once."""
+        seen: set[str] = set()
+        for real, _rid, repo in sorted((os.path.realpath(path), rid, path) for rid, path in repos):
+            if real in seen:
+                continue
+            seen.add(real)
+            stack.enter_context(self._lock(repo))
+
+    # --- create all, or none -------------------------------------------------------------------------------------
+    def create_attempt(self, run_id: str, task_id: str, attempt_no: int,
+                       repos: Sequence[AttemptRepo]) -> dict[str, str]:
+        """Create every worktree of one attempt from its pinned baseline, or none.
+
+        Per-repository locks are taken in ascending repository-path order (``_lock_all``; deadlock-free even when two
+        runs bind the same ids to different paths) and held for the whole create.
+        Each new tree is checked (owning repository, HEAD equals the baseline, clean). On any failure every worktree
+        and branch made by this call is removed and ``AttemptCreateError(repo_id)`` names the repository that failed.
+        Returns ``{repo_id: path}``.
+        """
+        adir = self.attempt_dir(run_id, task_id, attempt_no)
+        if not isinstance(repos, (list, tuple)) or not 1 <= len(repos) <= MAX_ATTEMPT_REPOS:
+            raise ValueError("an attempt needs 1 to %d repositories" % MAX_ATTEMPT_REPOS)
+        ordered = sorted(repos, key=lambda r: r.repo_id)
+        ids = [r.repo_id for r in ordered]
+        if len(set(ids)) != len(ids) or len({r.repo_path for r in ordered}) != len(ordered):
+            raise ValueError("attempt repositories must be distinct")
+        for r in ordered:
+            check_registry_id(r.repo_id)
+            self._allowlisted(r.repo_path)
+            if r.access not in ("write", "read"):
+                raise ValueError("access must be write or read")
+            if not isinstance(r.baseline_sha, str) or not _HEX_SHA.fullmatch(r.baseline_sha):
+                raise ValueError("baseline_sha must be a full lowercase hex commit id")
+        branch = self._guard_ref(self.attempt_branch(run_id, task_id, attempt_no))
+        made: list[tuple[AttemptRepo, str]] = []
+        current = ordered[0].repo_id
+        with ExitStack() as locks:
+            self._lock_all(locks, [(r.repo_id, r.repo_path) for r in ordered])
+            try:
+                self._mkdirs_private(adir)
+                for r in ordered:
+                    current = r.repo_id
+                    path = os.path.join(adir, r.repo_id)
+                    self._contained_attempt(path)
+                    if os.path.lexists(path):
+                        raise WorktreeError("attempt worktree already exists")
+                    repo = r.repo_path
+                    self._refuse_dangerous_config(repo)
+                    rc, out, _ = _git(repo, ["rev-parse", "--verify", "--quiet", "--end-of-options",
+                                             f"{r.baseline_sha}^{{commit}}"], check=False)
+                    if rc != 0 or out.strip() != r.baseline_sha:
+                        raise WorktreeError("baseline commit is missing")
+                    _git(repo, ["worktree", "prune"], check=False)
+                    if r.access == "write":
+                        rc, _, _ = _git(repo, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], check=False)
+                        if rc == 0:
+                            raise WorktreeError("attempt branch already exists")  # never reuse another attempt's
+                        made.append((r, path))
+                        _git(repo, ["worktree", "add", "-b", branch, path, r.baseline_sha])
+                    else:
+                        made.append((r, path))
+                        _git(repo, ["worktree", "add", "--detach", path, r.baseline_sha])
+                    if self._repo_of(path) != repo:
+                        raise WorktreeError("worktree does not belong to its repository")
+                    head, clean = self._tree_state(repo, path)
+                    if head != r.baseline_sha or not clean:
+                        raise WorktreeError("new worktree is not the pinned baseline")
+            except BaseException as exc:
+                for r, path in reversed(made):
+                    self._discard_locked(r, path, branch)
+                try:
+                    os.rmdir(adir)
+                except OSError:
+                    pass
+                if isinstance(exc, (WorktreeError, ValueError, OSError)):
+                    raise AttemptCreateError(current) from exc
+                raise
+        return {r.repo_id: os.path.join(adir, r.repo_id) for r in ordered}
+
+    def _discard_locked(self, r: AttemptRepo, path: str, branch: str) -> None:
+        """Best effort removal of one attempt worktree (caller holds the repository lock)."""
+        repo = r.repo_path
+        try:
+            self._refuse_dangerous_config(repo)
+            if os.path.lexists(path):
+                self._contained_attempt(path)
+                _git(repo, ["worktree", "remove", "--force", path], check=False)
+                if os.path.lexists(path) and not os.path.islink(path):
+                    shutil.rmtree(path, ignore_errors=True)
+            _git(repo, ["worktree", "prune"], check=False)
+            if r.access == "write":
+                _git(repo, ["branch", "-D", "--", self._guard_ref(branch)], check=False)
+        except (WorktreeError, OSError):
+            pass
+
+    def discard_attempt(self, run_id: str, task_id: str, attempt_no: int, repos: Sequence[AttemptRepo]) -> None:
+        """Best effort: remove an attempt's worktrees (used when they could not be recorded before the spawn)."""
+        branch = self._guard_ref(self.attempt_branch(run_id, task_id, attempt_no))
+        ordered = sorted(repos, key=lambda r: r.repo_id)
+        with ExitStack() as locks:
+            self._lock_all(locks, [(r.repo_id, self._allowlisted(r.repo_path)) for r in ordered])
+            for r in reversed(ordered):
+                self._discard_locked(r, self.attempt_worktree_path(run_id, task_id, attempt_no, r.repo_id), branch)
+        try:
+            os.rmdir(self.attempt_dir(run_id, task_id, attempt_no))
+        except OSError:
+            pass
+
+    def remove_attempt_clean(self, run_id: str, task_id: str, attempt_no: int,
+                             repos: Sequence[AttemptRepo]) -> dict[str, str]:
+        """Non-forced removal of an attempt's worktrees that provably never ran (ADR 026 D4 step 8).
+
+        Per repository (locks in repo_id order): ``absent`` (nothing there), ``removed`` (a clean tree still at the
+        pinned baseline: ``git worktree remove`` without --force, and its attempt branch deleted only while it still
+        points at the baseline), or ``kept_dirty`` / ``kept_moved`` / ``kept_foreign`` (left untouched and reported).
+        """
+        branch = self._guard_ref(self.attempt_branch(run_id, task_id, attempt_no))
+        out: dict[str, str] = {}
+        ordered = sorted(repos, key=lambda r: r.repo_id)
+        with ExitStack() as locks:
+            self._lock_all(locks, [(r.repo_id, self._allowlisted(r.repo_path)) for r in ordered])
+            for r in ordered:
+                repo, path = r.repo_path, self.attempt_worktree_path(run_id, task_id, attempt_no, r.repo_id)
+                self._refuse_dangerous_config(repo)
+                if not os.path.lexists(path):
+                    out[r.repo_id] = "absent"
+                else:
+                    try:
+                        self._contained_attempt(path)
+                        if self._repo_of(path) != repo:
+                            raise WorktreeError("foreign")
+                    except WorktreeError:
+                        out[r.repo_id] = "kept_foreign"
+                        continue
+                    head, clean = self._tree_state(repo, path)
+                    if not clean:
+                        out[r.repo_id] = "kept_dirty"
+                        continue
+                    if head != r.baseline_sha:
+                        out[r.repo_id] = "kept_moved"
+                        continue
+                    _git(repo, ["worktree", "remove", path])
+                    out[r.repo_id] = "removed"
+                if r.access == "write":
+                    rc, tip, _ = _git(repo, ["rev-parse", "--verify", "--quiet", "--end-of-options",
+                                             f"refs/heads/{branch}^{{commit}}"], check=False)
+                    if rc == 0 and tip.strip() == r.baseline_sha:
+                        _git(repo, ["branch", "-D", "--", branch], check=False)
+        try:
+            os.rmdir(self.attempt_dir(run_id, task_id, attempt_no))
+        except OSError:
+            pass
+        return out
+
+    def attempt_tree_problem(self, run_id: str, task_id: str, attempt_no: int, repo_id: str, repo: str,
+                             recorded_path: str, baseline_sha: str) -> str | None:
+        """Spawn-time recheck of one recorded attempt worktree (ADR 026 D4 step 2). Fixed codes, never raises."""
+        try:
+            self._allowlisted(repo)
+            path = self.attempt_worktree_path(run_id, task_id, attempt_no, repo_id)
+            if recorded_path != path:
+                return "worktree_mismatch"
+            path = self._attempt_tree(run_id, task_id, attempt_no, repo_id, repo)
+            head, clean = self._tree_state(repo, path)
+        except (WorktreeError, ValueError, OSError):
+            return "worktree_mismatch"
+        if head != baseline_sha:
+            return "head_moved"
+        if not clean:
+            return "worktree_dirty"
+        return None
+
+    # --- facts ---------------------------------------------------------------------------------------------------
+    def _tree_state(self, repo: str, path: str) -> tuple[str, bool]:
+        _, head, _ = self._tree_git(repo, path, ["rev-parse", "HEAD"])
+        _, porc, trunc = self._tree_git(repo, path, ["status", "--porcelain=v1", "-z", "--untracked-files=normal",
+                                                     "--ignore-submodules=all"], max_bytes=4096)
+        return head.strip(), not porc and not trunc
+
+    def attempt_tree_state(self, run_id: str, task_id: str, attempt_no: int, repo_id: str,
+                           repo: str) -> tuple[str, bool]:
+        """(HEAD, clean) of one attempt worktree (the pre-spawn recheck)."""
+        self._allowlisted(repo)
+        return self._tree_state(repo, self._attempt_tree(run_id, task_id, attempt_no, repo_id, repo))
+
+    def attempt_branch_head(self, run_id: str, task_id: str, attempt_no: int, repo: str) -> str | None:
+        """Current SHA of the attempt branch in ``repo`` (read from the repository, not the tree), or None."""
+        self._allowlisted(repo)
+        branch = self._guard_ref(self.attempt_branch(run_id, task_id, attempt_no))
+        rc, out, _ = _git(repo, ["rev-parse", "--verify", "--quiet", "--end-of-options",
+                                 f"refs/heads/{branch}^{{commit}}"], check=False)
+        sha = out.strip()
+        return sha if rc == 0 and _HEX_SHA.fullmatch(sha) else None
+
+    def attempt_commit_landed(self, run_id: str, task_id: str, attempt_no: int, repo_id: str, repo: str,
+                              head_before: str, protected: Sequence[str] = ()) -> str | None:
+        """Crash recovery: the commit SHA if the branch HEAD is a direct child of ``head_before`` and the worktree's
+        index equals that commit's tree (the commit landed), else None. Read-only."""
+        head = self.attempt_branch_head(run_id, task_id, attempt_no, repo)
+        if head is None or head == head_before:
+            return None
+        rc, parents, _ = _git(repo, ["rev-list", "--parents", "-n", "1", "--end-of-options", head], check=False)
+        if rc != 0 or parents.split() != [head, head_before]:
+            return None
+        path = self._attempt_tree(run_id, task_id, attempt_no, repo_id, repo)
+        rc, _, _ = self._tree_git(repo, path, ["diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv",
+                                               "--ignore-submodules=none", head, "--"], check=False)
+        if rc != 0:
+            return None
+        try:  # the commit landed; it only counts as ours if the committed change passes the full commit rule again
+            self.check_commit_range(repo, head_before, head, protected)
+        except CommitRefused:
+            return None
+        return head
+
+    def check_commit_range(self, repo: str, base: str, head: str, protected: Sequence[str] = ()) -> int:
+        """Re-run the D3 rule on a committed change (``diff-tree -r -z --raw --no-renames base head`` and the blobs
+        from the object store): paths, protected paths, modes and XML well-formedness. Raises ``CommitRefused``;
+        returns the number of changed paths. Read-only."""
+        for sha in (base, head):
+            if not isinstance(sha, str) or not _HEX_SHA.fullmatch(sha):
+                raise CommitRefused("bad_commit")
+        self._allowlisted(repo)
+        self._refuse_dangerous_config(repo)
+        _, raw, trunc = _git(repo, ["diff-tree", "-r", "-z", "--raw", "--no-renames", "--no-abbrev",
+                                    "--no-ext-diff", "--no-textconv", "--end-of-options", base, head],
+                             max_bytes=_COMMIT_LISTING_BYTES)
+        if trunc:
+            raise CommitRefused("too_many_paths")
+        tokens = raw.split("\x00")
+        records = [(t.split(" "), tokens[i + 1] if i + 1 < len(tokens) else "")
+                   for i, t in enumerate(tokens) if t.startswith(":")]
+        if len(records) > MAX_COMMIT_PATHS:
+            raise CommitRefused("too_many_paths")
+        check_staged_paths(records, check_protected_patterns(list(protected)))
+        self._check_blobs(repo, records)
+        return len(records)
+
+    @staticmethod
+    def _check_blobs(repo: str, records) -> None:
+        bad = 0
+        for fields, _name in records:
+            if len(fields) > 3 and fields[1] == "100644":  # added or modified: the blob, never the work tree file
+                if not _HEX_SHA.fullmatch(fields[3]):
+                    raise CommitRefused("xml_not_well_formed")
+                rc, blob, too_big = _git_raw(repo, ["cat-file", "blob", fields[3]], max_bytes=MAX_XML_BYTES,
+                                             check=False)
+                if rc != 0 or too_big:
+                    bad += 1
+                    continue
+                try:
+                    check_xml(blob)
+                except XmlRefused:
+                    bad += 1
+        if bad:
+            raise CommitRefused("xml_not_well_formed", bad)
+
+    # --- host commit ---------------------------------------------------------------------------------------------
+    def _commit_status(self, repo: str, path: str) -> list[str]:
+        """``status --porcelain=v1 -z --untracked-files=all --ignored=matching`` entries (bounded, refused if over)."""
+        _, porc, trunc = self._tree_git(repo, path, ["status", "--porcelain=v1", "-z", "--untracked-files=all",
+                                                     "--ignored=matching", "--ignore-submodules=all"],
+                                        max_bytes=_COMMIT_LISTING_BYTES)
+        entries = [e for e in porc.split("\x00") if e]
+        if trunc or len(entries) > MAX_COMMIT_PATHS:
+            raise CommitRefused("too_many_paths")
+        return entries
+
+    def commit_attempt(self, run_id: str, task_id: str, attempt_no: int, repo_id: str, repo: str, message: str, *,
+                       expected_head: str, protected: Sequence[str] = ()) -> dict:
+        """Host-side commit of one write-access attempt worktree onto its attempt branch.
+
+        Same hardening as ``commit`` plus the ADR 026 D3 rule: no ignored path may be present
+        (``ignored_path_present``), every staged path passes ``check_staged_paths`` (XML only, not protected, mode
+        100644), nothing untracked remains after staging (``untracked_path_present``), and every added or modified
+        blob, read from the object store, is well-formed XML (``xml_not_well_formed``). The branch HEAD must still be ``expected_head`` (the value
+        recorded in the commit intent). With nothing to commit it returns ``committed: False`` and
+        ``head == head_before`` (the candidate is the baseline). On a refusal the index is reset and the working tree
+        is left exactly as the agent left it. Returns {"head_before","head","paths","committed"}.
+        """
+        if (not isinstance(message, str) or not message.strip() or len(message) > MAX_COMMIT_MESSAGE
+                or "\x00" in message):
+            raise ValueError("invalid commit message")
+        self._allowlisted(repo)
+        protected = check_protected_patterns(list(protected))
+        branch = self._guard_ref(self.attempt_branch(run_id, task_id, attempt_no))
+        path = self._attempt_tree(run_id, task_id, attempt_no, repo_id, repo)
+        with self._lock(repo):
+            _, head_before, _ = self._tree_git(repo, path, ["rev-parse", "HEAD"])
+            head_before = head_before.strip()
+            rc, cur, _ = self._tree_git(repo, path, ["symbolic-ref", "--short", "-q", "HEAD"], check=False)
+            if rc != 0 or cur.strip() != branch:
+                raise CommitRefused("not_on_attempt_branch")
+            if head_before != expected_head:
+                raise CommitRefused("branch_moved")
+            entries = self._commit_status(repo, path)
+            if any(e.startswith("!! ") for e in entries):
+                raise CommitRefused("ignored_path_present", sum(e.startswith("!! ") for e in entries))
+            if not entries:
+                return {"head_before": head_before, "head": head_before, "paths": 0, "committed": False}
+            try:
+                self._tree_git(repo, path, ["add", "-A", "--"])
+                _, raw, raw_trunc = self._tree_git(repo, path, ["diff", "--cached", "--raw", "-z", "--no-renames",
+                                                                "--no-abbrev", "--no-ext-diff", "--no-textconv",
+                                                                "--ignore-submodules=none"],
+                                                   max_bytes=_COMMIT_LISTING_BYTES)
+                if raw_trunc:
+                    raise CommitRefused("too_many_paths")
+                tokens = raw.split("\x00")
+                records = [(t.split(" "), tokens[i + 1] if i + 1 < len(tokens) else "")
+                           for i, t in enumerate(tokens) if t.startswith(":")]
+                if len(records) > MAX_COMMIT_PATHS:
+                    raise CommitRefused("too_many_paths")
+                if not records:
+                    self._tree_git(repo, path, ["reset", "-q", "--"], check=False)
+                    return {"head_before": head_before, "head": head_before, "paths": 0, "committed": False}
+                check_staged_paths(records, protected)
+                after = self._commit_status(repo, path)
+                if any(e.startswith(("?? ", "!! ")) for e in after):
+                    raise CommitRefused("untracked_path_present", sum(e.startswith(("?? ", "!! ")) for e in after))
+                self._check_blobs(repo, records)
+                # Bind the commit to the tree that was checked: write the index to a tree, re-check that exact tree
+                # against the baseline, then commit THAT tree with commit-tree and move only the attempt branch from
+                # head_before to it (update-ref with the expected old value). An index rewritten after the checks
+                # (same-uid agent, sandbox off) cannot slip into the commit.
+                _, tree, _ = self._tree_git(repo, path, ["write-tree"])
+                tree = tree.strip()
+                if not _HEX_SHA.fullmatch(tree):
+                    raise CommitRefused("git_error")
+                _, commit, _ = _git(repo, ["-c", "commit.gpgsign=false", "-c", "user.useConfigOnly=false",
+                                           "commit-tree", tree, "-p", head_before, "-m", message.strip()])
+                commit = commit.strip()
+                if not _HEX_SHA.fullmatch(commit):
+                    raise CommitRefused("git_error")
+                self.check_commit_range(repo, head_before, commit, protected)
+                _git(repo, ["update-ref", "-m", "synapse attempt commit", f"refs/heads/{branch}", commit, head_before])
+            except BaseException:
+                self._tree_git(repo, path, ["reset", "-q", "--"], check=False)
+                raise
+            head = commit
+            # The worktree's index/HEAD now follow the branch; refresh the index to the commit (files untouched).
+            self._tree_git(repo, path, ["reset", "-q", "--"], check=False)
+        return {"head_before": head_before, "head": head, "paths": len(records), "committed": True}
+
+
+class WorktreeManager(AttemptWorktrees):
     def __init__(self, repo_allowlist: Iterable[str], root_dir: str) -> None:
         repos = list(repo_allowlist)
         if not repos:
@@ -327,8 +878,10 @@ class WorktreeManager:
 
     def _lock(self, repo: str):
         with _locks_guard:
-            tl = _locks.setdefault(repo, threading.Lock())
-        return _RepoLock(tl, os.path.join(self._root, f".lock-{hashlib.sha256(repo.encode()).hexdigest()[:16]}"))
+            # keyed by the resolved path: two spellings of one repository must share one lock
+            key = os.path.realpath(repo)
+            tl = _locks.setdefault(key, threading.Lock())
+        return _RepoLock(tl, os.path.join(self._root, f".lock-{hashlib.sha256(key.encode()).hexdigest()[:16]}"))
 
     def _repo_of(self, path: str) -> str:
         """Resolve owning allowlisted repo from the worktree's .git file."""
