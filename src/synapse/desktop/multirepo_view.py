@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QGroupBox, QLabel, QPlainTextEdit, QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
-from synapse.desktop.multirepo_model import manifest_summary, short
+from synapse.desktop.multirepo_model import MARKER, manifest_summary, short
 
 COLUMNS = ("Repository", "Access", "Baseline", "Candidate", "State", "Deploy")
 
@@ -70,11 +70,14 @@ class MultiRepoPane(QGroupBox):
             return
         self.setVisible(True)
         rows = view["rows"]
-        writes = sum(1 for r in rows if r["access"] == "write")
-        status = f"{len(rows)} repositories in this run ({writes} written, {len(rows) - writes} read only)"
+        counts = {kind: sum(1 for r in rows if r["access"] == kind) for kind in ("write", "read")}
+        unknown = len(rows) - counts["write"] - counts["read"]
+        status = f"{len(rows)} repositories in this run ({counts['write']} written, {counts['read']} read only"
+        status += f", {unknown} with unknown access)" if unknown else ")"
         if view.get("dropped"):
-            status += f"; {view['dropped']} malformed or extra entries not shown"
-        self.status.setText(status)
+            status += f"; {view['dropped']} malformed or extra repository bindings not shown"
+        notes = list(view.get("errors") or []) + ([view["stale"]] if view.get("stale") else [])
+        self.status.setText("\n".join([status] + [n[0].upper() + n[1:] + "." for n in notes if n]))
         headline, banner = manifest_summary(view.get("manifest"))
         self.manifest.setText(headline)
         self.banner.setText(banner)
@@ -84,7 +87,7 @@ class MultiRepoPane(QGroupBox):
         self.table.blockSignals(True)
         self.table.setRowCount(len(rows))
         for index, row in enumerate(rows):
-            values = (row["repo_id"], row["access"], f"{row['baseline_ref'] or '-'} @ {short(row['baseline_sha'])}",
+            values = (row["repo_id"], row.get("access_text") or row["access"], f"{row['baseline_ref'] or '-'} @ {short(row['baseline_sha'])}",
                       short(row["candidate_sha"]), row["label"], row["deploy"])
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -115,8 +118,8 @@ class MultiRepoPane(QGroupBox):
             parts.append(f"{row['changed_paths']} changed paths, {row['diff_bytes'] if row['diff_bytes'] is not None else '?'} diff bytes")
         if row["validations"]:
             parts.append("validations: " + ", ".join(f"{v['name']} {v['outcome']}" for v in row["validations"]))
-        if row["deploy_none"]:
-            parts.append(row["deploy"])
+        if row["deploy"] != "-":
+            parts.append("deploy: " + row["deploy"])
         self.detail.setText("\n".join(parts))
         diff = row["diff"]
         if row["access"] == "read":
@@ -127,10 +130,12 @@ class MultiRepoPane(QGroupBox):
             note, body = "Diff not available from the daemon.", ""
         else:
             note = f"Diff shown: {len(diff['text'])} characters (agent output, shown as plain text)"
+            if diff.get("altered"):
+                note += f"; {diff['altered']} hidden or control characters replaced with {MARKER}, so the shown text differs from the diff"
             if diff["truncated"]:
                 note += "; TRUNCATED (the full diff is not shown)"
             elif diff.get("verified"):
-                note += "; matches the manifest's diff_sha256"
+                note += "; the daemon's diff text matches the manifest's diff_sha256"
             else:
                 note += "; could not be matched to the manifest's diff_sha256"
             body = diff["text"]

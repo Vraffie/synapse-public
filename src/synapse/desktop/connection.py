@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 from threading import Event, Lock
 from urllib.parse import quote, urlencode
@@ -19,7 +20,7 @@ from synapse.desktop.agent_view import UNAVAILABLE_STATUSES, clean, sanitize_det
 from synapse.desktop.cursor_store import Cursor, CursorError, cursor_path, read_cursor, valid_event_id, write_cursor
 from synapse.desktop.mock_resume import ASSERTION, collect_evidence, fetch_all_tasks
 from synapse.desktop.multirepo_model import (
-    build_view, sanitize_manifest_detail, sanitize_manifest_list, sanitize_registry, sanitize_run_repos,
+    build_view, mark_stale, sanitize_manifest_detail, sanitize_manifest_list, sanitize_run_repos,
 )
 
 API_VERSION = "v1"  # the only API prefix this client speaks (/api/v1/...)
@@ -32,7 +33,6 @@ FEED_PAGES = 2  # message pages per thread per cycle, so a long backlog is caugh
 APPROVAL_PAGES = 5  # pages (100 rows each) the Control Center walks, independent of the Developer tab's paging
 AGENT_RETRY_POLLS = 10  # after 'unavailable', re-probe the agent endpoint only every Nth poll
 MULTIREPO_RETRY_POLLS = 30  # a run (or daemon) without multi-repository reads is re-probed only every Nth poll
-REGISTRY_EVERY = 30  # the read-only registry view (deploy: none markers) is refreshed every Nth poll
 
 
 def backoff_delay(interval: float, failures: int, cap: float = MAX_BACKOFF) -> float:
@@ -129,9 +129,9 @@ class Poller(QThread):
         self._approval_cursor = ""
         self._approval_page_generation = 0
         self._agent_skip = 0
-        self._multirepo_skip = 0
+        self._multirepo_skip = None  # (run id, generation, polls left) after the daemon said 'not served'
         self._multirepo_seen = None
-        self._registry = None  # (cycle fetched, sanitized registry or None)
+        self._multirepo_last = None  # (run id, generation, last good view, HH:MM of it, consecutive failures)
         self._cycle = 0
         self._feed_cursors = {}  # (run id, thread id) -> last message cursor already delivered
         self._feed_run = None
@@ -154,7 +154,7 @@ class Poller(QThread):
             self._thread_id = ""
             self._thread_generation += 1
             self._agent_skip = 0
-            self._multirepo_skip = 0
+            self._multirepo_skip = None
             return self._run_generation
 
     def select_thread(self, thread_id: str):
@@ -377,31 +377,46 @@ class Poller(QThread):
 
     def _poll_multirepo(self, run_id, generation):
         """Per-repository rows and the newest candidate manifest; read only, refreshed every FEED_EVERY polls."""
-        if self._multirepo_skip > 0:
-            self._multirepo_skip -= 1
-            return
+        with self._run_lock:
+            skip = self._multirepo_skip
+            if skip is not None and skip[:2] == (run_id, generation) and skip[2] > 0:
+                self._multirepo_skip = (run_id, generation, skip[2] - 1)
+                return
         if self._multirepo_seen == (run_id, generation) and self._cycle % FEED_EVERY:
             return
         self._multirepo_seen = (run_id, generation)
         try:
-            run_repos = sanitize_run_repos(self._fetch_optional(multirepo_routes.run_repos(run_id)), run_id)
-            manifests = sanitize_manifest_list(self._fetch_optional(multirepo_routes.run_manifests(run_id)))
-            detail = None
+            errors = []
+            raw_repos = self._fetch_optional(multirepo_routes.run_repos(run_id))
+            run_repos = None if raw_repos is None else sanitize_run_repos(raw_repos, run_id)
+            if raw_repos is not None and run_repos is None:
+                errors.append("the run's repository list was not understood")
+            raw_list = self._fetch_optional(multirepo_routes.run_manifests(run_id))
+            manifests = None if raw_list is None else sanitize_manifest_list(raw_list)
+            if raw_list is not None and manifests is None:
+                errors.append("the manifest list was not understood")
+            detail, newest = None, None
             if manifests:
                 newest = manifests[-1]["manifest_sha256"]
-                detail = sanitize_manifest_detail(self._fetch_optional(multirepo_routes.run_manifest(run_id, newest)), run_id)
-            if run_repos is None and not manifests:
-                self._multirepo_skip = MULTIREPO_RETRY_POLLS
+                raw_detail = self._fetch_optional(multirepo_routes.run_manifest(run_id, newest))
+                detail = None if raw_detail is None else sanitize_manifest_detail(raw_detail, run_id)
+                if raw_detail is not None and detail is None:
+                    errors.append("the manifest detail was not understood")
+            if raw_repos is None and raw_list is None:
+                with self._run_lock:
+                    self._multirepo_skip = (run_id, generation, MULTIREPO_RETRY_POLLS)
+                self._multirepo_last = None
                 self.multirepo_view.emit(run_id, generation, None)
                 return
-            if run_repos and run_repos["bindings"] and (self._registry is None or self._cycle - self._registry[0] >= REGISTRY_EVERY):
-                try:
-                    self._registry = (self._cycle, sanitize_registry(self._fetch_optional(multirepo_routes.registry())))
-                except Exception:
-                    self._registry = (self._cycle, None)
-            self.multirepo_view.emit(run_id, generation, build_view(run_repos, manifests, detail, self._registry and self._registry[1]))
-        except Exception:
-            pass  # transient failure: keep the last view; never show exception text
+            view = build_view(run_repos, manifests, detail, newest, errors)
+            self._multirepo_last = (run_id, generation, view, time.strftime("%H:%M"), 0)
+            self.multirepo_view.emit(run_id, generation, view)
+        except Exception:  # transient failure: keep the last view but say it is stale; never show exception text
+            last = self._multirepo_last
+            if last is not None and last[:2] == (run_id, generation):
+                failures = last[4] + 1
+                self._multirepo_last = last[:4] + (failures,)
+                self.multirepo_view.emit(run_id, generation, mark_stale(last[2], last[3], failures))
 
     def _poll_profiles(self):
         """Fetch the accounts for the run-start pickers. Called right after connecting and retried every loop until it
