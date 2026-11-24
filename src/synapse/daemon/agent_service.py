@@ -121,6 +121,9 @@ class AgentRunService:
             raise _bad("profile provider is not supported")
         if spec.provider == "codex" and getattr(self.runtime.profile, "sandbox", True) is not False:
             raise _bad("codex profiles are refused while the base profile is sandboxed")
+        if self.runtime.cooldowns.active(spec.id):
+            # Refused at creation (no run, no worktree, no spawn); never rerouted to another profile.
+            raise _bad("profile is cooling down")
         return spec
 
     def validate(self, req: dict, profile_id: str | None = None) -> dict:
@@ -378,7 +381,7 @@ class AgentRunService:
                     spec["approval_step"] = {**task["approval_step"], "policy_version": POLICY_VERSION}
                 specs[node] = spec
             try:
-                self.runtime.start(run_id, "agent-start:" + run_id, specs)
+                self.runtime.start(run_id, "agent-start:" + run_id, specs, run_profile=req.get("profile"))
             except AgentDisabled:
                 raise AgentRunError(503, "Agent runs are not configured") from None
             except at.AgentSpecError:
@@ -431,7 +434,8 @@ class AgentRunService:
                     spec["approval_step"] = {**task["approval_step"], "policy_version": POLICY_VERSION}
                 specs[node] = spec
             try:
-                self.runtime.start(run_id, "agent-start:" + run_id, specs, repo_bindings=bindings)
+                self.runtime.start(run_id, "agent-start:" + run_id, specs, repo_bindings=bindings,
+                                   run_profile=req.get("profile"))
             except AgentDisabled:
                 raise AgentRunError(503, "Agent runs are not configured") from None
             except at.AgentSpecError:
@@ -741,7 +745,14 @@ class AgentRunService:
                 "worktree": flat,
                 "cancellation_requested": self.db.execute("SELECT 1 FROM events WHERE run_id=? AND type='agent.cancellation_requested' LIMIT 1", (run_id,)).fetchone() is not None,
                 "attempts_resumed": resumed_count(self.db, run_id),  # never-spawned attempts re-queued at startup (ADR 024)
+                "profile": self._run_profile(run_id),
                 "tasks": tasks}
+
+    def _run_profile(self, run_id: str) -> str | None:
+        """The run-level profile recorded at start (``agent.run_profile_selected``); None for older runs."""
+        row = self.db.execute("SELECT json_extract(payload_json,'$.profile_id') FROM events WHERE run_id=? "
+                              "AND type='agent.run_profile_selected' ORDER BY sequence LIMIT 1", (run_id,)).fetchone()
+        return row[0] if row is not None and isinstance(row[0], str) else None
 
     def _summary(self, task_id: str) -> dict | None:
         row = self.db.execute("SELECT sha256 FROM artifacts WHERE json_extract(provenance_json,'$.kind')='agent_summary' "

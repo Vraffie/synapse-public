@@ -166,6 +166,7 @@ def build_bwrap_argv(bwrap: str, *, worktree: str, scratch: str, executable: str
                      inner: Sequence[str], forbidden: Sequence[str] = (),
                      extra_ro_dirs: Sequence[str] = (), host_root: str = "/",
                      no_ancestor: Sequence[str] = (),
+                     ro_fds: Sequence[tuple[int, str]] = (),
                      worktree_binds: Sequence[tuple[str, bool]] = ()) -> list[str]:
     """Wrap `inner` (argv[0] is `executable`) in bwrap. Pure: no filesystem writes, no env.
 
@@ -185,6 +186,12 @@ def build_bwrap_argv(bwrap: str, *, worktree: str, scratch: str, executable: str
     worktree. Then ``worktree`` (the attempt directory) is only the working directory and is NOT bound: exactly the
     declared worktrees are mounted, writable ones with ``--bind`` and read-access ones with ``--ro-bind``, each a
     direct child of ``worktree``. Anything else the attempt directory holds stays invisible.
+
+    `ro_fds` are ``(open O_PATH descriptor, destination inside scratch)`` single-file read-only binds
+    (``--ro-bind-fd``) placed on top of the scratch mount: the one deliberate exception to `forbidden` (the active
+    profile's credentials file, which the child must be able to read). Binding the descriptor, not a path, means a
+    path swapped after the caller's checks is not what gets mounted. The caller passes the descriptor to bwrap
+    (``pass_fds``). The destination must lie inside `scratch`; nothing else of the source's directory is mounted.
     """
     def _contains(outer: str, inner_: str) -> bool:
         return inner_ == outer or inner_.startswith(outer.rstrip("/") + "/")
@@ -215,12 +222,18 @@ def build_bwrap_argv(bwrap: str, *, worktree: str, scratch: str, executable: str
     ]
     for path in extra_ro_dirs:
         argv += ["--ro-bind", path, path]
+    for fd, dest in ro_fds:
+        if (type(fd) is not int or fd < 0 or not dest.startswith(scratch.rstrip("/") + "/")
+                or any(_contains(tree, dest) for tree in (worktree, *mounted)) or os.path.normpath(dest) != dest):
+            raise SandboxUnavailable("a sandbox file bind must target the scratch directory")
     argv += ["--ro-bind", executable, executable, "--bind", scratch, scratch]
     if binds:
         for path, writable in binds:
             argv += ["--bind" if writable else "--ro-bind", path, path]
     else:
         argv += ["--bind", worktree, worktree]
+    for fd, dest in ro_fds:
+        argv += ["--ro-bind-fd", str(fd), dest]
     secrets: list[str] = []
     for tree in mounted:
         secrets += [m for m in git_secret_masks(tree, extra_ro_dirs) if m not in secrets]
