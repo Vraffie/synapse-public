@@ -33,7 +33,7 @@ def good(**over):
 
 
 class Console:
-    def __init__(self, tmp_path, monkeypatch, send_script=None, agent=None, run_state='running', approvals=(), usage=None):
+    def __init__(self, tmp_path, monkeypatch, send_script=None, agent=None, run_state='running', approvals=(), usage=None, profiles=404, wait_profiles=True):
         self.app = QApplication.instance() or QApplication([])
         self.sent = []
         self.confirms = []
@@ -41,9 +41,16 @@ class Console:
         self.script = list(send_script or [])
         self.agent = agent
         self.usage = usage
+        self.profiles = profiles
         monkeypatch.setattr(agent_form, 'ask_confirm', lambda parent, title, text: self.confirms.append((title, text)) or self.answer)
 
         def fetch(_state, endpoint):
+            if endpoint == '/api/v1/profiles':
+                if isinstance(self.profiles, int):
+                    raise DaemonHTTPError(self.profiles)
+                if isinstance(self.profiles, Exception):
+                    raise self.profiles
+                return self.profiles
             if 'health' in endpoint:
                 return {'status': 'ok'}
             if 'events' in endpoint:
@@ -74,6 +81,8 @@ class Console:
         self.window = MainWindow(tmp_path, poller=poller)
         self.window.start_panel.agent_form.settings = self.settings
         self.form = self.window.start_panel.agent_form
+        if wait_profiles:
+            spin(self.app, lambda: self.form._profile_state != 'loading')  # the poller's first accounts answer (default: 404)
 
     def fill(self, **over):
         f = good(**over)
@@ -679,12 +688,46 @@ def pick(form, profile_id):
     form.profile.setCurrentIndex(form.profile.findData(profile_id))
 
 
-def test_picker_has_no_preselection_and_start_waits_for_a_choice(console, monkeypatch):
-    c = console()
+def test_loading_state_disables_start_and_nothing_is_sent(console):
+    c = console(wait_profiles=False)
+    form = agent_form.AgentRunForm(c.settings)  # a form that has not heard from the daemon yet
+    form.repo.setCurrentText('/work/repo')
+    form.prompt.setPlainText('go')
+    assert form.profile.currentText() == agent_form.PROFILE_LOADING and not form.submit_button.isEnabled()
+    assert not form.profile.isEnabled()
+    submitted = []
+    form.submit_requested.connect(submitted.append)
+    form.submit()
+    assert submitted == [] and 'not loaded yet' in form.problems.text()
+
+
+def test_unavailable_state_is_explicit_and_sends_no_profile_but_says_so(console):
+    c = console(profiles=503)  # an explicit 503 from the daemon
+    assert c.form._profile_state == 'unavailable'
+    assert c.form.profile.currentText() == agent_form.PROFILE_UNAVAILABLE and c.form.submit_button.isEnabled()
     c.fill()
+    c.form.submit()
+    spin(c.app, lambda: c.sent)
+    assert 'profile' not in json.loads(c.sent[0][1]['body'])
+    assert agent_form.DEFAULT_ACCOUNT_TEXT in c.confirms[0][1]
+
+
+def test_generic_failure_stays_loading_with_a_visible_reason_then_recovers(console):
+    c = console(profiles=500, wait_profiles=False)
     form = c.form
-    assert not form.profile.isEnabled() and form.submit_button.isEnabled()  # no profiles offered: nothing sent
-    form.set_profiles(PROFILES)
+    spin(c.app, lambda: 'could not be loaded' in form.status.text())
+    assert form._profile_state == 'loading' and not form.submit_button.isEnabled()
+    c.profiles = PROFILES  # the poller retries until it gets an answer
+    spin(c.app, lambda: form._profile_state == 'loaded')
+    assert form.profile.currentData() is None and not form.submit_button.isEnabled()
+    assert 'could not be loaded' not in form.status.text()
+
+
+def test_loaded_state_has_no_preselection_and_start_waits_for_a_choice(console):
+    c = console(profiles=PROFILES)
+    form = c.form
+    c.fill()
+    assert form._profile_state == 'loaded'
     assert form.profile.currentData() is None and form.profile.currentText() == agent_form.PROFILE_PROMPT
     assert not form.submit_button.isEnabled()
     form.submit()
@@ -693,6 +736,17 @@ def test_picker_has_no_preselection_and_start_waits_for_a_choice(console, monkey
     assert form.submit_button.isEnabled()
     form.set_profiles(PROFILES)  # a refresh keeps a still-usable choice
     assert form.profile.currentData() == 'claude-work'
+
+
+def test_a_daemon_restart_does_not_silently_drop_the_choice(console):
+    c = console()
+    form = c.form
+    form.set_profiles(PROFILES)
+    pick(form, 'claude-work')
+    form.set_profiles(None)  # 503 while the daemon restarts
+    assert form._profile_state == 'unavailable' and 'claude-work' in form.status.text() and 'cleared' in form.status.text()
+    form.set_profiles_failed('connection lost')
+    assert form._profile_state == 'loading' and not form.submit_button.isEnabled()
 
 
 def test_unusable_profiles_are_listed_with_reason_but_not_selectable(console):
@@ -706,76 +760,92 @@ def test_unusable_profiles_are_listed_with_reason_but_not_selectable(console):
     assert not enabled and 'cooling down' in text and '10 min' in text
     text, enabled = rows['old']
     assert not enabled and 'disabled' in text
-    form.profile.setCurrentIndex(form.profile.findData('old'))  # even if forced, the unusable id is still sent only by choice
+    form.profile.setCurrentIndex(form.profile.findData('old'))
+    assert not form.submit_button.isEnabled() or form.profile.currentData() == 'old'  # a forced index is still only a choice
     pick(form, 'claude-personal-ios')
     assert form.profile.currentData() == 'claude-personal-ios'
-    # a chosen profile that starts cooling down on refresh is dropped back to "choose", never replaced by another
+    # a chosen profile that starts cooling down on refresh drops back to "choose", never replaced by another
     form.set_profiles({'profiles': [{'id': 'claude-personal-ios', 'enabled': True, 'cooldown_remaining_seconds': 30}]})
     assert form.profile.currentData() is None and not form.submit_button.isEnabled()
 
 
 def test_chosen_profile_is_sent_in_the_post_and_confirmed(console):
-    c = console(send_script=[{'run_id': 'run-9', 'task_id': 't', 'state': 'queued', 'worktree_path': '/w'}])
+    c = console(profiles=PROFILES, send_script=[{'run_id': 'run-9', 'task_id': 't', 'state': 'queued', 'worktree_path': '/w'}])
     c.fill()
-    c.form.set_profiles(PROFILES)
     pick(c.form, 'claude-personal-ios')
     c.form.submit()
     spin(c.app, lambda: c.sent)
     endpoint, kwargs = c.sent[0]
     assert endpoint == '/api/v1/agent-runs' and json.loads(kwargs['body'])['profile'] == 'claude-personal-ios'
-    assert 'Claude account: claude-personal-ios' in c.confirms[0][1]
+    assert 'Claude account: claude-personal-ios (what you chose)' in c.confirms[0][1]
     spin(c.app, lambda: 'account claude-personal-ios' in c.form.status.text())
 
 
-def test_no_profile_key_when_the_daemon_offers_none(console):
-    c = console()
-    c.fill()
-    c.form.set_profiles(None)
-    c.form.submit()
-    spin(c.app, lambda: c.sent)
-    assert 'profile' not in json.loads(c.sent[0][1]['body'])
-
-
 def test_a_422_shows_the_daemons_reason_not_the_generic_text(console):
-    c = console(send_script=[DaemonHTTPError(422, reason='profile is cooling down')])
+    c = console(profiles=PROFILES, send_script=[DaemonHTTPError(422, reason='profile is disabled')])
     c.fill()
-    c.form.set_profiles(PROFILES)
     pick(c.form, 'claude-work')
     c.form.submit()
-    spin(c.app, lambda: 'profile is cooling down' in c.form.status.text())
+    spin(c.app, lambda: 'profile is disabled' in c.form.status.text())
     assert agent_form.REJECTED_TEXT not in c.form.status.text() and 'nothing was started' in c.form.status.text().lower()
 
 
+def test_status_and_problem_labels_are_plain_text(console):
+    from PySide6.QtCore import Qt
+    form = console().form
+    assert form.status.textFormat() == Qt.TextFormat.PlainText and form.problems.textFormat() == Qt.TextFormat.PlainText
+
+
 def test_control_center_composer_has_the_same_picker_and_gate(console):
-    c = console()
+    c = console(profiles=PROFILES)
     composer = c.window.control_center.composer
+    spin(c.app, lambda: composer._profile_state == 'loaded')  # fed through the runs_view wiring
     composer.prompt.setPlainText('do it')
     composer.repo.setCurrentText('/work/repo')
-    composer.set_profiles(PROFILES)
     assert composer.profile.currentData() is None and not composer.submit_button.isEnabled()
     pick(composer, 'claude-work')
     assert composer.submit_button.isEnabled()
 
 
-def test_poller_profile_feed_reaches_the_pickers(console):
+def test_poller_profile_signals_reach_both_pickers_through_the_wiring(console):
+    c = console(profiles=PROFILES)
+    composer = c.window.control_center.composer
+    spin(c.app, lambda: c.form._profile_state == 'loaded' and composer._profile_state == 'loaded')
+    poller = c.window.poller
+    poller.profiles_failed.emit('boom')  # the real signals, as the Poller thread would emit them
+    assert c.form._profile_state == 'loading' and composer._profile_state == 'loading'
+    poller.profiles_list.emit(None)
+    assert c.form._profile_state == 'unavailable' and composer._profile_state == 'unavailable'
+
+
+def test_poller_classifies_profile_answers(console):
     c = console()
-    seen = []
-    c.window.poller.profiles_list.connect(seen.append)
-    c.window.poller._poll_profiles()
-    assert seen == []  # the harness answers with a run snapshot: not a profiles list, so nothing is emitted
-    c.window.poller.fetch = lambda _s, endpoint: PROFILES
-    c.window.poller._poll_profiles()
-    assert seen == [PROFILES]
-    c.window.poller.fetch = lambda _s, endpoint: (_ for _ in ()).throw(DaemonHTTPError(404))
-    c.window.poller._poll_profiles()
-    assert seen[-1] is None
+    poller = c.window.poller
+    seen, failed = [], []
+    poller.profiles_list.connect(seen.append)
+    poller.profiles_failed.connect(failed.append)
+    poller.fetch = lambda _s, endpoint: PROFILES
+    poller._poll_profiles()
+    assert seen == [PROFILES] and poller._profiles_loaded
+    poller.fetch = lambda _s, endpoint: (_ for _ in ()).throw(DaemonHTTPError(503))
+    poller._poll_profiles()
+    assert seen[-1] is None and poller._profiles_loaded
+    poller.fetch = lambda _s, endpoint: {'run': {}}
+    poller._poll_profiles()
+    assert failed and not poller._profiles_loaded
 
 
-def test_agent_pane_shows_the_runs_profile_when_present(console):
+def test_agent_pane_shows_the_runs_profiles_from_the_real_shape(console):
     base = {'outcome': 'ok', 'summary_text': 's', 'tool_names': [], 'worktree': None}
     pane = agent_view.AgentDetailPane()
-    pane.set_detail(agent_view.sanitize_detail({**base, 'profile': 'claude-work'}))
+    one = {**base, 'tasks': [{'task_id': 't', 'profile_id': 'claude-work', 'spec': {'profile': 'x'}}]}
+    pane.set_detail(agent_view.sanitize_detail(one))
+    assert pane.profile.text() == 'Claude account: claude-work'
+    two = {**base, 'tasks': [{'profile_id': None, 'spec': {'profile': 'claude-personal'}}, {'profile_id': 'claude-work', 'spec': {}}]}
+    pane.set_detail(agent_view.sanitize_detail(two))
+    assert pane.profile.text() == 'Claude accounts: claude-personal, claude-work'
+    pane.set_detail(agent_view.sanitize_detail({**base, 'profile': 'claude-work'}))  # a top-level field is accepted too
     assert pane.profile.text() == 'Claude account: claude-work'
     pane.set_detail(agent_view.sanitize_detail(base))
     assert pane.profile.text() == ''
-    assert agent_view.sanitize_detail({**base, 'profile': 'bad id\n'})['profile'] is None
+    assert agent_view.sanitize_detail({**base, 'tasks': [{'profile_id': 'bad id\n'}]})['profiles'] == []

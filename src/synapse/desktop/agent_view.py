@@ -25,6 +25,21 @@ def clean(text, limit: int) -> str:
     return _CONTROL.sub("", text.replace("\r\n", "\n").replace("\r", "\n"))[:limit]
 
 
+def run_profiles(raw: dict) -> list[str]:
+    """Distinct account ids of a run: each task's claimed ``profile_id`` (else the requested ``spec.profile``) and a
+    top-level ``profile`` when the daemon returns one. Anything that is not a plain profile id is ignored."""
+    found = []
+    candidates = [raw.get("profile")]
+    for task in (raw.get("tasks") if isinstance(raw.get("tasks"), list) else [])[:50]:
+        if isinstance(task, dict):
+            spec = task.get("spec") if isinstance(task.get("spec"), dict) else {}
+            candidates.append(task.get("profile_id") if task.get("profile_id") is not None else spec.get("profile"))
+    for value in candidates:
+        if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", value) and value not in found:
+            found.append(value)
+    return found
+
+
 def sanitize_detail(raw) -> dict | None:
     """Validate and bound an agent detail response; None means 'not understood'."""
     if not isinstance(raw, dict):
@@ -44,9 +59,7 @@ def sanitize_detail(raw) -> dict | None:
         worktree = {"status": clean(worktree.get("status") or "", 200), "head": clean(worktree.get("head") or "", 80),
                     "diff_stat": clean(worktree.get("diff_stat") or "", MAX_DIFF_STAT),
                     "diff": diff[:MAX_DIFF], "truncated": bool(worktree.get("truncated", False)) or len(diff) > MAX_DIFF}
-    profile = raw.get("profile")  # top-level account id; absent on older daemons
-    profile = profile if isinstance(profile, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", profile) else None
-    return {"profile": profile, "outcome": None if outcome is None else clean(outcome, 80),
+    return {"profiles": run_profiles(raw), "outcome": None if outcome is None else clean(outcome, 80),
             "summary_text": None if summary is None else clean(summary, MAX_SUMMARY),
             "tool_names": [clean(t, 64) for t in tools[:MAX_TOOLS]], "tools_total": len(tools), "worktree": worktree}
 
@@ -148,7 +161,8 @@ class AgentDetailPane(QGroupBox):
 
     def set_detail(self, detail: dict):
         self.status.setText("Agent run details")
-        self.profile.setText("Claude account: " + detail["profile"] if detail.get("profile") else "")
+        accounts = detail.get("profiles") or []
+        self.profile.setText(("Claude account: " if len(accounts) == 1 else "Claude accounts: ") + ", ".join(accounts) if accounts else "")
         self.outcome.setText("Outcome: " + (detail["outcome"] or "not finished yet"))
         names = ", ".join(detail["tool_names"])
         extra = detail["tools_total"] - len(detail["tool_names"])

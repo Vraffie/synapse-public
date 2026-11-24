@@ -2,7 +2,9 @@
 
 Contract (POST /api/v1/agent-runs): body {repo, base_ref, prompt, allowed_tools, permission_mode, timeout_seconds,
 approval_step, profile?}. ``profile`` is the Claude account the operator chose for this run (ids come from
-GET /api/v1/profiles); it is omitted only when the daemon offers no profiles. There is never a preselected or fallback account. The form validates client-side what it can and never sends bypass/auto permission modes. The
+GET /api/v1/profiles). The picker has three states: loading (Start disabled), unavailable (an explicit 404/503: no
+``profile`` is sent and the daemon's default account is used, which the confirm summary says) and loaded (the
+operator must choose; nothing is preselected and there is never a fallback account). The form validates client-side what it can and never sends bypass/auto permission modes. The
 Idempotency-Key is generated per submission and reused while the very same payload is retried after a lost
 response; any edit that changes the payload is a new submission with a new key. Nothing here handles tokens
 (the Poller's transport loads the operator token) and nothing formats exception text.
@@ -40,6 +42,9 @@ REJECTED_TEXT = ("The daemon rejected the request (422). Either a value exceeds 
                  "timeout) or a tool is not allowed by the daemon's operator config; adjust the form and retry.")
 PROFILE_PROMPT = "Choose a Claude account…"
 PROFILE_REQUIRED = "Choose a Claude account for this run."
+PROFILE_LOADING = "Loading accounts…"
+PROFILE_UNAVAILABLE = "Not available on this daemon (the daemon's default account will be used)"
+DEFAULT_ACCOUNT_TEXT = "Claude account: daemon default (no account was chosen)"
 _PROFILE = re.compile(r"[A-Za-z0-9._-]{1,64}")  # the daemon's profile id pattern
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _CREDENTIAL_URL = re.compile(r"://[^/\s]*@")
@@ -126,7 +131,9 @@ def validate(fields: dict) -> tuple[dict | None, list[str]]:
         problems.append("Allow at least one tool.")
     profile = fields.get("profile")
     if profile is None:
-        if fields.get("profile_required"):
+        if fields.get("profile_state") == "loading":
+            problems.append("The Claude accounts are not loaded yet; wait for the list (or the connection) and retry.")
+        elif fields.get("profile_required"):
             problems.append(PROFILE_REQUIRED)
     elif not isinstance(profile, str) or _PROFILE.fullmatch(profile) is None:
         problems.append("Claude account must be 1-64 characters of letters, digits and . _ -")
@@ -163,7 +170,7 @@ def summary_text(payload: dict) -> str:
     prompt = payload["prompt"]
     shown = prompt if len(prompt) <= 400 else prompt[:400] + "..."
     lines = [f"Repository: {payload['repo']}", f"Base ref: {payload['base_ref']}",
-             *([f"Claude account: {payload['profile']}"] if payload.get("profile") else []),
+             f"Claude account: {payload['profile']} (what you chose)" if payload.get("profile") else DEFAULT_ACCOUNT_TEXT,
              f"Permission mode: {payload['permission_mode']}", f"Allowed tools: {', '.join(payload['allowed_tools'])}",
              f"Timeout: {payload['timeout_seconds']} s", f"Prompt ({len(prompt)} chars, sha256 {prompt_digest(prompt)[:16]}):", shown]
     risky = [t for t in payload["allowed_tools"] if t in ("Edit", "Write", "NotebookEdit", "Bash")]
@@ -228,7 +235,9 @@ class AgentRunForm(QWidget):
         self.repo.setCurrentText("")
         self.base_ref = QLineEdit("main")
         self.profile = QComboBox()
-        self._profile_rows = None  # None: the daemon offers no profiles (unavailable), so none is sent
+        self._profile_state = "loading"  # loading | unavailable | loaded
+        self._profile_rows = []
+        self._profile_notice = ""
         self._set_profile_items()
         self.prompt = self._make_prompt()
         self.tool_boxes = {}
@@ -258,13 +267,16 @@ class AgentRunForm(QWidget):
         self.submit_button = QPushButton("Start agent run…")
         self.problems = QLabel("")
         self.problems.setWordWrap(True)
+        self.problems.setTextFormat(Qt.TextFormat.PlainText)
         self.status = QLabel("Fill in the form to start an agent run.")
         self.status.setWordWrap(True)
+        self.status.setTextFormat(Qt.TextFormat.PlainText)
         self.tools_row = tools_row
         self._build_layout()
         self._last = None  # (body, key, correlation) of the submission awaiting its outcome
         self._pending = False
         self._connect_signals()
+        self._update_submit()
 
     def _make_prompt(self) -> QPlainTextEdit:
         """Hook: subclasses supply a richer prompt editor."""
@@ -299,12 +311,12 @@ class AgentRunForm(QWidget):
         self.profile.blockSignals(True)
         self.profile.clear()
         rows = self._profile_rows
-        if rows is None:
-            self.profile.addItem("Not available on this daemon", None)
+        if self._profile_state != "loaded":
+            self.profile.addItem(PROFILE_LOADING if self._profile_state == "loading" else PROFILE_UNAVAILABLE, None)
             self.profile.setEnabled(False)
         else:
             self.profile.setEnabled(True)
-            self.profile.addItem(PROFILE_PROMPT if rows else "No Claude accounts configured", None)
+            self.profile.addItem(PROFILE_PROMPT, None)
             for row in rows:
                 self.profile.addItem(profile_label(row), row["id"])
                 if not row["enabled"] or row["cooldown"] > 0:
@@ -316,16 +328,45 @@ class AgentRunForm(QWidget):
         self.profile.blockSignals(False)
 
     def set_profiles(self, raw):
-        """Feed the picker from GET /api/v1/profiles (raw answer) or None when the daemon cannot list them."""
-        self._profile_rows = None if raw is None else sanitize_profiles(raw)
+        """Feed the picker from GET /api/v1/profiles (raw answer). None, or an answer with no usable rows, is the
+        explicit 'unavailable' state (the daemon default account); anything not understood is a failed load."""
+        rows = None if raw is None else sanitize_profiles(raw)
+        if raw is not None and rows is None:
+            self.set_profiles_failed("the daemon's accounts answer was not understood")
+            return
+        chosen = self.profile.currentData()
+        self._clear_profile_notice()
+        if rows:
+            self._profile_state, self._profile_rows = "loaded", rows
+        else:
+            self._profile_state, self._profile_rows = "unavailable", []
+            if chosen is not None:
+                self._profile_notice = (f"The daemon no longer lists accounts: your choice '{chosen}' was cleared and the "
+                                        "daemon's default account would be used. Check before starting.")
+        self._set_profile_items()
+        self._update_submit()
+
+    def _clear_profile_notice(self):
+        if self._profile_notice and self.status.text() == self._profile_notice:
+            self.status.setText("Fill in the form to start an agent run.")
+        self._profile_notice = ""
+
+    def set_profiles_failed(self, reason: str = "the daemon could not be reached"):
+        """The accounts could not be loaded (not an explicit 404/503): back to loading, Start disabled, reason visible."""
+        self._clear_profile_notice()
+        self._profile_state, self._profile_rows = "loading", []
+        self._profile_notice = f"Claude accounts could not be loaded ({reason}); retrying. Start is disabled until they load."
         self._set_profile_items()
         self._update_submit()
 
     def _profile_required(self) -> bool:
-        return self._profile_rows is not None
+        return self._profile_state == "loaded"
 
     def _update_submit(self, *_):
-        self.submit_button.setEnabled(not self._pending and (not self._profile_required() or self.profile.currentData() is not None))
+        ready = self._profile_state == "unavailable" or (self._profile_state == "loaded" and self.profile.currentData() is not None)
+        self.submit_button.setEnabled(not self._pending and ready)
+        if not self._pending and self._profile_notice:
+            self.status.setText(self._profile_notice)
 
     def _connect_signals(self):
         self.profile.currentIndexChanged.connect(self._update_submit)
@@ -360,7 +401,8 @@ class AgentRunForm(QWidget):
         return {"repo": self.repo.currentText(), "base_ref": self.base_ref.text(), "prompt": self.prompt.toPlainText(),
                 "allowed_tools": [t for t, box in self.tool_boxes.items() if box.isChecked()],
                 "permission_mode": self.mode.currentText(), "timeout_seconds": self.timeout.value(), "approval_step": step,
-                "profile": self.profile.currentData(), "profile_required": self._profile_required()}
+                "profile": self.profile.currentData(), "profile_required": self._profile_required(),
+                "profile_state": self._profile_state}
 
     def build_submission(self) -> AgentSubmission | None:
         """Validate and return a submission, reusing the key only for a byte-identical retry; shows problems."""

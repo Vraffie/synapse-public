@@ -102,6 +102,23 @@ def _refusal_reason(response) -> str | None:
     return text or None
 
 
+def _run_profiles(result) -> list[str]:
+    """Distinct account ids of an agent-show answer: tasks[].profile_id (claimed) else tasks[].spec.profile
+    (requested), plus a top-level ``profile`` if the daemon returns one. Non-id values are ignored."""
+    if not isinstance(result, dict):
+        return []
+    values = [result.get("profile")]
+    for task in (result.get("tasks") if isinstance(result.get("tasks"), list) else [])[:50]:
+        if isinstance(task, dict):
+            spec = task.get("spec") if isinstance(task.get("spec"), dict) else {}
+            values.append(task.get("profile_id") if task.get("profile_id") is not None else spec.get("profile"))
+    found = []
+    for value in values:
+        if isinstance(value, str) and _PROFILE_ID.fullmatch(value) and value not in found:
+            found.append(value)
+    return found
+
+
 def _profile_id(value: str) -> str:
     if _PROFILE_ID.fullmatch(value) is None:
         raise argparse.ArgumentTypeError("profile ID must be 1-64 characters of [A-Za-z0-9._-]")
@@ -400,7 +417,8 @@ def _add_agent_parsers(commands) -> None:
     start.add_argument("--tool", action="append", dest="tools", help="allowed tool (repeatable; with --prompt-file)")
     start.add_argument("--profile", type=_profile_id,
                        help="Claude account profile for this run (see `agentctl profiles`); omitted: the daemon default. "
-                            "There is no fallback: a unknown, disabled or cooling-down profile is refused")
+                            "There is no fallback: an unknown or disabled profile is refused at start (HTTP 422); a profile in a "
+                            "cooldown is not refused at start, the task fails closed before spawning")
     start.add_argument("--permission-mode", default="acceptEdits", choices=("acceptEdits", "plan", "dontAsk", "manual"))
     start.add_argument("--timeout-seconds", type=float, default=600)
     start.add_argument("--approval-operation")
@@ -476,8 +494,8 @@ def _agent_command(args, parser) -> int:
                               idempotency_key=args.idempotency_key, correlation_id=args.correlation_id)
         elif args.command == "agent-show":
             result = _request(args.state_dir, "/api/v1/runs/" + quote(args.run_id, safe="") + "/agent")
-            if isinstance(result, dict) and isinstance(result.get("profile"), str):
-                print("profile: " + re.sub(r"[^\x20-\x7e]", "", result["profile"])[:64], file=sys.stderr)
+            for account in _run_profiles(result):
+                print("profile: " + account, file=sys.stderr)
         elif args.command == "agent-abandon":
             result = _request(args.state_dir, "/api/v1/runs/" + quote(args.run_id, safe="") + "/agent-abandon",
                               body=json.dumps({"expected_run_version": args.expected_run_version,

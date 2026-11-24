@@ -183,6 +183,8 @@ class RunsMixin:
         self.poller.agent_started.connect(self._agent_started)
         self.poller.profiles_list.connect(self.start_panel.agent_form.set_profiles)
         self.poller.profiles_list.connect(self.control_center.composer.set_profiles)
+        self.poller.profiles_failed.connect(self.start_panel.agent_form.set_profiles_failed)
+        self.poller.profiles_failed.connect(self.control_center.composer.set_profiles_failed)
         self.poller.agent_cancel_finished.connect(self._agent_cancel_finished)
         self.poller.agent_op_finished.connect(self._agent_op_finished)
         self.poller.agent_commit_done.connect(self._agent_commit_done)
