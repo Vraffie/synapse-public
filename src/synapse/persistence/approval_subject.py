@@ -55,6 +55,19 @@ def agent_subject(db: sqlite3.Connection, read_blob: BlobReader | None, run_id: 
             except Exception:
                 unavailable = True
         profile = {"profile": spec["profile_id"]} if spec.get("profile_id") else {}
+        if "repos" in spec:  # ADR 026 D5: multi-repository subject; no path or attempt HEAD
+            from synapse.persistence.repo_bindings import load_run_repos
+            bound = load_run_repos(db, run_id)
+            return {**profile, "kind": "agent_run_multi", "node_id": node,
+                    "repos": [{"repo_id": r["repo_id"], "access": r["access"],
+                               "baseline_ref": bound[r["repo_id"]].baseline_ref,
+                               "baseline_sha": bound[r["repo_id"]].baseline_sha} for r in spec["repos"]],
+                    "allowed_tools": spec["allowed_tools"][:MAX_SUBJECT_TOOLS],
+                    "allowed_tools_truncated": len(spec["allowed_tools"]) > MAX_SUBJECT_TOOLS,
+                    "permission_mode": spec["permission_mode"], "timeout_seconds": spec["timeout_seconds"],
+                    "prompt_bytes": spec["prompt_bytes"], "prompt_preview": preview,
+                    "prompt_preview_truncated": truncated, "prompt_unavailable": unavailable,
+                    "spec_sha256": candidate_sha256}
         return {**profile, "kind": "agent_run", "node_id": node, "repo": spec["repo"], "base_ref": spec["base_ref"],
                 "worktree_head": spec["worktree_head"], "allowed_tools": spec["allowed_tools"][:MAX_SUBJECT_TOOLS],
                 "allowed_tools_truncated": len(spec["allowed_tools"]) > MAX_SUBJECT_TOOLS,

@@ -96,6 +96,20 @@ The agent-runs API uses it for the per-run worktree.
 
 `WorktreeManager.commit` stages everything in a task's worktree and commits it onto the task's own branch with the same hardened host git as the other operations (hooks, filters, attributes and config guard). It refuses a nested repository (gitlink), any `.gitmodules` change and more than 1000 changed files, judged on the staged index; any refusal resets the index. The operator-facing action is `agent-worktree-commit` (see [agent runs](agent-runs.md#getting-the-edits-out-agent-worktree-commit)).
 
+## Multi-repository attempts (ADR 026, first slice)
+
+A multi-repository run gets one worktree per (task attempt, repository), created by `WorktreeManager.create_attempt` just before the attempt's single spawn:
+
+- Layout `<worktree_root>/<run_id>/<task_id>/<attempt_no>/<repo_id>`. The attempt directory is the agent's cwd and is not itself a worktree. Every level below the root is created one at a time (0700) and a symlink or foreign directory at any level is refused.
+- A write repository gets the local branch `synapse/<run_id>/<task_id>/<attempt_no>`; a read repository gets a detached checkout of the pinned baseline and no branch. Both always start from the run's pinned `baseline_sha`, never from a ref and never from a sibling task's result. A leftover branch of the same name is never adopted (the create fails).
+- **All or none.** Per-repository locks (the in-process lock plus the `flock` file) are taken in ascending `repo_id` order and held for the whole create. If any repository fails, every worktree and branch made by the call is removed and the error names the repository (`worktree_create_failed:<repo_id>`).
+- **Ref guard.** Every branch Synapse creates or deletes goes through one guard that refuses anything outside `refs/heads/synapse/`. Synapse never pushes, fetches, merges or touches the owner's checkout.
+- **Spawn-time recheck.** `attempt_tree_problem` re-reads each recorded tree: the path is the computed one and belongs to the bound repository (`worktree_mismatch`), HEAD is the pinned baseline (`head_moved`), the tree is clean (`worktree_dirty`).
+- **Host commit** (`commit_attempt`) of one write worktree, at attempt end. Same hardening as `commit`, plus the owner's rule: `status -z --untracked-files=all --ignored=matching` must show no ignored path (`ignored_path_present`: a `.gitignore` must never hide a file from the rule); every staged path (`diff --cached --raw -z --no-renames`) must match `**/*.xml` and be a plain relative path (`path_not_editable`), must not match the repository's `protected_paths` (`path_not_allowed`), and an added or modified entry must be mode `100644` (`mode_not_allowed`: no symlink, executable or gitlink); nothing untracked may remain after staging (`untracked_path_present`); every added or modified blob, read from the object store, must be well-formed XML (`xml_not_well_formed`, checked by `application/xml_wellformed.py`: stdlib expat, any `<!DOCTYPE`/`<!ENTITY`/other declaration refused before parsing, 8 MiB and depth 256 caps). The branch HEAD must still be the recorded `head_before` (`branch_moved`). A refusal resets the index and leaves the files as the agent left them. A clean tree is not an error: the result is `unchanged` (candidate = baseline, no commit).
+- **Never-spawned cleanup.** `remove_attempt_clean` removes an attempt's trees without `--force` when they are clean and still at the baseline (and deletes the attempt branch only while it still points at the baseline); a dirty or moved tree is kept and reported.
+
+`protected_paths` grammar: anchored, repository-relative globs; `*` and `?` match within one segment, a whole `**` segment matches any number of segments, and a pattern also protects everything below a directory it matches (`.github` protects `.github/ci.xml`). No character classes or negation. Protected paths only ever narrow the XML rule.
+
 ## Provider compatibility
 
 `git worktree add` writes a `.git` *file* (`gitdir: ...`), not a directory.

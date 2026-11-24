@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_database_lifecycle_holds_lock_and_closes_connection(tmp_path):
     path = tmp_path / "daemon.sqlite"
     with daemon_database(path, ROOT / "migrations") as connection:
-        assert connection.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,), (12,), (13,), (14,), (15,), (16,), (17,)]
+        assert connection.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,), (12,), (13,), (14,), (15,), (16,), (17,), (18,), (19,)]
         assert path.stat().st_mode & 0o077 == 0
         with pytest.raises(DaemonAlreadyRunning):
             with daemon_database(path, ROOT / "migrations"):
@@ -23,7 +23,7 @@ def test_database_lifecycle_holds_lock_and_closes_connection(tmp_path):
     with pytest.raises(sqlite3.ProgrammingError):
         connection.execute("SELECT 1")
     with daemon_database(path, ROOT / "migrations") as reopened:
-        assert reopened.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,), (12,), (13,), (14,), (15,), (16,), (17,)]
+        assert reopened.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,), (12,), (13,), (14,), (15,), (16,), (17,), (18,), (19,)]
 
 
 def test_migration_failure_releases_ownership(tmp_path):
@@ -35,7 +35,7 @@ def test_migration_failure_releases_ownership(tmp_path):
         with daemon_database(path, directory):
             pytest.fail("invalid migration succeeded")
     with daemon_database(path, ROOT / "migrations") as connection:
-        assert connection.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,), (12,), (13,), (14,), (15,), (16,), (17,)]
+        assert connection.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,), (12,), (13,), (14,), (15,), (16,), (17,), (18,), (19,)]
 
 
 def test_rejects_symlink_and_public_database(tmp_path):

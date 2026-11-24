@@ -43,6 +43,7 @@ from synapse.domain.workflow import State
 from synapse.infrastructure.artifact_blobs import ArtifactBlobStore
 from synapse.orchestration.mock_engine import MockWorkflowEngine, _RunInterrupted
 from synapse.orchestration.budget_enforcement import agent_budget_check, bound_policy_identity, write_budget_refusal
+from synapse.orchestration.evidence_verifier import EVIDENCE_VERIFIER_ID
 from synapse.orchestration.review_independence import (
     REVIEW_VERIFIER_ID, ReviewGate, ReviewNode, ReviewRefused, ReviewTicket, record_review_refusal,
     record_review_verdict, review_context)
@@ -50,6 +51,8 @@ from synapse.persistence.agent_tasks import spec_hash
 from synapse.persistence.artifact_store import publish_artifact
 from synapse.persistence.attempt_resume import mark_spawn_begun
 from synapse.persistence.mock_execution_store import record_verification, set_attempt
+from synapse.persistence.repo_bindings import (
+    AttemptWorktree, commit_intent, commit_result, load_attempt_worktrees, load_run_repos, record_attempt_worktrees)
 from synapse.persistence.run_store import write_run_transition
 from synapse.persistence.state_store import StateConflict
 from synapse.providers.claude_cli import ClaudeCliProfile, ClaudeCliProvider
@@ -170,6 +173,9 @@ class AgentProviderRouter:
             if provider is None:
                 provider = self._providers[key] = self._build(*key)
             sandbox = self._codex_sandbox.get(id(provider))
+            if sandbox is not None and request.input.get("workspace") is not None:
+                self.start_refusals[request.task_id] = "multi_repo_codex_unsupported"
+                raise ValueError("multi-repository attempts are claude-only in this slice")
             if sandbox is not None:
                 await self._codex_version_gate(provider, sandbox, request)
             handle = await provider.start(request)
@@ -253,7 +259,8 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                  profile_limits_check: Callable[[Mapping[str, Any]], str | None] | None = None,
                  raw_blobs: ArtifactBlobStore | None = None,
                  routing_dry_run: RoutingDryRunConfig | None = RoutingDryRunConfig(),
-                 review_nodes: Mapping[str, ReviewNode] | None = None):
+                 review_nodes: Mapping[str, ReviewNode] | None = None,
+                 workspaces: Any = None):
         # A gated task spends one attempt on the approval wait (see AGENT_MAX_ATTEMPTS).
         super().__init__(connection, router, blobs, verify, verifier_id=verifier_id,
                          max_concurrency=max_concurrency, max_attempts=AGENT_MAX_ATTEMPTS,
@@ -268,6 +275,9 @@ class AgentWorkflowEngine(MockWorkflowEngine):
         self.raw_blobs = raw_blobs if raw_blobs is not None else blobs.with_max_bytes(_PROVIDER_OUTPUT_CAP)
         # Independent review enforcement (ADR 025); None keeps the pre-review behaviour for every task.
         self._reviews = ReviewGate(connection, blobs, review_nodes, specs) if review_nodes else None
+        # Multi-repository attempts (ADR 026): blocking create/discard/commit over the worktree manager, called in a
+        # worker thread. None refuses every workspace task before any spawn (multi_repo_unavailable).
+        self._workspaces = workspaces
 
     def _verifier_id_for(self, task_id: str) -> str:
         """A pluggable verifier may name itself per task (e.g. evidence for opted-in nodes only)."""
@@ -358,6 +368,91 @@ class AgentWorkflowEngine(MockWorkflowEngine):
 
     def _retryable(self, attempt_count: int) -> bool:
         return False
+
+    async def _prepare_workspace(self, run_id: str, task_id: str, attempt_id: str, attempt_no: int,
+                                 spec: Mapping[str, Any]) -> tuple[str | None, tuple[str, list[AttemptWorktree]] | None]:
+        """Create every worktree of this attempt (all or none) and record them, before the single spawn.
+
+        Returns (refusal reason, None) or (None, (attempt dir, trees)). Every declared repository must be bound to the
+        run (and a write one to this task); each tree is cut from the pinned baseline SHA. After the rows are
+        recorded, the spawn-time recheck (ADR 026 D4 step 2) re-reads each row: path, owning repository, HEAD equal
+        to the pinned baseline, clean (``worktree_mismatch``/``head_moved``/``worktree_dirty``). If the rows cannot
+        be recorded the trees are discarded and nothing is spawned.
+        """
+        if self._workspaces is None:
+            return "multi_repo_unavailable", None
+        bindings = load_run_repos(self.db, run_id)
+        repos = spec["repos"]
+        for r in repos:
+            b = bindings.get(r["repo_id"])
+            if b is None or (r["access"] == "write" and b.writer_task_id != task_id):
+                return "repo_binding_mismatch", None
+        try:
+            root, trees = await asyncio.to_thread(self._workspaces.prepare, run_id, task_id, attempt_no, repos, bindings)
+        except Exception as exc:
+            failed = getattr(exc, "repo_id", None)
+            _LOG.warning("attempt worktrees could not be created for task %s", task_id)
+            return ("worktree_create_failed:%s" % failed) if isinstance(failed, str) else "worktree_create_failed", None
+        try:
+            with self._transaction():
+                self._check_running(run_id)
+                record_attempt_worktrees(self.db, attempt_id, trees)
+        except BaseException as exc:
+            try:
+                await asyncio.shield(asyncio.to_thread(self._workspaces.discard, run_id, task_id, attempt_no, repos,
+                                                       bindings))
+            except Exception:
+                _LOG.warning("unrecorded attempt worktrees could not be removed for task %s", task_id)
+            if isinstance(exc, (_RunInterrupted, asyncio.CancelledError)) or not isinstance(exc, Exception):
+                raise
+            _LOG.exception("Could not record attempt worktrees for task %s", task_id)
+            return "worktree_not_recorded", None
+        recorded = load_attempt_worktrees(self.db, attempt_id)
+        try:
+            problem = await asyncio.to_thread(self._workspaces.recheck, run_id, task_id, attempt_no,
+                                              list(recorded.values()), bindings)
+        except Exception:
+            _LOG.warning("spawn-time worktree recheck failed for task %s", task_id)
+            problem = "worktree_mismatch"
+        if problem is not None:
+            return problem, None
+        return None, (root, sorted(recorded.values(), key=lambda t: t.repo_id))
+
+    async def _commit_workspace(self, run_id: str, task_id: str, attempt_id: str, attempt_no: int,
+                                trees: list[AttemptWorktree]) -> str | None:
+        """Host-side commit of each write-access worktree, ascending repo_id, intent before and result after.
+
+        Returns None when every write repository is ``done`` or ``unchanged`` (nothing to commit: candidate ==
+        baseline, no git commit), else ``commit_failed:<repo_id>:<reason>`` for the first failure; repositories
+        after it are not attempted and earlier commits stay on their Synapse branches as evidence. A crash between
+        an intent and its result leaves the intent for startup recovery (never replayed blindly).
+        """
+        bindings = load_run_repos(self.db, run_id)
+        message = "synapse: run %s task %s attempt %d" % (run_id, task_id, attempt_no)
+        for tree in sorted((t for t in trees if t.access == "write"), key=lambda t: t.repo_id):
+            binding = bindings.get(tree.repo_id)
+            if binding is None:
+                return "commit_failed:%s:not_bound" % tree.repo_id
+            with self._transaction():
+                self._check_running(run_id)
+                commit_intent(self.db, attempt_id, tree.repo_id, tree.baseline_sha)
+            try:
+                result = await asyncio.to_thread(self._workspaces.commit, run_id, task_id, attempt_no, tree.repo_id,
+                                                 binding, message, tree.baseline_sha)
+            except Exception as exc:
+                reason = getattr(exc, "reason", None)
+                reason = reason if isinstance(reason, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", reason) else "git_error"
+                with self._transaction():
+                    commit_result(self.db, attempt_id, tree.repo_id, tree.baseline_sha, state="failed", reason=reason)
+                return "commit_failed:%s:%s" % (tree.repo_id, reason)
+            with self._transaction():
+                if result["committed"]:
+                    commit_result(self.db, attempt_id, tree.repo_id, tree.baseline_sha, state="done",
+                                  candidate_sha=result["head"], paths=result["paths"])
+                else:
+                    commit_result(self.db, attempt_id, tree.repo_id, tree.baseline_sha, state="unchanged",
+                                  candidate_sha=tree.baseline_sha, paths=0)
+        return None
 
     def _block_for_budget(self, run_id: str, task_id: str, version: int, profile_id: str, denied) -> None:
         """A budget refusal at claim or park: a breach fails the READY task, other reasons block it; nothing is
@@ -596,7 +691,10 @@ class AgentWorkflowEngine(MockWorkflowEngine):
         try:
             self._check_running(run_id)
             problem = self._profile_problem(spec)
-            if problem is None and (spec.get("approval_step") is not None or spec.get("worktree_head") is not None):
+            workspace_task = "repos" in spec
+            prepared: tuple[str, list[AttemptWorktree]] | None = None
+            if problem is None and not workspace_task and (
+                    spec.get("approval_step") is not None or spec.get("worktree_head") is not None):
                 # A gated task must carry a recorded HEAD; a missing one fails closed (never skips the recheck).
                 problem = (await self._worktree_problem(run_id, task_id, spec["worktree"], spec["worktree_head"])
                            if isinstance(spec.get("worktree_head"), str) else "worktree_head_missing")
@@ -618,15 +716,28 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                 except Exception:
                     _LOG.exception("Could not record the profile selection for task %s", task_id)
                     problem = "profile_selection_not_recorded"
+            if problem is None and workspace_task and self._verifier_id_for(task_id) == EVIDENCE_VERIFIER_ID:
+                # ADR 025 evidence is per worktree; per-repository evidence for multi-repository attempts is not in
+                # this slice, so such a node is refused before anything is created or spawned (never unchecked).
+                problem = "evidence_multi_repo_unsupported"
+            if problem is None and workspace_task:
+                # All of this attempt's worktrees exist (and are recorded) before the spawn, or none do. This is also
+                # the gated task's recheck: each tree is a fresh checkout of the pinned baseline the approval bound.
+                problem, prepared = await self._prepare_workspace(run_id, task_id, attempt_id, attempt_no, spec)
             if problem is not None:
                 terminal = ProviderEvent("failed", problem)  # refused before any spawn
             else:
                 prompt = self._prompts(task_id).decode("utf-8")
                 if ticket is not None:
                     prompt += review_context(ticket)  # the verified candidate only, never the author transcript
-                request = ExecutionRequest(profile_id, task_id, {
-                    "prompt": prompt, "worktree": spec["worktree"],
-                    "timeout_seconds": spec["timeout_seconds"], "max_output_bytes": _PROVIDER_OUTPUT_CAP})
+                payload = {"prompt": prompt, "worktree": spec.get("worktree"),
+                           "timeout_seconds": spec["timeout_seconds"], "max_output_bytes": _PROVIDER_OUTPUT_CAP}
+                if prepared is not None:
+                    # One process for the whole attempt: cwd is the attempt directory and the sandbox mounts exactly
+                    # the declared worktrees (read-access ones read-only).
+                    payload["worktree"] = prepared[0]
+                    payload["workspace"] = [{"path": t.path, "access": t.access} for t in prepared[1]]
+                request = ExecutionRequest(profile_id, task_id, payload)
                 # ADR 024: from this commit on the attempt MAY have run. Without it, startup recovery may prove it
                 # never spawned and re-queue it. Nothing below may reach the provider unless this row is durable.
                 with self._transaction():
@@ -650,6 +761,12 @@ class AgentWorkflowEngine(MockWorkflowEngine):
             if terminal is None:
                 terminal = ProviderEvent("unknown", "no_terminal_event")
             outcome, detail = terminal.kind, terminal.text
+            if outcome == "succeeded" and prepared is not None:
+                # Host commit at attempt end (owner decision): local Synapse branches only, never pushed. Failed,
+                # cancelled and unknown attempts are never committed.
+                failure = await self._commit_workspace(run_id, task_id, attempt_id, attempt_no, prepared[1])
+                if failure is not None:
+                    outcome, detail = "failed", failure
             usage = None
             handle = self.router.handles.get(task_id)
             if handle is not None:

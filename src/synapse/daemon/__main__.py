@@ -29,12 +29,13 @@ from synapse.persistence import audit_chain
 from synapse.persistence.backup import BackupError, _check_schema, code_schema_version
 from synapse.persistence.agent_tasks import AGENT_PROFILE
 from synapse.persistence.budget_binding import BudgetPolicyError, load_budget_policy
-from synapse.daemon.agent_config import AgentConfigError, load_agent_config
+from synapse.daemon.agent_config import AgentConfigError, load_agent_config, registry_sha256
 from synapse.daemon.agent_profiles import build_registry, load_agent_profiles, sync_profiles
 from synapse.infrastructure.spawn_journal import SpawnJournal
 from synapse.daemon.agent_runtime import AgentRuntime
 from synapse.daemon.same_user_gate import ENV as ALLOW_ENV, SameUserAgentsRefused, check_same_user_agents, record_acknowledgement
 from synapse.daemon.agent_service import AgentRunService, worktree_checker
+from synapse.daemon.multi_repo import AttemptWorkspaces, RepoRegistry, resolve_commit_intents
 from synapse.infrastructure.worktrees import WorktreeManager
 from synapse.providers.credential_sweep import sweep_startup
 from synapse.daemon.mock_runtime import MockRuntime
@@ -278,6 +279,10 @@ def run(state_dir: Path, migrations: Path, *, enable_mock_mcp_ipc: bool = False,
                 worktrees = WorktreeManager(agent_config.repos, agent_config.worktree_root)
             except (ValueError, OSError) as exc:
                 raise AgentConfigError("invalid repos/worktree_root: %s" % exc) from exc
+            if agent_config.registry:  # ADR 026 D1: what the operator's registry was at this start (ids, no paths)
+                logging.getLogger(__name__).info(
+                    "repository registry: %d entries, registry_sha256=%s", len(agent_config.registry),
+                    registry_sha256(agent_config.registry))
         # Fail before recovering or mutating state if activation is malformed.
         if socket_fd is not None:
             with _inherited_socket(socket_fd, state_dir / "agentd.sock", socket_identity):
@@ -298,6 +303,15 @@ def run(state_dir: Path, migrations: Path, *, enable_mock_mcp_ipc: bool = False,
             token = _operator_token(dir_fd)
             if acknowledged:
                 record_acknowledgement(connection, codex_unsandboxed=codex_unsandboxed)
+            if agent_config is not None and agent_config.registry:
+                # ADR 026 D1: the startup audit event records which registry was loaded (hash and ids, no paths).
+                import json as _json
+                from datetime import datetime as _dt, timezone as _tz
+                audit_chain.append_audit(
+                    connection, "daemon:startup", "agent.repo_registry_loaded", "agent-runtime", "allowed", None,
+                    _json.dumps({"registry_sha256": registry_sha256(agent_config.registry),
+                                 "repo_ids": sorted(e.id for e in agent_config.registry)}, sort_keys=True),
+                    _dt.now(_tz.utc).isoformat())
             try:
                 os.mkdir("artifacts", 0o700, dir_fd=dir_fd)
             except FileExistsError:
@@ -318,11 +332,14 @@ def run(state_dir: Path, migrations: Path, *, enable_mock_mcp_ipc: bool = False,
                 approval_policy=None if agent_config is None else agent_config.approval_policy,
                 worktree_check=None if worktrees is None else worktree_checker(worktrees),
                 budget_policy=budget_policy, registry=profile_registry,
-                spawn_journal=SpawnJournal(state_dir / "spawn-journal"))
+                spawn_journal=SpawnJournal(state_dir / "spawn-journal"),
+                workspaces=None if worktrees is None else AttemptWorkspaces(worktrees),
+                commit_recovery=lambda db: resolve_commit_intents(db, worktrees))
             agent_runtime.recover_interrupted()
             if profile_registry is not None:
                 sync_profiles(connection, profile_registry)
-            agent_service = AgentRunService(connection, agent_runtime, worktrees, profile_registry)
+            agent_service = AgentRunService(connection, agent_runtime, worktrees, profile_registry,
+                                            RepoRegistry(() if agent_config is None else agent_config.registry))
             def resume_parked():
                 mock_runtime.resume_parked()
                 agent_runtime.resume_parked()
