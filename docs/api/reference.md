@@ -2720,6 +2720,7 @@ Success (or idempotent replay of an earlier command).
   "run_state": "string",
   "cancellation_requested": false,
   "attempts_resumed": 1,
+  "profile": "string",
   "outcome": "string",
   "summary_text": "string",
   "tool_names": [

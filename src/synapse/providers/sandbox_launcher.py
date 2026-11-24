@@ -165,7 +165,8 @@ def _root_links(root: str = "/") -> list[str]:
 def build_bwrap_argv(bwrap: str, *, worktree: str, scratch: str, executable: str,
                      inner: Sequence[str], forbidden: Sequence[str] = (),
                      extra_ro_dirs: Sequence[str] = (), host_root: str = "/",
-                     no_ancestor: Sequence[str] = ()) -> list[str]:
+                     no_ancestor: Sequence[str] = (),
+                     ro_fds: Sequence[tuple[int, str]] = ()) -> list[str]:
     """Wrap `inner` (argv[0] is `executable`) in bwrap. Pure: no filesystem writes, no env.
 
     Writable: only `worktree` and `scratch` (both at their host paths, so the worktree's
@@ -179,6 +180,11 @@ def build_bwrap_argv(bwrap: str, *, worktree: str, scratch: str, executable: str
     them. The executable is a single-file mount but must still not be, lie under or contain a
     forbidden path (a launcher stored in a credential dir is refused).
     Secrets travel via the process environment, never this argv (it is visible in /proc).
+    `ro_fds` are ``(open O_PATH descriptor, destination inside scratch)`` single-file read-only binds
+    (``--ro-bind-fd``) placed on top of the scratch mount: the one deliberate exception to `forbidden` (the active
+    profile's credentials file, which the child must be able to read). Binding the descriptor, not a path, means a
+    path swapped after the caller's checks is not what gets mounted. The caller passes the descriptor to bwrap
+    (``pass_fds``). The destination must lie inside `scratch`; nothing else of the source's directory is mounted.
     """
     def _contains(outer: str, inner_: str) -> bool:
         return inner_ == outer or inner_.startswith(outer.rstrip("/") + "/")
@@ -203,8 +209,14 @@ def build_bwrap_argv(bwrap: str, *, worktree: str, scratch: str, executable: str
     ]
     for path in extra_ro_dirs:
         argv += ["--ro-bind", path, path]
+    for fd, dest in ro_fds:
+        if (type(fd) is not int or fd < 0 or not dest.startswith(scratch.rstrip("/") + "/")
+                or _contains(worktree, dest) or os.path.normpath(dest) != dest):
+            raise SandboxUnavailable("a sandbox file bind must target the scratch directory")
     argv += ["--ro-bind", executable, executable, "--bind", scratch, scratch,
              "--bind", worktree, worktree]
+    for fd, dest in ro_fds:
+        argv += ["--ro-bind-fd", str(fd), dest]
     for secret in git_secret_masks(worktree, extra_ro_dirs):  # after the binds so they sit on top
         # --dev-bind, not --ro-bind/--remount-ro: both add nodev, which makes the char device unopenable
         # (EACCES). Writes land in /dev/null and the mount point cannot be unlinked or renamed (EBUSY).
