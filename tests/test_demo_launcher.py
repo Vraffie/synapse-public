@@ -72,8 +72,22 @@ def test_no_approve_wait_stops_at_the_gate_and_removes_state():
     wait_gone(state_dir(out))
 
 
+def start_with_ctrl_c_enabled(*args):
+    """Start the demo with SIGINT at its default disposition, as an interactive terminal gives it.
+
+    An ignored SIGINT survives exec, and Python then never installs its KeyboardInterrupt handler. Test runners started
+    in the background of a non-interactive shell (`cmd &`, nohup, some agent harnesses) ignore SIGINT, so the demo
+    would inherit that, ignore the test's Ctrl+C, finish the run and exit 0. A handled signal is reset to the default
+    on exec, so installing one here for the duration of the spawn gives the child a default SIGINT either way."""
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        return start(*args)
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
 def test_ctrl_c_cleans_up_daemon_and_state():
-    proc = start("--headless", "--pace", "2")
+    proc = start_with_ctrl_c_enabled("--headless", "--pace", "2")
     seen = ""
     while "started: run" not in seen:
         line = proc.stdout.readline()
