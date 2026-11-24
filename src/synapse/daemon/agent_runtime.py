@@ -401,7 +401,8 @@ class AgentRuntime:
                 max_concurrency=self._max_concurrency,
                 approval_requester=DaemonApprovalRequester(self.db) if gates else None,
                 worktree_check=self._worktree_check, profile_check=self._profile_problem,
-                profile_limits_check=self._profile_limits_problem, workspaces=self._workspaces)
+                profile_limits_check=self._profile_limits_problem, workspaces=self._workspaces,
+                workspace_sandboxed=bool(getattr(self.profile, "sandbox", False)))
             self._engine = engine
             scenarios = {t: ("agent",) for t in task_specs}
             while True:

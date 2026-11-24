@@ -20,7 +20,7 @@ from synapse.providers.sandbox_launcher import find_bwrap
 MAX_CONFIG_BYTES = 64 * 1024
 _REQUIRED = {"executable", "allowed_tools", "enabled"}
 _OPTIONAL = {"max_timeout_seconds", "repos", "worktree_root", "require_approval",
-             "require_approval_for_modes", "require_approval_for_tools", "sandbox"}
+             "require_approval_for_modes", "require_approval_for_tools", "sandbox", "allow_multi_repo_unsandboxed"}
 MAX_REPOS = 32
 MAX_REGISTRY_ENTRIES = 16  # object entries (multi-repository registry); the candidate manifest's repository limit
 MAX_BASELINE_REFS = 16
@@ -99,6 +99,7 @@ class AgentConfig:
     worktree_root: str | None = None
     approval_policy: ApprovalPolicy = ApprovalPolicy()
     registry: tuple[RepoEntry, ...] = ()
+    allow_multi_repo_unsandboxed: bool = False  # explicit operator waiver; default: multi-repo runs need the sandbox
 
 
 def _abs_path(value, what: str) -> str:
@@ -231,7 +232,7 @@ def load_agent_config(path: Path, state_dir: Path) -> AgentConfig:
     if not isinstance(data, dict) or not _REQUIRED <= set(data) <= _REQUIRED | _OPTIONAL:
         raise AgentConfigError("config must contain executable, allowed_tools, enabled and only the optional keys "
                                "max_timeout_seconds, repos, worktree_root, require_approval, require_approval_for_modes, "
-                               "require_approval_for_tools, sandbox")
+                               "require_approval_for_tools, sandbox, allow_multi_repo_unsandboxed")
     tools = data["allowed_tools"]
     if not isinstance(tools, list) or any(not isinstance(t, str) for t in tools):
         raise AgentConfigError("allowed_tools must be a list of strings")
@@ -256,4 +257,7 @@ def load_agent_config(path: Path, state_dir: Path) -> AgentConfig:
         raise AgentConfigError("executable does not exist or is not executable")
     if profile.enabled and profile.sandbox and find_bwrap() is None:
         raise AgentConfigError("sandbox is requested but bwrap is not installed (no unsandboxed fallback)")
-    return AgentConfig(profile, repos, root, _approval_policy(data, profile), registry)
+    waiver = data.get("allow_multi_repo_unsandboxed", False)
+    if not isinstance(waiver, bool):
+        raise AgentConfigError("allow_multi_repo_unsandboxed must be a boolean")
+    return AgentConfig(profile, repos, root, _approval_policy(data, profile), registry, waiver)

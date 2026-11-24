@@ -466,15 +466,15 @@ def test_registry_ids_unique_and_paths_unique(cfg_world):
         load([a, {"id": "x", "path": a}])
 
 
-# ------------------------------------------------------------------------------------------------ migration 0019
-def test_migration_0019_upgrade_keeps_data_and_tables_are_insert_only(tmp_path):
+# ------------------------------------------------------------------------------------------------ migration 0018
+def test_migration_0018_upgrade_keeps_data_and_tables_are_insert_only(tmp_path):
     db = open_database(tmp_path / "u.db")
     try:
-        applied = apply_migrations(db, ROOT / "migrations", limit=18)
-        assert applied[-1] == 18
+        applied = apply_migrations(db, ROOT / "migrations", limit=17)
+        assert applied[-1] == 17
         db.execute("INSERT INTO audit_entries(principal, action, resource, decision, details_json, created_at) "
                    "VALUES ('op','read','run','allowed','{}','now')")
-        assert apply_migrations(db, ROOT / "migrations") == [19]
+        assert apply_migrations(db, ROOT / "migrations") == [18]
         assert db.execute("SELECT principal FROM audit_entries").fetchall() == [("op",)]
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert {"run_repo_bindings", "attempt_worktrees", "attempt_repo_commits"} <= tables
@@ -594,6 +594,7 @@ class World:
                                         git_repos=tuple(self.repos.values()))
         self.journal = self.state / "spawn-journal"
         self.workspaces = workspaces_factory(self.manager)
+        self.workspaces.allow_unsandboxed = True  # the fake CLI runs without bwrap here; see the sandbox test
         self.runtime = self.new_runtime(self.db)
         self.service = AgentRunService(self.db, self.runtime, self.manager, None, RepoRegistry(self.entries))
 
@@ -828,10 +829,139 @@ def test_unrecorded_worktrees_are_discarded_and_never_spawned(world, monkeypatch
         assert git(path, "worktree", "list").count("\n") == 1
 
 
-def test_workspace_task_without_hooks_is_refused_before_spawn(world):
-    world.runtime._workspaces = None
-    world.start(world.request([world.task()]))
+def test_workspace_task_without_hooks_is_refused_before_spawn(world, monkeypatch):
+    monkeypatch.setattr(world.service.runtime, "_workspaces", None)
+    world.service.runtime.profile = world.profile.__class__(**{**{f: getattr(world.profile, f) for f in (
+        "executable", "allowed_tools", "state_dir", "enabled", "term_grace_seconds", "permission_mode", "git_repos")},
+        "sandbox": False})
+    hooks = AttemptWorkspaces(world.manager, allow_unsandboxed=True)
+    monkeypatch.setattr(world.service, "runtime", world.runtime)
+    # the service passes (hooks present at validation), the engine then finds none: refused before any spawn
+    world.runtime._workspaces = hooks
+
+    async def go():
+        result = await world.service.start("k", world.request([world.task()]))
+        return result
+    real_launch = world.runtime._launch
+
+    def launch(run_id):
+        world.runtime._workspaces = None
+        real_launch(run_id)
+    monkeypatch.setattr(world.runtime, "_launch", launch)
+
+    async def run():
+        await go()
+        await asyncio.wait_for(world.runtime._active, 60)
+    asyncio.run(run())
     assert world.summary_detail() == ["multi_repo_unavailable"] and world.spawns() == []
+
+
+def test_multi_repo_runs_need_the_sandbox_unless_the_operator_waives_it(world):
+    world.workspaces.allow_unsandboxed = False  # profile sandbox is off in this world
+    with pytest.raises(AgentRunError, match="multi_repo_requires_sandbox"):
+        world.start(world.request([world.task()]))
+    assert world.db.execute("SELECT count(*) FROM runs").fetchone() == (0,)
+    # the engine refuses on its own too (a run created while waived, waiver withdrawn before the attempt)
+    world.workspaces.allow_unsandboxed = True
+    real_launch = world.runtime._launch
+
+    def launch(run_id):
+        world.workspaces.allow_unsandboxed = False
+        real_launch(run_id)
+    world.runtime._launch = launch
+    world.start(world.request([world.task()]), key="k2")
+    assert world.summary_detail() == ["multi_repo_requires_sandbox"] and world.spawns() == []
+
+
+def test_config_waiver_is_a_strict_boolean(cfg_world, tmp_path):
+    load, a, _ = cfg_world
+    path = tmp_path / "cfg.json"
+    load([a])
+    data = json.loads(path.read_text())
+    for value, ok in ((True, True), (False, True), ("yes", False)):
+        path.write_text(json.dumps({**data, "allow_multi_repo_unsandboxed": value}))
+        path.chmod(0o600)
+        if ok:
+            assert load_agent_config(path, tmp_path / "state").allow_multi_repo_unsandboxed is value
+        else:
+            with pytest.raises(AgentConfigError):
+                load_agent_config(path, tmp_path / "state")
+
+
+def test_lock_order_is_by_repository_path_not_repo_id(tmp_path):
+    """Bindings outlive registry edits: run 1 binds A->p1, B->p2 and run 2 binds A->p2, B->p1. Locking by repo_id
+    would take p1 then p2 in run 1 and p2 then p1 in run 2 (deadlock); locking by path is one global order."""
+    p1, p2 = make_repo(tmp_path / "p1"), make_repo(tmp_path / "p2")
+    mgr = WorktreeManager([p1, p2], str((tmp_path / "wt").resolve()))
+    order = []
+    real = WorktreeManager._lock
+
+    def spy(self, repo):
+        order.append(repo)
+        return real(self, repo)
+    try:
+        WorktreeManager._lock = spy
+        mgr.create_attempt("run1", "t", 1, [AttemptRepo("A", p1, head(p1), "write"), AttemptRepo("B", p2, head(p2), "write")])
+        first, order[:] = list(order), []
+        mgr.create_attempt("run2", "t", 1, [AttemptRepo("A", p2, head(p2), "write"), AttemptRepo("B", p1, head(p1), "write")])
+        assert first == order == sorted([p1, p2])
+    finally:
+        WorktreeManager._lock = real
+    errors = []
+
+    def go(run, pairs):
+        try:
+            for n in range(2, 6):
+                mgr.create_attempt(run, "t", n, [AttemptRepo(rid, path, head(path), "write") for rid, path in pairs])
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+    threads = [threading.Thread(target=go, args=("run1", [("A", p1), ("B", p2)])),
+               threading.Thread(target=go, args=("run2", [("A", p2), ("B", p1)]))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    assert not any(t.is_alive() for t in threads) and errors == []
+
+
+def test_recovery_never_calls_a_landed_but_rule_breaking_commit_done(tmp_path):
+    w, image = crash_world(tmp_path, "commit_before_git")
+    try:
+        result = w.start(w.request([w.task(prompt={"writes": {"portfolio": {"config.xml": "<p/>"}}})]))
+        run_id, task_id = result.response["run_id"], result.response["tasks"][0]["task_id"]
+        tree = os.path.join(w.root, run_id, task_id, "1", "portfolio")
+        branch = "synapse/%s/%s/1" % (run_id, task_id)
+        base = head(w.repos["portfolio"], "main")
+        # what a same-uid agent could leave: exactly one commit on head_before, index == that tree, adding a script
+        git(w.repos["portfolio"], "update-ref", "refs/heads/" + branch, base)
+        git(tree, "reset", "-q", "--hard", base)
+        Path(tree, "evil.sh").write_text("#!/bin/sh\nid\n")
+        os.chmod(os.path.join(tree, "evil.sh"), 0o755)
+        git(tree, "add", "-A")
+        git(tree, "commit", "-q", "-m", "x")
+        db = open_database(image)
+        try:
+            w.new_runtime(db).recover_interrupted()
+            assert w.commits(db)[-1] == ("portfolio", "unknown", "unverifiable")
+        finally:
+            db.close()
+    finally:
+        w.close()
+
+
+def test_a_failure_after_the_branch_moved_is_never_recorded_failed(world, monkeypatch):
+    real = WorktreeManager.commit_attempt
+
+    def landed_then_raise(self, *a, **k):
+        out = real(self, *a, **k)
+        if out["committed"]:  # the branch moved, then a later step failed
+            raise WorktreeError("post-commit step failed")
+        return out
+    monkeypatch.setattr(WorktreeManager, "commit_attempt", landed_then_raise)
+    world.start(world.request([world.task(prompt={"writes": {"portfolio": {"config.xml": "<p/>"}}})]))
+    assert world.commits() == [("portfolio", "intent", None), ("portfolio", "done", None),
+                               ("product-config", "intent", None), ("product-config", "unchanged", None)]
+    assert world.states() == (["succeeded"], {"edit": "completed"})
 
 
 def test_runtime_start_refuses_workspace_specs_without_bindings(world):
@@ -925,7 +1055,7 @@ def test_crash_before_spawn_requeues_a_new_attempt_with_fresh_worktrees(tmp_path
                 w.manager.create_attempt(run_id, task_id, 1, [
                     AttemptRepo(rid, w.repos[rid], head(w.repos[rid]), "write" if rid != "tenant-specification" else "read")
                     for rid in REPO_IDS])
-            rt = w.new_runtime(db, workspaces=AttemptWorkspaces(w.manager))
+            rt = w.new_runtime(db, workspaces=AttemptWorkspaces(w.manager, allow_unsandboxed=True))
             rt.recover_interrupted()
             assert rt._pending_redrive == run_id  # ADR 024: provably never spawned
 

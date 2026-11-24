@@ -62,7 +62,7 @@ The daemon service (`AgentRunService.start`) accepts the multi-repository reques
 flags and desktop views are B's lane and follow separately. Shape:
 `{"repos": [{"repo_id", "baseline_ref"?}], "tasks": [{..., "repos": [{"repo_id", "access": "write"|"read"}]}]}`,
 1 to 16 repositories, no `repo`/`base_ref`, Claude profiles only (Codex has no per-worktree mount control yet).
-Exactly one task per run may write a given repository; a task may write several. Refusals (422, nothing
+Exactly one task per run may write a given repository; a task may write several. Multi-repository runs require `"sandbox": true`: without bwrap a same-uid agent could rewrite a worktree's index or refs between the host checks and the commit, or write to its read-only repositories. The operator can waive this explicitly with `"allow_multi_repo_unsandboxed": true` in the config (refused otherwise with `multi_repo_requires_sandbox`, at the request and again before each attempt). Refusals (422, nothing
 written): `repo_not_registered`, `baseline_ref_not_allowed`, `baseline_ref_unresolved`, `repo_unusable`, two
 writers, an undeclared repository. Each `baseline_ref` is resolved to a commit once, before anything is written,
 and stored with the run in `run_repo_bindings` (with the writer task and `bindings_sha256`) in the same

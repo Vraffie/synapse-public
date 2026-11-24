@@ -1,4 +1,4 @@
-"""Multi-repository run storage (ADR 026 slice 1, migration 0019).
+"""Multi-repository run storage (ADR 026 slice 1, migration 0018).
 
 * ``run_repo_bindings``: the registry entries a run uses, with each baseline ref pinned to a commit SHA, written in
   the transaction that starts the run (``bind_run_repos``). Insert-only.

@@ -333,7 +333,8 @@ def run(state_dir: Path, migrations: Path, *, enable_mock_mcp_ipc: bool = False,
                 worktree_check=None if worktrees is None else worktree_checker(worktrees),
                 budget_policy=budget_policy, registry=profile_registry,
                 spawn_journal=SpawnJournal(state_dir / "spawn-journal"),
-                workspaces=None if worktrees is None else AttemptWorkspaces(worktrees),
+                workspaces=None if worktrees is None else AttemptWorkspaces(
+                    worktrees, allow_unsandboxed=agent_config.allow_multi_repo_unsandboxed),
                 commit_recovery=lambda db: resolve_commit_intents(db, worktrees))
             agent_runtime.recover_interrupted()
             if profile_registry is not None:

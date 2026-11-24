@@ -474,12 +474,20 @@ class AttemptWorktrees:
         self._check_repo(repo)
         return repo
 
+    def _lock_all(self, stack: ExitStack, repos: Sequence[str]) -> None:
+        """Take every repository lock in ONE global order: ascending resolved repository path. The order must not
+        depend on repo_id: a run's bindings outlive registry edits, so two runs may map the same ids to different
+        paths, and id order would then lock in opposite orders (deadlock)."""
+        for repo in sorted(set(repos), key=lambda r: os.path.realpath(r)):
+            stack.enter_context(self._lock(repo))
+
     # --- create all, or none -------------------------------------------------------------------------------------
     def create_attempt(self, run_id: str, task_id: str, attempt_no: int,
                        repos: Sequence[AttemptRepo]) -> dict[str, str]:
         """Create every worktree of one attempt from its pinned baseline, or none.
 
-        Per-repository locks are taken in ascending ``repo_id`` order (deadlock-free) and held for the whole create.
+        Per-repository locks are taken in ascending repository-path order (``_lock_all``; deadlock-free even when two
+        runs bind the same ids to different paths) and held for the whole create.
         Each new tree is checked (owning repository, HEAD equals the baseline, clean). On any failure every worktree
         and branch made by this call is removed and ``AttemptCreateError(repo_id)`` names the repository that failed.
         Returns ``{repo_id: path}``.
@@ -502,8 +510,7 @@ class AttemptWorktrees:
         made: list[tuple[AttemptRepo, str]] = []
         current = ordered[0].repo_id
         with ExitStack() as locks:
-            for r in ordered:
-                locks.enter_context(self._lock(r.repo_path))
+            self._lock_all(locks, [r.repo_path for r in ordered])
             try:
                 self._mkdirs_private(adir)
                 for r in ordered:
@@ -566,8 +573,7 @@ class AttemptWorktrees:
         branch = self._guard_ref(self.attempt_branch(run_id, task_id, attempt_no))
         ordered = sorted(repos, key=lambda r: r.repo_id)
         with ExitStack() as locks:
-            for r in ordered:
-                locks.enter_context(self._lock(self._allowlisted(r.repo_path)))
+            self._lock_all(locks, [self._allowlisted(r.repo_path) for r in ordered])
             for r in reversed(ordered):
                 self._discard_locked(r, self.attempt_worktree_path(run_id, task_id, attempt_no, r.repo_id), branch)
         try:
@@ -587,8 +593,7 @@ class AttemptWorktrees:
         out: dict[str, str] = {}
         ordered = sorted(repos, key=lambda r: r.repo_id)
         with ExitStack() as locks:
-            for r in ordered:
-                locks.enter_context(self._lock(self._allowlisted(r.repo_path)))
+            self._lock_all(locks, [self._allowlisted(r.repo_path) for r in ordered])
             for r in ordered:
                 repo, path = r.repo_path, self.attempt_worktree_path(run_id, task_id, attempt_no, r.repo_id)
                 self._refuse_dangerous_config(repo)
@@ -663,7 +668,7 @@ class AttemptWorktrees:
         return sha if rc == 0 and _HEX_SHA.fullmatch(sha) else None
 
     def attempt_commit_landed(self, run_id: str, task_id: str, attempt_no: int, repo_id: str, repo: str,
-                              head_before: str) -> str | None:
+                              head_before: str, protected: Sequence[str] = ()) -> str | None:
         """Crash recovery: the commit SHA if the branch HEAD is a direct child of ``head_before`` and the worktree's
         index equals that commit's tree (the commit landed), else None. Read-only."""
         head = self.attempt_branch_head(run_id, task_id, attempt_no, repo)
@@ -675,7 +680,55 @@ class AttemptWorktrees:
         path = self._attempt_tree(run_id, task_id, attempt_no, repo_id, repo)
         rc, _, _ = self._tree_git(repo, path, ["diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv",
                                                "--ignore-submodules=none", head, "--"], check=False)
-        return head if rc == 0 else None
+        if rc != 0:
+            return None
+        try:  # the commit landed; it only counts as ours if the committed change passes the full commit rule again
+            self.check_commit_range(repo, head_before, head, protected)
+        except CommitRefused:
+            return None
+        return head
+
+    def check_commit_range(self, repo: str, base: str, head: str, protected: Sequence[str] = ()) -> int:
+        """Re-run the D3 rule on a committed change (``diff-tree -r -z --raw --no-renames base head`` and the blobs
+        from the object store): paths, protected paths, modes and XML well-formedness. Raises ``CommitRefused``;
+        returns the number of changed paths. Read-only."""
+        for sha in (base, head):
+            if not isinstance(sha, str) or not _HEX_SHA.fullmatch(sha):
+                raise CommitRefused("bad_commit")
+        self._allowlisted(repo)
+        self._refuse_dangerous_config(repo)
+        _, raw, trunc = _git(repo, ["diff-tree", "-r", "-z", "--raw", "--no-renames", "--no-abbrev",
+                                    "--no-ext-diff", "--no-textconv", "--end-of-options", base, head],
+                             max_bytes=_COMMIT_LISTING_BYTES)
+        if trunc:
+            raise CommitRefused("too_many_paths")
+        tokens = raw.split("\x00")
+        records = [(t.split(" "), tokens[i + 1] if i + 1 < len(tokens) else "")
+                   for i, t in enumerate(tokens) if t.startswith(":")]
+        if len(records) > MAX_COMMIT_PATHS:
+            raise CommitRefused("too_many_paths")
+        check_staged_paths(records, check_protected_patterns(list(protected)))
+        self._check_blobs(repo, records)
+        return len(records)
+
+    @staticmethod
+    def _check_blobs(repo: str, records) -> None:
+        bad = 0
+        for fields, _name in records:
+            if len(fields) > 3 and fields[1] == "100644":  # added or modified: the blob, never the work tree file
+                if not _HEX_SHA.fullmatch(fields[3]):
+                    raise CommitRefused("xml_not_well_formed")
+                rc, blob, too_big = _git_raw(repo, ["cat-file", "blob", fields[3]], max_bytes=MAX_XML_BYTES,
+                                             check=False)
+                if rc != 0 or too_big:
+                    bad += 1
+                    continue
+                try:
+                    check_xml(blob)
+                except XmlRefused:
+                    bad += 1
+        if bad:
+            raise CommitRefused("xml_not_well_formed", bad)
 
     # --- host commit ---------------------------------------------------------------------------------------------
     def _commit_status(self, repo: str, path: str) -> list[str]:
@@ -740,29 +793,29 @@ class AttemptWorktrees:
                 after = self._commit_status(repo, path)
                 if any(e.startswith(("?? ", "!! ")) for e in after):
                     raise CommitRefused("untracked_path_present", sum(e.startswith(("?? ", "!! ")) for e in after))
-                bad = 0
-                for fields, _name in records:
-                    if len(fields) > 3 and fields[1] == "100644":  # added or modified: the staged blob, not the file
-                        if not _HEX_SHA.fullmatch(fields[3]):
-                            raise CommitRefused("xml_not_well_formed")
-                        rc, blob, too_big = _git_raw(repo, ["cat-file", "blob", fields[3]],
-                                                     max_bytes=MAX_XML_BYTES, check=False)
-                        if rc != 0 or too_big:
-                            bad += 1
-                            continue
-                        try:
-                            check_xml(blob)
-                        except XmlRefused:
-                            bad += 1
-                if bad:
-                    raise CommitRefused("xml_not_well_formed", bad)
-                self._tree_git(repo, path, ["-c", "commit.gpgsign=false", "-c", "user.useConfigOnly=false",
-                                            "commit", "--no-verify", "--no-gpg-sign", "-q", "-m", message.strip()])
+                self._check_blobs(repo, records)
+                # Bind the commit to the tree that was checked: write the index to a tree, re-check that exact tree
+                # against the baseline, then commit THAT tree with commit-tree and move only the attempt branch from
+                # head_before to it (update-ref with the expected old value). An index rewritten after the checks
+                # (same-uid agent, sandbox off) cannot slip into the commit.
+                _, tree, _ = self._tree_git(repo, path, ["write-tree"])
+                tree = tree.strip()
+                if not _HEX_SHA.fullmatch(tree):
+                    raise CommitRefused("git_error")
+                _, commit, _ = _git(repo, ["-c", "commit.gpgsign=false", "-c", "user.useConfigOnly=false",
+                                           "commit-tree", tree, "-p", head_before, "-m", message.strip()])
+                commit = commit.strip()
+                if not _HEX_SHA.fullmatch(commit):
+                    raise CommitRefused("git_error")
+                self.check_commit_range(repo, head_before, commit, protected)
+                _git(repo, ["update-ref", "-m", "synapse attempt commit", f"refs/heads/{branch}", commit, head_before])
             except BaseException:
                 self._tree_git(repo, path, ["reset", "-q", "--"], check=False)
                 raise
-            _, head, _ = self._tree_git(repo, path, ["rev-parse", "HEAD"])
-        return {"head_before": head_before, "head": head.strip(), "paths": len(records), "committed": True}
+            head = commit
+            # The worktree's index/HEAD now follow the branch; refresh the index to the commit (files untouched).
+            self._tree_git(repo, path, ["reset", "-q", "--"], check=False)
+        return {"head_before": head_before, "head": head, "paths": len(records), "committed": True}
 
 
 class WorktreeManager(AttemptWorktrees):

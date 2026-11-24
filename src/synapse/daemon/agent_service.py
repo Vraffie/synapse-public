@@ -408,6 +408,10 @@ class AgentRunService:
         here: each attempt creates all of its worktrees just before its spawn, or none."""
         if not self.repo_registry.entries:
             raise _bad("multi-repository runs are not configured (no repository objects in repos)")
+        hooks = getattr(self.runtime, "_workspaces", None)
+        if not getattr(self.runtime.profile, "sandbox", False) and not getattr(hooks, "allow_unsandboxed", False):
+            raise _bad("multi_repo_requires_sandbox: multi-repository runs need the sandbox "
+                       "(or the operator's allow_multi_repo_unsandboxed)")
         try:
             bindings = await asyncio.to_thread(resolve_run_repos, self.repo_registry, self.manager, req["repos"])
         except RepoRequestError as exc:

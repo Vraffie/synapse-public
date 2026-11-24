@@ -18,7 +18,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from synapse.daemon.agent_config import RepoEntry
-from synapse.infrastructure.worktrees import AttemptRepo, WorktreeError, WorktreeManager
+from synapse.infrastructure.worktrees import AttemptRepo, CommitRefused, WorktreeError, WorktreeManager
 from synapse.persistence.agent_tasks import load_task_specs
 from synapse.persistence.repo_bindings import (
     AttemptWorktree, RepoBinding, commit_result, dangling_intents, load_run_repos, record_removal)
@@ -72,8 +72,12 @@ def resolve_run_repos(registry: RepoRegistry, manager: WorktreeManager,
 class AttemptWorkspaces:
     """Engine hooks over ``WorktreeManager`` (blocking; the engine calls them in a worker thread)."""
 
-    def __init__(self, manager: WorktreeManager) -> None:
+    def __init__(self, manager: WorktreeManager, *, allow_unsandboxed: bool = False) -> None:
         self.manager = manager
+        # Multi-repository attempts need the bwrap sandbox: without it a same-uid agent could rewrite a worktree's
+        # index or refs between the host checks and the commit, or write to read-only repositories. Only an explicit
+        # operator choice (agent.json "allow_multi_repo_unsandboxed") lifts that.
+        self.allow_unsandboxed = bool(allow_unsandboxed)
 
     @staticmethod
     def _repos(repos: Sequence[Mapping[str, str]], bindings: Mapping[str, RepoBinding]) -> list[AttemptRepo]:
@@ -110,8 +114,25 @@ class AttemptWorkspaces:
 
     def commit(self, run_id: str, task_id: str, attempt_no: int, repo_id: str, binding: RepoBinding, message: str,
                expected_head: str) -> dict:
-        return self.manager.commit_attempt(run_id, task_id, attempt_no, repo_id, binding.path, message,
-                                           expected_head=expected_head, protected=binding.protected_paths)
+        try:
+            return self.manager.commit_attempt(run_id, task_id, attempt_no, repo_id, binding.path, message,
+                                               expected_head=expected_head, protected=binding.protected_paths)
+        except CommitRefused:
+            raise  # refused before the branch moved
+        except Exception:
+            # Something failed; the branch may still have moved (a step after the commit raised). Never record
+            # "failed" for a landed commit: re-check the tip; done only if it passes the full rule, else unknown.
+            try:
+                tip = self.manager.attempt_branch_head(run_id, task_id, attempt_no, binding.path)
+                if tip is None or tip == expected_head:
+                    raise
+                landed = self.manager.attempt_commit_landed(run_id, task_id, attempt_no, repo_id, binding.path,
+                                                            expected_head, binding.protected_paths)
+            except CommitRefused:
+                landed = None
+            if landed is None:
+                raise CommitRefused("commit_state_unknown") from None
+            return {"head_before": expected_head, "head": landed, "paths": None, "committed": True}
 
     def cleanup_never_spawned(self, db: sqlite3.Connection, attempt_ids: Sequence[str]) -> dict[str, int]:
         """ADR 026 D4 step 8: remove (never forced) the worktrees of attempts ADR 024 re-queued as provably never
@@ -171,8 +192,12 @@ def resolve_commit_intents(db: sqlite3.Connection, manager: WorktreeManager | No
                 if head == intent.head_before:
                     state, reason = "not_done", None
                 else:
+                    # "landed" re-runs the full commit rule on head_before..head (paths, modes, XML from the object
+                    # store); anything that fails it is unknown, never done.
+                    protected = load_run_repos(db, intent.run_id)[intent.repo_id].protected_paths
                     landed = manager.attempt_commit_landed(intent.run_id, intent.task_id, intent.attempt_no,
-                                                           intent.repo_id, intent.repo_path, intent.head_before)
+                                                           intent.repo_id, intent.repo_path, intent.head_before,
+                                                           protected)
                     if landed is not None:
                         state, sha, reason = "done", landed, None
             except (WorktreeError, ValueError, OSError):

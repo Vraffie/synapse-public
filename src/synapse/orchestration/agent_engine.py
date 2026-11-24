@@ -260,7 +260,7 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                  raw_blobs: ArtifactBlobStore | None = None,
                  routing_dry_run: RoutingDryRunConfig | None = RoutingDryRunConfig(),
                  review_nodes: Mapping[str, ReviewNode] | None = None,
-                 workspaces: Any = None):
+                 workspaces: Any = None, workspace_sandboxed: bool = False):
         # A gated task spends one attempt on the approval wait (see AGENT_MAX_ATTEMPTS).
         super().__init__(connection, router, blobs, verify, verifier_id=verifier_id,
                          max_concurrency=max_concurrency, max_attempts=AGENT_MAX_ATTEMPTS,
@@ -278,6 +278,7 @@ class AgentWorkflowEngine(MockWorkflowEngine):
         # Multi-repository attempts (ADR 026): blocking create/discard/commit over the worktree manager, called in a
         # worker thread. None refuses every workspace task before any spawn (multi_repo_unavailable).
         self._workspaces = workspaces
+        self._workspace_sandboxed = workspace_sandboxed  # the profile runs agents in bwrap (required unless allowed)
 
     def _verifier_id_for(self, task_id: str) -> str:
         """A pluggable verifier may name itself per task (e.g. evidence for opted-in nodes only)."""
@@ -381,6 +382,8 @@ class AgentWorkflowEngine(MockWorkflowEngine):
         """
         if self._workspaces is None:
             return "multi_repo_unavailable", None
+        if not self._workspace_sandboxed and not getattr(self._workspaces, "allow_unsandboxed", False):
+            return "multi_repo_requires_sandbox", None
         bindings = load_run_repos(self.db, run_id)
         repos = spec["repos"]
         for r in repos:
@@ -436,15 +439,33 @@ class AgentWorkflowEngine(MockWorkflowEngine):
             with self._transaction():
                 self._check_running(run_id)
                 commit_intent(self.db, attempt_id, tree.repo_id, tree.baseline_sha)
+            # The git work runs in a thread that cannot be cancelled; a cancellation of this task still waits for it
+            # and records its result, so no intent is left dangling by a cancel (only by a crash).
+            work = asyncio.ensure_future(asyncio.to_thread(self._workspaces.commit, run_id, task_id, attempt_no,
+                                                           tree.repo_id, binding, message, tree.baseline_sha))
+            cancelled = None
             try:
-                result = await asyncio.to_thread(self._workspaces.commit, run_id, task_id, attempt_no, tree.repo_id,
-                                                 binding, message, tree.baseline_sha)
+                try:
+                    result = await asyncio.shield(work)
+                except asyncio.CancelledError as exc:
+                    cancelled = exc
+                    result = await work
             except Exception as exc:
                 reason = getattr(exc, "reason", None)
                 reason = reason if isinstance(reason, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", reason) else "git_error"
+                state = "unknown" if reason == "commit_state_unknown" else "failed"
                 with self._transaction():
-                    commit_result(self.db, attempt_id, tree.repo_id, tree.baseline_sha, state="failed", reason=reason)
+                    commit_result(self.db, attempt_id, tree.repo_id, tree.baseline_sha, state=state, reason=reason)
+                if cancelled is not None:
+                    raise cancelled
                 return "commit_failed:%s:%s" % (tree.repo_id, reason)
+            if cancelled is not None:
+                with self._transaction():
+                    commit_result(self.db, attempt_id, tree.repo_id, tree.baseline_sha,
+                                  state="done" if result["committed"] else "unchanged",
+                                  candidate_sha=result["head"] if result["committed"] else tree.baseline_sha,
+                                  paths=result["paths"])
+                raise cancelled
             with self._transaction():
                 if result["committed"]:
                     commit_result(self.db, attempt_id, tree.repo_id, tree.baseline_sha, state="done",
