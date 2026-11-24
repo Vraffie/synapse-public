@@ -120,8 +120,12 @@ def _cost(value: object) -> float | None:
 CREDENTIALS_NAME = ".credentials.json"
 
 
+# Characters a deny rule cannot express (glob/rule syntax, control chars): such a path could not be protected.
+_RULE_UNSAFE = re.compile(r"[()\x00-\x1f\x7f*?\[\]]")
+
+
 def _clean_abs(value: object) -> bool:
-    return (isinstance(value, str) and "\x00" not in value and os.path.isabs(value)
+    return (isinstance(value, str) and not _RULE_UNSAFE.search(value) and os.path.isabs(value)
             and os.path.normpath(value) == value and value != os.sep)
 
 
@@ -140,7 +144,8 @@ def check_claude_config_dir(path: str, *, avoid: tuple[str, ...] = ()) -> str:
     Returns the credentials path. Raises ValueError with a fixed message (never the path).
     """
     if not _clean_abs(path) or os.path.realpath(path) != path:
-        raise ValueError("claude_config_dir must be a normalized absolute path without symlinks")
+        raise ValueError("claude_config_dir must be a normalized absolute path without symlinks, glob, "
+                         "parenthesis or control characters")
     try:
         info = os.lstat(path)
     except OSError:
@@ -157,9 +162,16 @@ def check_claude_config_dir(path: str, *, avoid: tuple[str, ...] = ()) -> str:
         return creds
     except OSError:
         raise ValueError("claude_config_dir credentials file cannot be inspected") from None
-    if not stat.S_ISREG(cinfo.st_mode) or cinfo.st_uid != os.getuid() or cinfo.st_mode & 0o077:
-        raise ValueError("claude_config_dir credentials must be a regular file owned by the current user, mode 0600")
+    _check_credentials_stat(cinfo)
     return creds
+
+
+def _check_credentials_stat(info: os.stat_result) -> None:
+    # st_nlink == 1: a hard link to another file (say a state-dir token) would hand the agent that file instead.
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077
+            or info.st_nlink != 1):
+        raise ValueError("claude_config_dir credentials must be a regular file owned by the current user, mode 0600, "
+                         "with a single link")
 
 
 def claude_scratch_base() -> str:
@@ -258,6 +270,8 @@ class ClaudeCliProfile:
             raise ValueError("git_repos must be a tuple of absolute paths")
         if self.claude_config_dir is not None and not _clean_abs(self.claude_config_dir):
             raise ValueError("claude_config_dir must be a normalized absolute path")
+        if self.claude_config_dir is not None and self.api_key is not None:
+            raise ValueError("claude_config_dir and api_key are mutually exclusive (one account per profile)")
         if not isinstance(self.protected_config_dirs, tuple) or not all(map(_clean_abs, self.protected_config_dirs)):
             raise ValueError("protected_config_dirs must be a tuple of normalized absolute paths")
         if type(self.sandbox) is not bool:
@@ -627,10 +641,15 @@ class ClaudeCliProvider:
             paths += [os.path.join(real_home, sub) for sub in _DENY_HOME_SUBDIRS]
         if cfg:
             paths.append(cfg)
-        paths += self._config_dirs()
+        protected = self._config_dirs()
+        for path in protected:
+            if not os.path.isabs(path) or _RULE_UNSAFE.search(path):
+                # Never skip a profile dir silently: a dir no rule can name would be readable by the file tools.
+                raise ValueError("a profile config dir cannot be expressed as a deny rule")
+        paths += protected
         deny: list[str] = []
         for path in dict.fromkeys(paths):
-            if not os.path.isabs(path) or re.search(r"[()\x00-\x1f*?\[\]]", path):
+            if not os.path.isabs(path) or _RULE_UNSAFE.search(path):
                 continue
             for tool in ("Read", "Edit"):
                 deny.append(f"{tool}(/{path}/**)")  # `//abs/path` is an absolute path rule
@@ -682,13 +701,14 @@ class ClaudeCliProvider:
                 ex.reaped = True
                 return
             plan = ex.plan
+            fds: list[int] = []  # O_PATH descriptors bwrap binds (credentials); closed here once the child has them
             try:
                 self._check_repo_config(plan.cwd)  # re-check: the worktree may change after start()
                 root, home, config = self._make_scratch(ex)
                 env = {**plan.env, "HOME": home, "CLAUDE_CONFIG_DIR": config, "TMPDIR": os.path.join(root, "tmp")}
                 argv = [*plan.argv, "--settings", os.path.join(root, "settings.json"), *plan.tail]
                 if self._profile.sandbox:
-                    argv = self._sandboxed(argv, plan, root)
+                    argv = self._sandboxed(argv, plan, root, fds)
                 if self._journal is not None:
                     ex.journal_key = uuid.uuid4().hex
                     self._journal.begin(ex.journal_key)  # intent first: cannot journal means cannot spawn
@@ -696,7 +716,7 @@ class ClaudeCliProvider:
                     process = subprocess.Popen(
                         argv, cwd=plan.cwd, env=env, shell=False,
                         stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                        close_fds=True, start_new_session=True,
+                        close_fds=True, pass_fds=tuple(fds), start_new_session=True,
                         preexec_fn=self._preexec(plan.cpu_seconds),
                     )
             except (OSError, ValueError, subprocess.SubprocessError, SandboxUnavailable) as exc:
@@ -709,6 +729,9 @@ class ClaudeCliProvider:
                 ex.spawn_failed = True
                 ex.reaped = True
                 return
+            finally:
+                for fd in fds:
+                    os.close(fd)
             ex.process = process
             try:
                 ex.identity = capture_mock_child(process)
@@ -726,7 +749,7 @@ class ClaudeCliProvider:
                 if process.returncode is not None:
                     self._journal_finish(ex)  # killed and reaped; otherwise the entry stays for the next startup
 
-    def _sandboxed(self, argv: list[str], plan: _Plan, root: str) -> list[str]:
+    def _sandboxed(self, argv: list[str], plan: _Plan, root: str, fds: list[int] | None = None) -> list[str]:
         """Wrap the child argv in bwrap (raises SandboxUnavailable, which fails the spawn closed)."""
         p = self._profile
         bwrap = p.sandbox_bwrap or find_bwrap()
@@ -738,16 +761,25 @@ class ClaudeCliProvider:
         homes = sandbox_homes(self._environ.get("HOME"))
         forbidden = [os.path.realpath(p.state_dir), *forbidden_home_paths(homes, _DENY_HOME_SUBDIRS),
                      *self._config_dirs()]
-        ro_files = ()
-        if p.claude_config_dir is not None and p.api_key is None:
+        ro_fds = ()
+        if p.claude_config_dir is not None:
             # Only the active profile's credentials file, read-only, on top of the scratch placeholder. The rest of
             # its config dir and every other profile's dir stay unmounted (and forbidden to every other mount).
-            ro_files = ((self._profile_credentials(plan.cwd),
-                         os.path.join(os.path.realpath(root), "config", CREDENTIALS_NAME)),)
+            # The file is pinned with an O_PATH descriptor (no read access, contents never read) that is re-checked
+            # with fstat and handed to bwrap --ro-bind-fd, so a path swapped after the lstat checks is not bound.
+            if fds is None:
+                raise SandboxUnavailable("credential bind needs descriptor passing")
+            fd = os.open(self._profile_credentials(plan.cwd), os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
+            fds.append(fd)
+            try:
+                _check_credentials_stat(os.fstat(fd))
+            except ValueError:
+                raise SandboxUnavailable("profile credentials file changed before the sandbox started") from None
+            ro_fds = ((fd, os.path.join(os.path.realpath(root), "config", CREDENTIALS_NAME)),)
         return build_bwrap_argv(
             bwrap, worktree=plan.cwd, scratch=os.path.realpath(root), executable=exe,
             inner=[exe, *argv[1:]], forbidden=forbidden,
-            extra_ro_dirs=git_readonly_dirs(plan.cwd, p.git_repos), no_ancestor=homes, ro_files=ro_files)
+            extra_ro_dirs=git_readonly_dirs(plan.cwd, p.git_repos), no_ancestor=homes, ro_fds=ro_fds)
 
     def _config_dirs(self) -> list[str]:
         """Every registry profile's config dir (lexical and resolved): never readable by tools, never mountable."""

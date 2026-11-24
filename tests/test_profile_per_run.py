@@ -207,16 +207,79 @@ def test_missing_or_loosened_profile_credentials_refuse_the_spawn(box):
     assert not (wt / "spawns.log").exists()
 
 
-def test_bwrap_file_bind_must_target_scratch(tmp_path):
+def test_bwrap_fd_bind_must_target_scratch(tmp_path):
     common = dict(worktree=str(tmp_path / "wt"), scratch=str(tmp_path / "s"), executable="/usr/bin/true",
                   inner=["/usr/bin/true"], forbidden=[str(tmp_path / "cfg")])
-    argv = build_bwrap_argv("/usr/bin/bwrap", **common, ro_files=[(str(tmp_path / "cfg" / "c"), str(tmp_path / "s" / "c"))])
-    i = argv.index(str(tmp_path / "cfg" / "c"))
-    assert argv[i - 1] == "--ro-bind" and argv[i + 1] == str(tmp_path / "s" / "c")
-    assert argv.index("--ro-bind", argv.index(str(tmp_path / "s")) - 1) < i  # after (on top of) the scratch bind
-    for dest in (str(tmp_path / "elsewhere"), str(tmp_path / "wt" / "c"), str(tmp_path / "s")):
+    argv = build_bwrap_argv("/usr/bin/bwrap", **common, ro_fds=[(7, str(tmp_path / "s" / "c"))])
+    i = argv.index("--ro-bind-fd")
+    assert argv[i + 1:i + 3] == ["7", str(tmp_path / "s" / "c")]
+    assert argv.index(str(tmp_path / "s")) < i  # after (on top of) the scratch bind
+    assert str(tmp_path / "cfg") not in " ".join(argv)  # the config dir path itself is never mounted
+    for fd, dest in ((7, str(tmp_path / "elsewhere")), (7, str(tmp_path / "wt" / "c")), (7, str(tmp_path / "s")),
+                     (-1, str(tmp_path / "s" / "c")), ("7", str(tmp_path / "s" / "c"))):
         with pytest.raises(SandboxUnavailable):
-            build_bwrap_argv("/usr/bin/bwrap", **common, ro_files=[(str(tmp_path / "cfg" / "c"), dest)])
+            build_bwrap_argv("/usr/bin/bwrap", **common, ro_fds=[(fd, dest)])
+
+
+def test_review_hardening_unsafe_chars_api_key_and_hardlinks(box):
+    tmp, _, wt, state = box
+    for name in ("gl*ob", "br[a]ck", "pa(ren)", "q?", "ctl\x01"):
+        d = tmp / name
+        d.mkdir(mode=0o700)
+        with pytest.raises(ValueError, match="glob"):
+            check_claude_config_dir(str(d.resolve()))
+        with pytest.raises(ValueError, match="claude_config_dir"):
+            provider(box, claude_config_dir=str(d.resolve()))
+    work = config_dir(tmp, "work", "x")
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        provider(box, claude_config_dir=str(work), api_key="FAKE-KEY")
+    # a hard link to another file (here a planted state-dir token) is refused
+    token = state / "operator.token"
+    token.write_text("FAKE-STATE-TOKEN")
+    token.chmod(0o600)
+    linked = config_dir(tmp, "hard")
+    os.link(token, linked / ".credentials.json")
+    with pytest.raises(ValueError, match="single link"):
+        check_claude_config_dir(str(linked))
+    with pytest.raises(ValueError, match="single link"):
+        asyncio.run(_run(provider(box, claude_config_dir=str(linked)), wt))
+    assert not (wt / "spawns.log").exists()
+
+
+def test_settings_refuse_instead_of_skipping_an_unexpressible_profile_dir(box):
+    prov = provider(box)
+    object.__setattr__(prov._profile, "protected_config_dirs", ("/x/a*b",))  # bypasses __post_init__ on purpose
+    with pytest.raises(ValueError, match="deny rule"):
+        prov._settings(str(box[0] / "scratchtmp"))
+
+
+@needs_bwrap
+def test_credentials_swapped_after_checks_are_not_bound(box, monkeypatch):
+    """The O_PATH descriptor is re-checked with fstat: a file replaced between lstat and bind refuses the spawn."""
+    tmp, _, wt, state = box
+    work = config_dir(tmp, "work", "FAKE-CRED-WORK")
+    token = state / "operator.token"
+    token.write_text("FAKE-STATE-TOKEN")
+    token.chmod(0o644)
+    prov = provider(box, environ={"PATH": "/usr/bin:/bin", "HOME": os.path.expanduser("~")}, sandbox=True,
+                    claude_config_dir=str(work))
+    real = prov._profile_credentials
+    calls = []
+    real_sandboxed = prov._sandboxed
+
+    def sandboxed(*a, **k):
+        calls.append("sandbox")
+        return real_sandboxed(*a, **k)
+
+    def swap(cwd):
+        creds = real(cwd)
+        if calls:  # only the check inside _sandboxed: swap after its lstat, before the O_PATH open
+            os.replace(token, creds)  # wrong mode now
+        return creds
+    monkeypatch.setattr(prov, "_sandboxed", sandboxed)
+    monkeypatch.setattr(prov, "_profile_credentials", swap)
+    events = asyncio.run(_run(prov, wt, "ok\n{}"))
+    assert calls and events[-1].kind == "failed" and not (wt / "spawns.log").exists()
 
 
 @needs_bwrap

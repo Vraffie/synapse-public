@@ -158,14 +158,16 @@ by registry validation).
 
 Checks at daemon start (startup fails on any of them) and again before every spawn (the spawn is refused):
 
-- an absolute, normalized path with no symlink in it;
+- an absolute, normalized path with no symlink in it and none of `( ) * ? [ ]` or control characters (a path no
+  deny rule can express is refused rather than left unprotected);
 - a directory owned by the daemon's user with mode `0700` or stricter (no group or other bits), checked with
   `lstat`;
 - not the same as, inside, or containing the state dir (and its `codex-run` scratch), the Claude scratch base
   (`<tmp>/synapse-agent-<uid>`), the `worktree_root`, any allowlisted repo, or the task's worktree;
 - distinct per profile: two profiles may not name the same directory or nested directories (one account each);
-- if `.credentials.json` exists it must be a regular file (not a symlink) owned by the user with mode `0600` or
-  stricter (`lstat` only). At spawn it must exist; there is **no fallback** to `$CLAUDE_CONFIG_DIR` or `~/.claude`,
+- if `.credentials.json` exists it must be a regular file (not a symlink, and with a single hard link, so it
+  cannot be a second name for another file such as a state-dir token) owned by the user with mode `0600` or
+  stricter (`lstat` only). `claude_config_dir` cannot be combined with an `api_key`. At spawn it must exist; there is **no fallback** to `$CLAUDE_CONFIG_DIR` or `~/.claude`,
   and the daemon's `CLAUDE_CODE_OAUTH_TOKEN` is not passed to such a child (it would override the account): it runs
   as its account or not at all.
 
@@ -175,10 +177,21 @@ config dir, `.credentials.json` is
 
 - unsandboxed: a **symlink** to `<claude_config_dir>/.credentials.json` (the CLI follows it);
 - sandboxed (`"sandbox": true`): a **read-only single-file bind** of that file on top of a scratch placeholder.
-  Nothing else of the directory is mounted, and every other profile's directory is unmounted.
+  The daemon opens the file with `O_PATH | O_NOFOLLOW` (a handle with no read access; the contents are never
+  read), re-checks it with `fstat` (regular file, owner, mode, one link) and binds that descriptor with
+  `bwrap --ro-bind-fd`, so a file swapped after the path checks is refused, not bound. This needs a bwrap with
+  `--ro-bind-fd` (checked with 0.13.1); an older bwrap fails the spawn. Nothing else of the directory is mounted,
+  and every other profile's directory is unmounted.
+
+Residual race (unsandboxed only): the symlink is resolved by the child when the CLI opens it, so a process running
+as the same user that replaces `.credentials.json` between the daemon's checks and that open decides what the
+child reads. Such a process can already read and write the whole directory, so this adds no capability; use the
+sandbox when that matters.
 
 Protection from agents: every registry profile's directory (for every task, including `default` ones) is added to
-the Synapse-owned `Read`/`Edit` deny rules and to the sandbox's forbidden paths, so no worktree, git dir, scratch or
+the Synapse-owned deny rules and to the sandbox's forbidden paths. The deny rules name the `Read` and `Edit` tools
+only; whether `Glob`, `Grep` or other tools honour them depends on the Claude CLI and is not verified here (the
+sandbox is the boundary that does not depend on the CLI). The forbidden paths mean no worktree, git dir, scratch or
 executable mount can expose one. As ADR 019 notes, a child must hold its own model credential to work, so this
 protects other profiles' accounts and the rest of the directory, not the running profile's own token from its own
 agent. Unsandboxed children run as the same OS user and can read anything that user can; use the sandbox for the
