@@ -13,11 +13,14 @@ from urllib.parse import quote, urlencode
 from PySide6.QtCore import QThread, Signal
 
 from synapse.cli.__main__ import DaemonHTTPError, _get, _request
-from synapse.desktop import approval_decision
+from synapse.desktop import approval_decision, multirepo_routes
 from synapse.desktop.agent_usage import MAX_ROWS, sanitize_usage
 from synapse.desktop.agent_view import UNAVAILABLE_STATUSES, clean, sanitize_detail
 from synapse.desktop.cursor_store import Cursor, CursorError, cursor_path, read_cursor, valid_event_id, write_cursor
 from synapse.desktop.mock_resume import ASSERTION, collect_evidence, fetch_all_tasks
+from synapse.desktop.multirepo_model import (
+    build_view, sanitize_manifest_detail, sanitize_manifest_list, sanitize_registry, sanitize_run_repos,
+)
 
 API_VERSION = "v1"  # the only API prefix this client speaks (/api/v1/...)
 MAX_BACKOFF = 15.0
@@ -28,6 +31,8 @@ FEED_MESSAGES = 50
 FEED_PAGES = 2  # message pages per thread per cycle, so a long backlog is caught up over several cycles
 APPROVAL_PAGES = 5  # pages (100 rows each) the Control Center walks, independent of the Developer tab's paging
 AGENT_RETRY_POLLS = 10  # after 'unavailable', re-probe the agent endpoint only every Nth poll
+MULTIREPO_RETRY_POLLS = 30  # a run (or daemon) without multi-repository reads is re-probed only every Nth poll
+REGISTRY_EVERY = 30  # the read-only registry view (deploy: none markers) is refreshed every Nth poll
 
 
 def backoff_delay(interval: float, failures: int, cap: float = MAX_BACKOFF) -> float:
@@ -86,6 +91,7 @@ class Poller(QThread):
     agent_usage_error = Signal(str, object, str)  # run id, generation, 'unavailable' | 'failed'
     agent_detail = Signal(str, object, object)  # run id, generation, sanitized detail
     agent_detail_error = Signal(str, object, str)  # run id, generation, 'unavailable' | 'failed'
+    multirepo_view = Signal(str, object, object)  # run id, generation, multirepo_model.build_view() dict or None (hide)
     profiles_list = Signal(object)  # raw GET /api/v1/profiles answer for the run-start pickers; None: explicit 404/503 (unavailable)
     profiles_failed = Signal(str)  # the profiles could not be loaded (not 404/503): short fixed reason, pickers stay disabled
     runs_list = Signal(object)  # recent runs (GET /api/v1/runs) for the Control Center switcher
@@ -123,6 +129,9 @@ class Poller(QThread):
         self._approval_cursor = ""
         self._approval_page_generation = 0
         self._agent_skip = 0
+        self._multirepo_skip = 0
+        self._multirepo_seen = None
+        self._registry = None  # (cycle fetched, sanitized registry or None)
         self._cycle = 0
         self._feed_cursors = {}  # (run id, thread id) -> last message cursor already delivered
         self._feed_run = None
@@ -145,6 +154,7 @@ class Poller(QThread):
             self._thread_id = ""
             self._thread_generation += 1
             self._agent_skip = 0
+            self._multirepo_skip = 0
             return self._run_generation
 
     def select_thread(self, thread_id: str):
@@ -356,6 +366,43 @@ class Poller(QThread):
         except Exception:
             self.agent_detail_error.emit(run_id, generation, 'failed')
 
+    def _fetch_optional(self, endpoint):
+        """A proposed ADR 026 read: None when this daemon does not serve it (old single-repository daemon)."""
+        try:
+            return self.fetch(self.state_dir, endpoint)
+        except DaemonHTTPError as exc:
+            if exc.status in multirepo_routes.NOT_SUPPORTED_STATUSES:
+                return None
+            raise
+
+    def _poll_multirepo(self, run_id, generation):
+        """Per-repository rows and the newest candidate manifest; read only, refreshed every FEED_EVERY polls."""
+        if self._multirepo_skip > 0:
+            self._multirepo_skip -= 1
+            return
+        if self._multirepo_seen == (run_id, generation) and self._cycle % FEED_EVERY:
+            return
+        self._multirepo_seen = (run_id, generation)
+        try:
+            run_repos = sanitize_run_repos(self._fetch_optional(multirepo_routes.run_repos(run_id)), run_id)
+            manifests = sanitize_manifest_list(self._fetch_optional(multirepo_routes.run_manifests(run_id)))
+            detail = None
+            if manifests:
+                newest = manifests[-1]["manifest_sha256"]
+                detail = sanitize_manifest_detail(self._fetch_optional(multirepo_routes.run_manifest(run_id, newest)), run_id)
+            if run_repos is None and not manifests:
+                self._multirepo_skip = MULTIREPO_RETRY_POLLS
+                self.multirepo_view.emit(run_id, generation, None)
+                return
+            if run_repos and run_repos["bindings"] and (self._registry is None or self._cycle - self._registry[0] >= REGISTRY_EVERY):
+                try:
+                    self._registry = (self._cycle, sanitize_registry(self._fetch_optional(multirepo_routes.registry())))
+                except Exception:
+                    self._registry = (self._cycle, None)
+            self.multirepo_view.emit(run_id, generation, build_view(run_repos, manifests, detail, self._registry and self._registry[1]))
+        except Exception:
+            pass  # transient failure: keep the last view; never show exception text
+
     def _poll_profiles(self):
         """Fetch the accounts for the run-start pickers. Called right after connecting and retried every loop until it
         succeeds (or the daemon says 404/503), then refreshed every FEED_EVERY cycles."""
@@ -558,6 +605,7 @@ class Poller(QThread):
                     self.run_error.emit(run_id, generation)
                 else:
                     self._poll_agent_detail(run_id, generation)
+                    self._poll_multirepo(run_id, generation)
             run_id, generation, thread_id, thread_generation, thread_cursor, thread_page, message_cursor, message_page = self._selection()
             self._cycle += 1
             if not run_id:

@@ -19,6 +19,7 @@ from synapse.desktop import agent_form
 from synapse.desktop.agent_usage import UsagePane
 from synapse.desktop.agent_view import AgentDetailPane, decision_context
 from synapse.desktop.mock_resume import PROFILE, confirm_evidence
+from synapse.desktop.multirepo_view import MultiRepoPane
 from synapse.desktop.start_panel import StartRunPanel
 
 MAX_TASK_ROWS = 200
@@ -80,6 +81,7 @@ class RunsMixin:
         self.agent_pane.remove_clicked.connect(self._remove_worktree)
         self.agent_pane.commit_clicked.connect(self._commit_changes)
         self.usage_pane = UsagePane()
+        self.multirepo_pane = MultiRepoPane()  # hidden unless the run has several repositories or a manifest
         self.agent_pane.approve_clicked.connect(lambda: self._agent_decide("approved"))
         self.agent_pane.reject_clicked.connect(lambda: self._agent_decide("rejected"))
         self.mock_button = self.start_panel.button
@@ -129,6 +131,7 @@ class RunsMixin:
         run_layout.addWidget(self.parked_list)
         run_layout.addWidget(self.review_approval_button)
         run_layout.addWidget(self.agent_pane)
+        run_layout.addWidget(self.multirepo_pane)
         run_layout.addWidget(self.usage_pane)
         run_layout.addWidget(graph)
         widget = QWidget()
@@ -192,6 +195,7 @@ class RunsMixin:
         self.poller.agent_usage_error.connect(self._agent_usage_error)
         self.poller.agent_detail.connect(self._agent_detail_shown)
         self.poller.agent_detail_error.connect(self._agent_detail_error)
+        self.poller.multirepo_view.connect(self._multirepo_shown)
 
     def _start_requested(self, request):
         if request.run_id == self._active_run:
@@ -366,6 +370,10 @@ class RunsMixin:
         self.agent_pane.set_detail(detail)
         self._update_agent_pane()
 
+    def _multirepo_shown(self, run_id, generation, view):
+        if run_id == self._active_run and generation == self._active_generation:
+            self.multirepo_pane.set_view(view)
+
     def _agent_detail_error(self, run_id, generation, kind):
         if run_id != self._active_run or generation != self._active_generation:
             return
@@ -432,6 +440,7 @@ class RunsMixin:
         self.control_center.set_run_id(self._active_run)
         self.agent_pane.clear()
         self.usage_pane.clear()
+        self.multirepo_pane.clear()
         self.agent_pane.set_awaiting_approval(False)
         self.graph_scene.clear()
         self._graph_signature = None
