@@ -445,11 +445,14 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                                                            tree.repo_id, binding, message, tree.baseline_sha))
             cancelled = None
             try:
-                try:
-                    result = await asyncio.shield(work)
-                except asyncio.CancelledError as exc:
-                    cancelled = exc
-                    result = await work
+                while not work.done():  # every cancellation (first, second, ...) waits for the thread's result
+                    try:
+                        await asyncio.shield(work)
+                    except asyncio.CancelledError as exc:
+                        if work.cancelled():
+                            raise
+                        cancelled = exc
+                result = work.result()
             except Exception as exc:
                 reason = getattr(exc, "reason", None)
                 reason = reason if isinstance(reason, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", reason) else "git_error"

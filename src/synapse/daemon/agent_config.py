@@ -171,7 +171,8 @@ def _check_repos(data: dict, state_dir: Path) -> tuple[tuple[str, ...], str | No
     if len({e.id for e in entries}) != len(entries):
         raise AgentConfigError("repos object ids must be unique")
     clean = tuple(r["path"] if isinstance(r, dict) else _abs_path(r, "repo") for r in repos)
-    if len(set(clean)) != len(clean):
+    if len(set(clean)) != len(clean) or len({os.path.realpath(c) for c in clean}) != len(clean):
+        # two entries for one repository (also through different spellings) would give one repository two ids
         raise AgentConfigError("repos must not contain duplicates")
     root = _abs_path(data["worktree_root"], "worktree_root")
     state = os.path.realpath(state_dir)

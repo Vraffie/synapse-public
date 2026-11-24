@@ -1243,3 +1243,69 @@ def test_approval_subject_is_agent_run_multi_without_paths(world):
     assert world.spawns() == []  # parked for the approval, never spawned
     # the hash binds the pinned baselines: another bindings digest gives another spec hash
     assert at.spec_hash(dict(spec, bindings_sha256="0" * 64)) != bound
+
+
+def test_an_error_while_rechecking_a_moved_branch_is_unknown_never_failed(world, monkeypatch):
+    real = WorktreeManager.commit_attempt
+
+    def landed_then_raise(self, *a, **k):
+        out = real(self, *a, **k)
+        if out["committed"]:
+            raise WorktreeError("post-commit reset refused")
+        return out
+
+    def recheck_raises(self, *a, **k):
+        raise WorktreeError("repository config.worktree is not allowed")
+    monkeypatch.setattr(WorktreeManager, "commit_attempt", landed_then_raise)
+    monkeypatch.setattr(WorktreeManager, "attempt_commit_landed", recheck_raises)
+    world.start(world.request([world.task(prompt={"writes": {"portfolio": {"config.xml": "<p/>"}}})]))
+    assert world.commits()[:2] == [("portfolio", "intent", None), ("portfolio", "unknown", "commit_state_unknown")]
+    assert not any(c[1] == "failed" for c in world.commits())
+    assert world.summary_detail() == ["commit_failed:portfolio:commit_state_unknown"]
+
+
+def test_replace_refs_and_grafts_cannot_make_a_bad_commit_look_clean(mgr, repos):
+    repo = repos["portfolio"]
+    base = head(repo)
+    wanted = attempt_repos({"portfolio": repo})
+    paths = mgr.create_attempt("r", "t", 1, wanted)
+    tree = paths["portfolio"]
+    # a bad commit (a non-XML file) on the attempt branch, and a clean look-alike commit
+    Path(tree, "evil.sh").write_text("id\n")
+    git(tree, "add", "-A")
+    git(tree, "commit", "-q", "-m", "bad")
+    bad = head(tree)
+    git(tree, "reset", "-q", "--hard", base)
+    Path(tree, "config.xml").write_text("<clean/>")
+    git(tree, "commit", "-q", "-am", "clean")
+    clean = head(tree)
+    git(repo, "replace", bad, clean)  # refs/replace/<bad> -> clean
+    (Path(repo) / ".git" / "info").mkdir(exist_ok=True)
+    (Path(repo) / ".git" / "info" / "grafts").write_text("%s\n" % bad)  # graft: bad has no parent
+    with pytest.raises(CommitRefused) as info:
+        mgr.check_commit_range(repo, base, bad)
+    assert info.value.reason == "path_not_editable"  # the stored object is checked, not the replacement
+    assert mgr.check_commit_range(repo, base, clean) == 1
+
+
+def test_one_repository_is_one_lock_and_duplicate_realpaths_are_refused(cfg_world, tmp_path, mgr, repos):
+    load, a, b = cfg_world
+    link = tmp_path / "alias"
+    os.symlink(a, link)
+    with pytest.raises(AgentConfigError):
+        load([{"id": "x", "path": a}, {"id": "y", "path": str(link)}])
+    taken = []
+    real = WorktreeManager._lock
+
+    def spy(self, repo):
+        taken.append(repo)
+        return real(self, repo)
+    try:
+        WorktreeManager._lock = spy
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            p = repos["portfolio"]
+            mgr._lock_all(stack, [("b-id", p), ("a-id", p), ("c", repos["product-config"])])
+        assert taken == sorted([p, repos["product-config"]])  # one lock per resolved path, in path order
+    finally:
+        WorktreeManager._lock = real

@@ -119,16 +119,22 @@ class AttemptWorkspaces:
                                                expected_head=expected_head, protected=binding.protected_paths)
         except CommitRefused:
             raise  # refused before the branch moved
-        except Exception:
+        except Exception as failure:
             # Something failed; the branch may still have moved (a step after the commit raised). Never record
             # "failed" for a landed commit: re-check the tip; done only if it passes the full rule, else unknown.
+            # Any error while checking (unreadable tip, refused config, missing tree, diff-tree failure) is unknown.
             try:
                 tip = self.manager.attempt_branch_head(run_id, task_id, attempt_no, binding.path)
-                if tip is None or tip == expected_head:
-                    raise
+            except Exception:
+                raise CommitRefused("commit_state_unknown") from None
+            if tip == expected_head:
+                raise failure  # the branch did not move: a plain failure
+            if tip is None:
+                raise CommitRefused("commit_state_unknown") from None
+            try:
                 landed = self.manager.attempt_commit_landed(run_id, task_id, attempt_no, repo_id, binding.path,
                                                             expected_head, binding.protected_paths)
-            except CommitRefused:
+            except Exception:
                 landed = None
             if landed is None:
                 raise CommitRefused("commit_state_unknown") from None

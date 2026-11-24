@@ -234,6 +234,9 @@ def _git_env() -> dict[str, str]:
         # Never lazily fetch missing objects of a partial clone: that would run the repo-chosen
         # remote.<name>.uploadpack (or a transport) from a read-only query such as `status`.
         "GIT_NO_LAZY_FETCH": "1",
+        # Object identity must be what is stored: refs/replace/* and info/grafts could make a check see different
+        # (clean) objects than the ones a commit or deploy actually uses (ADR 026 re-review).
+        "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": "/dev/null",
         "GIT_AUTHOR_NAME": "synapse", "GIT_AUTHOR_EMAIL": "synapse@localhost",
         "GIT_COMMITTER_NAME": "synapse", "GIT_COMMITTER_EMAIL": "synapse@localhost",
     }
@@ -270,7 +273,7 @@ def _git_raw(cwd: str, args: Iterable[str], *, max_bytes: int = DEFAULT_MAX_BYTE
     wall-clock deadline enforced by reader threads; on expiry the entire process group dies."""
     args = list(args)
     deadline = time.monotonic() + (_GIT_TIMEOUT if timeout is None else timeout)
-    argv = ["git", "--no-lazy-fetch", *_HARDEN, *args]
+    argv = ["git", "--no-lazy-fetch", "--no-replace-objects", *_HARDEN, *args]
     try:
         proc = subprocess.Popen(argv, cwd=cwd, env=_git_env(), shell=False,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -474,11 +477,16 @@ class AttemptWorktrees:
         self._check_repo(repo)
         return repo
 
-    def _lock_all(self, stack: ExitStack, repos: Sequence[str]) -> None:
-        """Take every repository lock in ONE global order: ascending resolved repository path. The order must not
-        depend on repo_id: a run's bindings outlive registry edits, so two runs may map the same ids to different
-        paths, and id order would then lock in opposite orders (deadlock)."""
-        for repo in sorted(set(repos), key=lambda r: os.path.realpath(r)):
+    def _lock_all(self, stack: ExitStack, repos: Sequence[tuple[str, str]]) -> None:
+        """Take the locks of ``(repo_id, repo_path)`` pairs in ONE global order: ascending (resolved path, repo_id).
+        The order must not depend on repo_id alone: a run's bindings outlive registry edits, so two runs may map the
+        same ids to different paths. Locks are keyed by the resolved path (``_lock``), so one repository reached
+        through two spellings is still one lock, taken once."""
+        seen: set[str] = set()
+        for real, _rid, repo in sorted((os.path.realpath(path), rid, path) for rid, path in repos):
+            if real in seen:
+                continue
+            seen.add(real)
             stack.enter_context(self._lock(repo))
 
     # --- create all, or none -------------------------------------------------------------------------------------
@@ -510,7 +518,7 @@ class AttemptWorktrees:
         made: list[tuple[AttemptRepo, str]] = []
         current = ordered[0].repo_id
         with ExitStack() as locks:
-            self._lock_all(locks, [r.repo_path for r in ordered])
+            self._lock_all(locks, [(r.repo_id, r.repo_path) for r in ordered])
             try:
                 self._mkdirs_private(adir)
                 for r in ordered:
@@ -573,7 +581,7 @@ class AttemptWorktrees:
         branch = self._guard_ref(self.attempt_branch(run_id, task_id, attempt_no))
         ordered = sorted(repos, key=lambda r: r.repo_id)
         with ExitStack() as locks:
-            self._lock_all(locks, [self._allowlisted(r.repo_path) for r in ordered])
+            self._lock_all(locks, [(r.repo_id, self._allowlisted(r.repo_path)) for r in ordered])
             for r in reversed(ordered):
                 self._discard_locked(r, self.attempt_worktree_path(run_id, task_id, attempt_no, r.repo_id), branch)
         try:
@@ -593,7 +601,7 @@ class AttemptWorktrees:
         out: dict[str, str] = {}
         ordered = sorted(repos, key=lambda r: r.repo_id)
         with ExitStack() as locks:
-            self._lock_all(locks, [self._allowlisted(r.repo_path) for r in ordered])
+            self._lock_all(locks, [(r.repo_id, self._allowlisted(r.repo_path)) for r in ordered])
             for r in ordered:
                 repo, path = r.repo_path, self.attempt_worktree_path(run_id, task_id, attempt_no, r.repo_id)
                 self._refuse_dangerous_config(repo)
@@ -870,8 +878,10 @@ class WorktreeManager(AttemptWorktrees):
 
     def _lock(self, repo: str):
         with _locks_guard:
-            tl = _locks.setdefault(repo, threading.Lock())
-        return _RepoLock(tl, os.path.join(self._root, f".lock-{hashlib.sha256(repo.encode()).hexdigest()[:16]}"))
+            # keyed by the resolved path: two spellings of one repository must share one lock
+            key = os.path.realpath(repo)
+            tl = _locks.setdefault(key, threading.Lock())
+        return _RepoLock(tl, os.path.join(self._root, f".lock-{hashlib.sha256(key.encode()).hexdigest()[:16]}"))
 
     def _repo_of(self, path: str) -> str:
         """Resolve owning allowlisted repo from the worktree's .git file."""
