@@ -348,3 +348,44 @@ def test_manifest_commands_send_the_documented_routes(calls):
         with pytest.raises(SystemExit):
             run(*bad)
         assert len(calls) == n
+
+
+def _prune_fake(monkeypatch, runs, refuse=()):
+    seen = []
+    def fake(state_dir, endpoint, **kw):
+        seen.append(endpoint)
+        if endpoint.startswith("/api/v1/runs?"):
+            state = endpoint.split("state=")[1].split("&")[0]
+            return {"runs": [r for r in runs if r["state"] == state], "next_cursor": None}
+        if endpoint.split("/")[4] in refuse:
+            raise RuntimeError("409 uncommitted changes")
+        return {"run_id": "x", "removed": True, "tasks": []}
+    monkeypatch.setattr(cli, "_request", fake)
+    return seen
+
+
+def _run(rid, state, updated, workflow="synapse.agent.single"):
+    return {"id": rid, "state": state, "updated_at": updated, "workflow_id": workflow}
+
+
+def test_worktree_prune_removes_only_old_finished_agent_runs_and_never_forces(monkeypatch, capsys):
+    runs = [_run("old", "succeeded", "2020-01-01T00:00:00+00:00"),
+            _run("dirty", "failed", "2020-01-01T00:00:00+00:00"),
+            _run("new", "cancelled", "2999-01-01T00:00:00+00:00"),
+            _run("mock", "succeeded", "2020-01-01T00:00:00+00:00", workflow="synapse.mock.x")]
+    seen = _prune_fake(monkeypatch, runs, refuse={"dirty"})
+    assert run("agent-worktree-prune") == 0
+    removals = [e for e in seen if e.endswith("/agent-worktree-remove")]
+    assert removals == ["/api/v1/runs/old/agent-worktree-remove", "/api/v1/runs/dirty/agent-worktree-remove"]
+    assert not any("force" in e for e in seen)
+    out = capsys.readouterr().out
+    assert "removed old" in out and "kept dirty" in out and "removed: 1, kept: 1" in out
+
+
+def test_worktree_prune_dry_run_removes_nothing_and_rejects_bad_age(monkeypatch, capsys):
+    seen = _prune_fake(monkeypatch, [_run("old", "succeeded", "2020-01-01T00:00:00+00:00")])
+    assert run("agent-worktree-prune", "--dry-run", "--older-than", "12h") == 0
+    assert not any(e.endswith("/agent-worktree-remove") for e in seen)
+    assert "would remove old" in capsys.readouterr().out
+    assert run("agent-worktree-prune", "--older-than", "0d") == 2
+    assert run("agent-worktree-prune", "--older-than", "week") == 2

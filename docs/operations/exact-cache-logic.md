@@ -1,8 +1,8 @@
-# Exact cache: lookup and record logic (M5.4 cache 2/3)
+# Exact cache: lookup, record and SQL storage (M5.4 cache 2/3 and 3/3)
 
 `synapse.application.result_cache` holds the lookup and record logic for the exact result cache. It works against a storage port (`CacheStore`). The design reference is [ADR 017](../adr/017-m5-token-optimization-and-analytics.md) D6. The key and the cacheability rules come only from [`cache_key`](exact-cache-key.md).
 
-**Nothing is cached today.** The module is pure: no SQLite, no file or network I/O, no clock, no daemon. No runtime code calls it. The only store is `InMemoryCacheStore`, which exists for tests. The SQL storage needs migration 0017, which belongs to another workstream and does not exist yet. This change adds no migration.
+**Nothing is cached today.** The logic module is pure: no SQLite, no file or network I/O, no clock, no daemon. The SQL storage now exists: migration `0020_result_cache.sql` creates the `result_cache` table, and `synapse.persistence.result_cache_store.SqliteCacheStore` implements the port over it (see [SQL store](#sql-store-migration-0018) below). No runtime code calls either one: the engine is not wired, there is no operator flag and no events. `InMemoryCacheStore` remains for the logic tests.
 
 ## Which task classes can be cached
 
@@ -79,15 +79,21 @@ The one change an entry may get is a one-way invalidation marker. `InMemoryCache
 
 ## Not done
 
-- No SQL storage and no migration. A `CacheStore` backed by the `result_cache` table needs migration 0017 (A's).
 - Not wired into `AgentWorkflowEngine`. There is no operator flag and no `cache.lookup` / `cache.stored` events yet.
 - No TTL ceiling and no eviction or retention policy. `created_marker` is an opaque caller-supplied string, because this module has no clock.
-- No audited operator invalidate. `invalidate` exists only on the in-memory test store and is not part of the port.
+- No audited operator invalidate. `invalidate` exists on `InMemoryCacheStore` and `SqliteCacheStore` but is not part of the port, writes no audit record and nothing calls it.
+- Cache writes do not append to the audit hash chain. The append-only triggers are the protection.
 - Restored-from-backup databases are not yet invalidated as a whole.
 
-## Schema the storage needs (for migration 0017; not written here)
+## SQL store (migration 0020)
 
-The following statements were run in a scratch SQLite 3.54.1 database (not a migration) and behaved as noted under them. They use the built-in JSON functions and `GLOB`.
+The schema is `src/synapse/persistence/migrations_sql/0020_result_cache.sql` (0017 is `attempt_spawn_marks`, ADR 024). It is the statement set below, re-verified against the real migration by `tests/test_result_cache_store.py`, with three additions that the scratch version lacked:
+
+- every text column has `typeof(col) = 'text'`, so a BLOB with the same bytes (which `json_valid` and `length` would otherwise accept) is refused;
+- `json_type(entry_json) = 'object'`;
+- `invalidated_at` is bounded the same way when set.
+
+The statements were first run in a scratch SQLite 3.54.1 database and behaved as noted under them; the tests now check the same rows against the migration. They use the built-in JSON functions and `GLOB`.
 
 ```sql
 CREATE TABLE result_cache (
@@ -146,3 +152,11 @@ Required behaviour of the SQL store:
 - The columns `result_artifact_id`, `origin_attempt_id` and `created_at` duplicate fields of `entry_json`. They exist only for queries and joins, as in ADR 017 D3. The table CHECK makes them agree with `entry_json`, so `get` never needs them.
 - Any decode error in `get` should surface as an exception or as a non-`CacheEntry`. `lookup` turns either into a miss.
 - The repository is daemon-owned, like every other writer of authoritative SQLite state.
+
+What `SqliteCacheStore` does (tests in `tests/test_result_cache_store.py`):
+
+- `put` validates that the entry is exactly a `CacheEntry` for that key and is not already invalidated, then runs one `INSERT` inside its own `BEGIN IMMEDIATE` (or inside the caller's transaction, if one is open). The cursor's row count is the return value. Two connections racing on one key give exactly one `stored` and one `already_present`, and a second writer cannot decide while a first writer's insert is uncommitted (it needs the write lock; with `busy_timeout` 0 it fails as `store_error`) and reports `already_present` once that commits. Inside a caller's transaction, a failing `put` or `invalidate` raises, SQLite undoes only that statement, and the caller's transaction stays open with its earlier work intact; if the caller rolls back, a `put` made inside it leaves no row. The connection must use `isolation_level=None`, as `open_database` sets.
+- `get` reads `entry_json` and `invalidated_at` only. It parses strictly: duplicate object keys, `NaN`/`Infinity`, a number that overflows to infinity (`1e400`) in the key material, a non-object, or any field set other than the eight `CacheEntry.entry_json()` writes raise `CorruptCacheEntry`, which `lookup` reports as a `store_error` miss. Duplicate keys matter: SQLite's `json_extract` reads the first duplicate (so the column CHECK passes), Python's `json.loads` would read the last. Field values are left to `lookup` (wrong types give `malformed_entry`, a hand-edited field gives `entry_digest_mismatch`, edited material gives `material_mismatch`).
+- A hit through the SQL store is the same `CacheDecision` as before: never a verification, review, approval or mandatory check, and a lookup writes nothing (`total_changes` is unchanged).
+
+Migration numbering: 0017 is ADR 024's `attempt_spawn_marks`, 0018 and 0019 are ADR 026's multi-repository runs and candidate manifests, so the result cache is 0020. The loader refuses gaps.

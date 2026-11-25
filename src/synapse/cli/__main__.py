@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from datetime import datetime, timedelta, timezone
 import getpass
 import http.client
 import json
@@ -381,6 +382,52 @@ def _runs_command(args) -> int:
     return 0
 
 
+_PRUNE_AGE = re.compile(r"([1-9][0-9]{0,4})([hd])")
+_PRUNE_STATES = ("succeeded", "failed", "cancelled")
+
+
+def _prune_command(args) -> int:
+    """Client side only: lists finished agent runs and calls the audited, never-forced worktree removal."""
+    match = _PRUNE_AGE.fullmatch(args.older_than)
+    if match is None:
+        print("agentctl: --older-than must look like 12h or 7d", file=sys.stderr)
+        return 2
+    cutoff = datetime.now(timezone.utc) - timedelta(**{"hours" if match[2] == "h" else "days": int(match[1])})
+    removed = kept = failed = 0
+    try:
+        for state in _PRUNE_STATES:
+            cursor = None
+            while True:
+                query = {"limit": 100, "state": state, **({"cursor": cursor} if cursor else {})}
+                page = _request(args.state_dir, "/api/v1/runs?" + urlencode(query))
+                for run in page["runs"]:
+                    if not run["workflow_id"].startswith("synapse.agent.") \
+                            or datetime.fromisoformat(run["updated_at"]) >= cutoff:
+                        continue
+                    if args.dry_run:
+                        print(f"would remove {run['id']} ({state}, last change {run['updated_at']})")
+                        continue
+                    try:
+                        result = _request(args.state_dir, "/api/v1/runs/" + quote(run["id"], safe="") + "/agent-worktree-remove",
+                                          body=b"", idempotency_key=str(uuid.uuid4()), correlation_id=str(uuid.uuid4()))
+                    except RuntimeError as exc:  # 409: uncommitted changes or removal refused; the tree stays
+                        kept += 1
+                        print(f"kept {run['id']}: {exc}")
+                        continue
+                    if result.get("removed"):
+                        removed += 1
+                        print(f"removed {run['id']}")
+                cursor = page.get("next_cursor")
+                if not cursor:
+                    break
+    except (OSError, ValueError, RuntimeError, http.client.HTTPException) as exc:
+        print(f"agentctl: {type(exc).__name__}: {exc}", file=sys.stderr)
+        failed = 1
+    if not args.dry_run:
+        print(f"worktrees removed: {removed}, kept: {kept}")
+    return 1 if failed else 0
+
+
 _MAX_TASKS_FILE = 6 * 100 * 1024  # JSON escaping can inflate a 32 KiB prompt; the server still enforces 32 KiB per prompt
 _MAX_PROMPT = 32 * 1024
 
@@ -446,6 +493,11 @@ def _add_agent_parsers(commands) -> None:
                         help="discard uncommitted changes and unmerged commits on the run's branch")
     remove.add_argument("--idempotency-key", type=_command_header)
     remove.add_argument("--correlation-id", type=_command_header)
+    prune = commands.add_parser("agent-worktree-prune", help="remove the worktrees of FINISHED real agent runs older "
+                                "than a given age (never forced: a tree with uncommitted changes is kept)")
+    prune.add_argument("--older-than", default="7d", metavar="AGE",
+                       help="minimum time since the run last changed, such as 12h or 7d (default 7d)")
+    prune.add_argument("--dry-run", action="store_true", help="list what would be removed and remove nothing")
     commit = commands.add_parser("agent-worktree-commit", help="commit a FINISHED real agent run's edits onto its own "
                                  "branch (host-side; the sandboxed agent cannot commit; never touches your checkout)")
     commit.add_argument("run_id")
@@ -730,6 +782,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "runs":
         return _runs_command(args)
+    if args.command == "agent-worktree-prune":
+        return _prune_command(args)
     if args.command in ("profiles", "profile-cooldown"):
         return _profile_command(args, parser)
     if args.command in ("agent-start", "agent-show", "agent-cancel", "agent-abandon", "agent-worktree-remove",

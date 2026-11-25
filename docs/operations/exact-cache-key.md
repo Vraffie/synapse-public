@@ -2,7 +2,7 @@
 
 `synapse.application.cache_key` decides whether a task result may be looked up in or stored to an exact cache, and if so derives the key. The design reference is [ADR 017](../adr/017-m5-token-optimization-and-analytics.md) D6.
 
-**Nothing is cached today.** The module is pure: it stores nothing, does no I/O, and no runtime code calls it. The storage half (the `result_cache` table from ADR 017 D3 and the `cache.lookup` / `cache.stored` events from D2) needs a migration. That migration is blocked on numbering: 0017 belongs to another workstream and the loader requires contiguous version numbers (`persistence/migrations.py`). So you can't enable the cache: there is no flag and no storage. When the storage half lands, it will be off by default and behind an operator flag (ADR 017, first slice).
+**Nothing is cached today.** The module is pure: it stores nothing, does no I/O, and no runtime code calls it. The storage exists since migration 0020 (`result_cache` table, `SqliteCacheStore`, see [exact-cache-logic.md](exact-cache-logic.md)), but nothing calls it: there are no `cache.lookup` / `cache.stored` events (ADR 017 D2) and no operator flag. When it is wired, it will be off by default and behind an operator flag (ADR 017, first slice).
 
 ## API
 
@@ -64,9 +64,10 @@ Settings are hashed, and only the digest enters the material. A secret value und
 - Hashes: 64 lowercase hex characters.
 - Settings: a JSON-compatible mapping with string keys, nesting depth up to 8, at most 2048 nodes (every mapping, list and scalar counts), at most 64 KiB encoded. The node cap is enforced during the walk, before any serialisation, so a huge flat mapping or list bypasses as `invalid_input:settings_nodes` after at most 2049 steps. NaN and non-JSON values are refused.
 
-## Not done (the storage half, 2/2)
+## Not done
 
-- The `result_cache` table, with the one-way `invalidated_at` trigger.
+The `result_cache` table and its one-way `invalidated_at` trigger exist (migration 0020).
+
 - The `cache.lookup` / `cache.stored` events.
 - The audited operator invalidation.
 - The TTL ceiling.

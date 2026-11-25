@@ -393,7 +393,7 @@ def test_migration_0019_upgrade_from_0018_keeps_data(tmp_path):
         before = [r[1] for r in db.execute("PRAGMA table_info(approval_requests)")]
         db.execute("INSERT INTO audit_entries(principal, action, resource, decision, details_json, created_at) "
                    "VALUES ('op','read','run','allowed','{}','now')")
-        assert apply_migrations(db, ROOT / "migrations") == [19]
+        assert apply_migrations(db, ROOT / "migrations", limit=19) == [19]
         assert db.execute("SELECT principal FROM audit_entries").fetchall() == [("op",)]
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert {"candidate_manifests", "candidate_manifest_invalidations"} <= tables
