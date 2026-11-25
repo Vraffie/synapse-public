@@ -849,3 +849,24 @@ def test_agent_pane_shows_the_runs_profiles_from_the_real_shape(console):
     pane.set_detail(agent_view.sanitize_detail(base))
     assert pane.profile.text() == ''
     assert agent_view.sanitize_detail({**base, 'tasks': [{'profile_id': 'bad id\n'}]})['profiles'] == []
+
+
+def test_the_operators_default_account_is_preselected_but_a_deliberate_choice_wins(console):
+    c = console(profiles=PROFILES)
+    form = c.form
+    form.set_default_profile('claude-work')
+    c.fill()
+    assert form._profile_state == 'loaded' and form.profile.currentData() == 'claude-work'
+    assert form.submit_button.isEnabled()
+    pick(form, 'claude-personal-ios')
+    form.set_profiles(PROFILES)  # a refresh keeps the operator's own choice, not the default
+    assert form.profile.currentData() == 'claude-personal-ios'
+
+
+def test_a_default_account_that_is_in_cooldown_or_unknown_is_not_preselected(console):
+    c = console(profiles=PROFILES)
+    form = c.form
+    for bad in ('claude-personal', 'old', 'nobody', 'bad id', None):
+        form.set_default_profile(bad)
+        c.fill()
+        assert form.profile.currentData() is None

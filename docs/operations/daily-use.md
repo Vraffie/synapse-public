@@ -9,6 +9,13 @@ Details live in [agent-runs](agent-runs.md), [agentctl](agentctl.md), [install](
 
 - Start: `python scripts/synapse_up.py up /abs/path/to/repo` (state dir `~/.local/state/synapse`, sandbox on, daemon
   plus desktop; add `--no-desktop` for no console). Stop: `python scripts/synapse_up.py down`.
+- Default Claude account: if `~/.config/synapse/default-account` (or `SYNAPSE_DEFAULT_ACCOUNT`) holds one line
+  `ID /absolute/path/to/claude-config-dir` (for example `claude-work /home/me/.claude`, the directory you would give
+  `CLAUDE_CONFIG_DIR`; mode 0700), `up` declares that account as profile `ID` (up to 2 tasks at once, your `--tools`,
+  `acceptEdits`), starts the daemon with it and writes `<state>/default-profile`. `agentctl agent-start` then names
+  that profile when you give no `--profile`, and the desktop preselects it (you can still pick another). The daemon is
+  unchanged: its built-in `default` profile is still what a request naming no profile means, and the profile file only
+  holds a path, never a credential. Remove the file and rerun `up` to go back; `up` then deletes `default-profile`.
 - With no REPO, `up` registers your default repositories: the absolute paths, one per line (`#` for comments), in
   `~/.config/synapse/default-repos` (or the file named by `SYNAPSE_DEFAULT_REPOS`). The list is yours and is not part of
   this repository; each path must be a git checkout, and nested repositories are refused as usual.

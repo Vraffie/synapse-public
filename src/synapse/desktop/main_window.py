@@ -13,6 +13,7 @@ from synapse.desktop.connection import Poller
 from synapse.desktop.events_view import EventsMixin
 from synapse.desktop.messages_view import MessagesMixin
 from synapse.desktop.notifications import ApprovalNotifier
+from synapse.default_profile import read_default_profile
 from synapse.desktop.runs_view import RunsMixin
 from synapse.desktop.shortcuts import SHORTCUTS, ShortcutsDialog
 from synapse.desktop.status_bar import ConsoleStatusBar
@@ -37,6 +38,7 @@ class MainWindow(RunsMixin, MessagesMixin, ApprovalsMixin, EventsMixin, QMainWin
         self._init_events_state()
         self.events_tab = self._build_events_tab()
         self.runs_tab = self._build_runs_tab()
+        self.start_panel.agent_form.set_default_profile(read_default_profile(state_dir))  # the operator's default account
         self.messages_tab = self._build_messages_tab()
         self.approvals_tab = self._build_approvals_tab()
         self.tabs = QTabWidget()

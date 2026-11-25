@@ -17,6 +17,7 @@ import sys
 import uuid
 from urllib.parse import quote, urlencode
 
+from synapse.default_profile import read_default_profile
 from synapse.persistence.migrations import default_migrations_dir
 from synapse.persistence.approval_environment import ALLOWED_ENVIRONMENTS
 
@@ -651,8 +652,9 @@ def _agent_command(args, parser) -> int:
                 body = {"repo": args.repo, "base_ref": args.base_ref, "prompt": _read_prompt(args.prompt_file),
                         "allowed_tools": args.tools, "permission_mode": args.permission_mode,
                         "timeout_seconds": args.timeout_seconds}
-            if args.profile:
-                body["profile"] = args.profile
+            profile = args.profile or read_default_profile(args.state_dir)  # the operator's default account when none is named
+            if profile:
+                body["profile"] = profile
             if args.approval_operation:
                 step = {"operation": args.approval_operation, "target": args.approval_target}
                 if args.approval_ttl_seconds is not None:

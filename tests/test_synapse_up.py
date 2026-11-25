@@ -119,6 +119,7 @@ def fake_env(tmp_path, monkeypatch):
     state = tmp_path / "state"
     monkeypatch.setenv("SYNAPSE_STATE", str(state))
     monkeypatch.setenv("SYNAPSE_DEFAULT_REPOS", str(tmp_path / "no-default-repos"))  # never the real file
+    monkeypatch.setenv("SYNAPSE_DEFAULT_ACCOUNT", str(tmp_path / "no-default-account"))  # never the real file
     exe = make_exe(tmp_path / "opt" / "claude")
     monkeypatch.setattr(up, "find_claude", lambda env=None: exe)
     monkeypatch.setattr(up, "alive", lambda pidfile: True)
@@ -232,6 +233,54 @@ def test_start_hint_has_required_flags_and_no_hardcoded_base_ref():
     src = (Path(__file__).resolve().parent.parent / "scripts" / "synapse_up.py").read_text()
     assert "--base-ref BASE_REF" in src and "--base-ref main" not in src
     assert "--idempotency-key" in src and "--correlation-id" in src
+
+
+def test_default_account_declares_a_profile_starts_the_daemon_with_it_and_records_the_default(workspace_dir, fake_env, tmp_path, monkeypatch):
+    work = tmp_path / "claude-work-dir"
+    work.mkdir(mode=0o700)
+    account = tmp_path / "account"
+    account.write_text("# my account\nclaude-work %s\n" % work)
+    monkeypatch.setenv("SYNAPSE_DEFAULT_ACCOUNT", str(account))
+    started = []
+    monkeypatch.setattr(up, "alive", lambda pidfile: False)
+    monkeypatch.setattr(up, "spawn", lambda argv, log, pidfile: started.append(argv) or 1)
+    assert up.main(["up", str(workspace_dir / "api"), "--no-desktop", "--tools", "Read,Edit"]) == 0
+    profiles = json.loads((fake_env / "agent-profiles.json").read_text())["profiles"]
+    assert profiles == [{"id": "claude-work", "provider": "claude", "allowed_tools": ["Read", "Edit"],
+                         "permission_mode": "acceptEdits", "max_concurrency": 2, "enabled": True,
+                         "claude_config_dir": str(work)}]
+    assert (fake_env / "default-profile").read_text() == "claude-work\n"
+    assert stat.S_IMODE((fake_env / "agent-profiles.json").stat().st_mode) == 0o600
+    assert started[0][started[0].index("--agent-config") + 1] == str(fake_env / "agent-profiles.json")
+
+
+def test_without_an_account_no_profile_is_declared_and_a_stale_default_is_removed(workspace_dir, fake_env, monkeypatch):
+    fake_env.mkdir(mode=0o700)
+    (fake_env / "default-profile").write_text("claude-work\n")
+    started = []
+    monkeypatch.setattr(up, "alive", lambda pidfile: False)
+    monkeypatch.setattr(up, "spawn", lambda argv, log, pidfile: started.append(argv) or 1)
+    assert up.main(["up", str(workspace_dir / "api"), "--no-desktop"]) == 0
+    assert "--agent-config" not in started[0] and not (fake_env / "default-profile").exists()
+
+
+@pytest.mark.parametrize("text", ["", "claude-work\n", "default /x\n", "a b c\n", "claude-work relative/dir\n", "claude-work /nonexistent-dir\n"])
+def test_a_malformed_account_file_is_refused_before_anything_is_written(workspace_dir, fake_env, tmp_path, monkeypatch, text):
+    account = tmp_path / "account"
+    account.write_text(text)
+    monkeypatch.setenv("SYNAPSE_DEFAULT_ACCOUNT", str(account))
+    assert up.main(["up", str(workspace_dir / "api"), "--no-desktop"]) == 1
+    assert not fake_env.exists()
+
+
+def test_an_account_dir_open_to_others_is_refused(workspace_dir, fake_env, tmp_path, monkeypatch):
+    work = tmp_path / "wide"
+    work.mkdir(mode=0o755)
+    work.chmod(0o755)
+    account = tmp_path / "account"
+    account.write_text("claude-work %s\n" % work)
+    monkeypatch.setenv("SYNAPSE_DEFAULT_ACCOUNT", str(account))
+    assert up.main(["up", str(workspace_dir / "api"), "--no-desktop"]) == 1
 
 
 def test_up_without_a_repo_registers_the_default_repositories(workspace_dir, fake_env, tmp_path, monkeypatch, capsys):
