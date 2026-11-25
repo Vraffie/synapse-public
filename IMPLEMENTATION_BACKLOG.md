@@ -54,6 +54,12 @@ Step 2 result (2026-11-25): against the real Claude binary, a 2 s timeout ended 
 
 Step 3 result (2026-11-25): a `SIGKILL` of the daemon mid-run left the `claude` child running until the next daemon start, when the startup fence killed it; the run then sat in `recovering` with the attempt `unknown`. Added `agentctl agent-worktree-prune [--older-than 7d] [--dry-run]` (PR #54, merged: client side, never forced, audited through `agent-worktree-remove`) and `agentctl agent-restart RUN --prompt-file F` (PR #56: a new run from the old run's recorded request, prompt checked against its stored hash, old run untouched). In-run retry of an `unknown` attempt was deliberately not built; it needs its own ADR and stays open under M4-A. PR #44 (result cache, migration 0020) is merged; an unrelated desktop test (`test_cancelled_run_is_shown_as_stopped`) errored once in a full-suite run and passes alone, so it looks like a flake.
 
+Step 4 result (2026-11-25): PR #57. Daemon-restart recovery of the desktop was already covered by a live test; the run switcher showed only the newest 25 runs with no sign of more, and now shows the newest 100 with a note. Not measured with 500+ runs.
+
+Step 5 result (2026-11-25): the per-profile concurrency limit already exists (see M4-B). What blocks parallel work is the global one-active-run limit: a second `agent-start` got `409 Another run is active`. By owner decision no code was written; a multi-task run with three independent tasks started two together and the third when one finished (engine cap 2). Concurrent separate runs stay open under M4-B.
+
+Step 6 result (2026-11-25): `docs/operations/daily-use.md`, covering only what was run live; its last section lists what was not (the sandboxed `synapse_up.py up` start, the approval-gated path, process groups that escape, Codex).
+
 Known open item found while preparing this track: `tests/test_desktop_live_daemon.py::test_cancelled_run_is_shown_as_stopped` errored in a full-suite run on the PR #44 branch. The cause is not yet known and it is not yet checked against `main`.
 
 ## M0 — Architecture baseline (this repository)
@@ -130,7 +136,7 @@ Verified slices on `main` (a single real Claude task per run; fake-executable te
 
 ### M4-B — Concurrency and profiles
 Design: ADR 015 (PR #85) and ADR 016 (PR #95), both merged.
-- [ ] Remove the one-run limit: scheduler cap plus per-profile concurrency (up to 6 tasks). Multi-task runs landed in PR #88 (M4-B1; engine cap defaults to 2); the per-profile concurrency limit remains. `--agent-config` profiles, registry sync and profile resolution landed in PR #156 (A7a, `docs/operations/agent-profiles.md`); an optional `profile` on `POST /api/v1/agent-runs` is validated against the profile ceilings and fingerprinted for idempotency (A7b-1, validation only: not stored in the task spec or approval binding, no per-profile cap or routing yet).
+- [ ] Remove the one-run limit: scheduler cap plus per-profile concurrency (up to 6 tasks). Multi-task runs landed in PR #88 (M4-B1; engine cap defaults to 2); the per-profile limit is enforced by `claim_task` through the profile row (checked 2026-11-25; the built-in profile defaults to 2), but the global one-active-run limit (`409 Another run is active`, `AgentRuntime` holds one active run and one engine) remains, so concurrent separate runs are not built; independent tasks inside one run do run in parallel. `--agent-config` profiles, registry sync and profile resolution landed in PR #156 (A7a, `docs/operations/agent-profiles.md`); an optional `profile` on `POST /api/v1/agent-runs` is validated against the profile ceilings and fingerprinted for idempotency (A7b-1, validation only: not stored in the task spec or approval binding, no per-profile cap or routing yet).
 - [x] Multi-task runs: DAG of tasks, one worktree per task attempt (`orchestration/dependencies.py` is the base; PR #88, `POST /api/v1/agent-runs` accepts 1-6 `tasks`; dependents do not inherit prerequisite changes, merging results is a later integration step).
 - [x] Profile registry: pure selection and cooldowns (PR #91, library only).
 - [ ] Wire 2–3 Claude profiles into runs: fixed primary, policy fallback and cooldowns; never try to evade subscription limits. PR #88 has landed; the registry wiring from ADR 016 remains.
