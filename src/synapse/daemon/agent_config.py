@@ -7,19 +7,25 @@ documented keys. Anything else fails startup rather than being ignored.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
 import stat
 
+from synapse.infrastructure.worktrees import check_protected_patterns, check_registry_id
 from synapse.providers.claude_cli import ClaudeCliProfile
 from synapse.providers.sandbox_launcher import find_bwrap
 
 MAX_CONFIG_BYTES = 64 * 1024
 _REQUIRED = {"executable", "allowed_tools", "enabled"}
 _OPTIONAL = {"max_timeout_seconds", "repos", "worktree_root", "require_approval",
-             "require_approval_for_modes", "require_approval_for_tools", "sandbox"}
+             "require_approval_for_modes", "require_approval_for_tools", "sandbox", "allow_multi_repo_unsandboxed"}
 MAX_REPOS = 32
+MAX_REGISTRY_ENTRIES = 16  # object entries (multi-repository registry); the candidate manifest's repository limit
+MAX_BASELINE_REFS = 16
+_ENTRY_KEYS = {"id", "path"}
+_ENTRY_OPTIONAL = {"baseline_refs", "default_baseline_ref", "protected_paths"}
 
 
 class AgentConfigError(ValueError):
@@ -53,12 +59,47 @@ class ApprovalPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class RepoEntry:
+    """One operator registry entry (the object form of ``repos``, ADR 026 D1).
+
+    Only object entries can take part in a multi-repository run; a plain path string stays a legacy single-repository
+    allowlist entry. ``baseline_refs`` are full ``refs/heads/...`` names; ``protected_paths`` are anchored globs
+    (see ``synapse.infrastructure.worktrees.matches_protected``).
+    """
+    id: str
+    path: str
+    baseline_refs: tuple[str, ...]
+    default_baseline_ref: str | None
+    protected_paths: tuple[str, ...]
+
+    def canonical(self) -> dict:
+        return {"id": self.id, "path": self.path, "baseline_refs": list(self.baseline_refs),
+                "default_baseline_ref": self.default_baseline_ref, "protected_paths": list(self.protected_paths)}
+
+    @property
+    def entry_sha256(self) -> str:
+        return hashlib.sha256(json.dumps(self.canonical(), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def registry_sha256(entries) -> str:
+    """Digest of the validated registry (object entries, sorted by id), logged at daemon start."""
+    body = [e.canonical() for e in sorted(entries, key=lambda e: e.id)]
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
 class AgentConfig:
-    """Validated operator config. ``repos``/``worktree_root`` are both set or both empty."""
+    """Validated operator config. ``repos``/``worktree_root`` are both set or both empty.
+
+    ``repos`` is every allowlisted path (plain strings and object entries); ``registry`` holds only the object
+    entries, for multi-repository runs.
+    """
     profile: ClaudeCliProfile
     repos: tuple[str, ...] = ()
     worktree_root: str | None = None
     approval_policy: ApprovalPolicy = ApprovalPolicy()
+    registry: tuple[RepoEntry, ...] = ()
+    allow_multi_repo_unsandboxed: bool = False  # explicit operator waiver; default: multi-repo runs need the sandbox
 
 
 def _abs_path(value, what: str) -> str:
@@ -74,16 +115,64 @@ def _overlaps(a: str, b: str) -> bool:
     return pa == pb or pa in pb.parents or pb in pa.parents
 
 
-def _check_repos(data: dict, state_dir: Path) -> tuple[tuple[str, ...], str | None]:
+_BASELINE_REF_MAX = 256
+
+
+def _baseline_ref(value) -> str:
+    """A full local branch name: ``refs/heads/<name>`` with a conservative character set (no SHAs, no remotes)."""
+    if (not isinstance(value, str) or not value.startswith("refs/heads/") or len(value) > _BASELINE_REF_MAX
+            or not all(c.isascii() and (c.isalnum() or c in "._/-") for c in value) or ".." in value
+            or "//" in value or value.endswith(("/", ".", ".lock")) or "/." in value or "/-" in value):
+        raise AgentConfigError("baseline refs must be full refs/heads/<branch> names")
+    return value
+
+
+def _repo_entry(raw) -> RepoEntry:
+    if not isinstance(raw, dict) or not _ENTRY_KEYS <= set(raw) <= _ENTRY_KEYS | _ENTRY_OPTIONAL:
+        raise AgentConfigError("a repos object must have id and path and only the optional keys "
+                               "baseline_refs, default_baseline_ref, protected_paths")
+    try:
+        repo_id = check_registry_id(raw["id"])
+    except ValueError as exc:
+        raise AgentConfigError("repos object id: %s" % exc) from None
+    path = _abs_path(raw["path"], "repo")
+    refs = raw.get("baseline_refs")
+    default = raw.get("default_baseline_ref")
+    if refs is not None:
+        if not isinstance(refs, list) or not 1 <= len(refs) <= MAX_BASELINE_REFS:
+            raise AgentConfigError("baseline_refs must be a list of 1 to %d refs" % MAX_BASELINE_REFS)
+        refs = tuple(_baseline_ref(r) for r in refs)
+        if len(set(refs)) != len(refs):
+            raise AgentConfigError("baseline_refs must not contain duplicates")
+    if default is not None:
+        default = _baseline_ref(default)
+        if refs is None:
+            refs = (default,)
+        elif default not in refs:
+            raise AgentConfigError("default_baseline_ref must be one of baseline_refs")
+    try:
+        protected = check_protected_patterns(raw.get("protected_paths", []))
+    except ValueError as exc:
+        raise AgentConfigError("protected_paths: %s" % exc) from None
+    return RepoEntry(repo_id, path, tuple(refs or ()), default, protected)
+
+
+def _check_repos(data: dict, state_dir: Path) -> tuple[tuple[str, ...], str | None, tuple[RepoEntry, ...]]:
     if ("repos" in data) != ("worktree_root" in data):
         raise AgentConfigError("repos and worktree_root must be configured together")
     if "repos" not in data:
-        return (), None
+        return (), None, ()
     repos = data["repos"]
     if not isinstance(repos, list) or not 1 <= len(repos) <= MAX_REPOS:
-        raise AgentConfigError("repos must be a list of 1 to %d absolute paths" % MAX_REPOS)
-    clean = tuple(_abs_path(r, "repo") for r in repos)
-    if len(set(clean)) != len(clean):
+        raise AgentConfigError("repos must be a list of 1 to %d absolute paths or repository objects" % MAX_REPOS)
+    entries = tuple(_repo_entry(r) for r in repos if isinstance(r, dict))
+    if len(entries) > MAX_REGISTRY_ENTRIES:
+        raise AgentConfigError("at most %d repos may be repository objects" % MAX_REGISTRY_ENTRIES)
+    if len({e.id for e in entries}) != len(entries):
+        raise AgentConfigError("repos object ids must be unique")
+    clean = tuple(r["path"] if isinstance(r, dict) else _abs_path(r, "repo") for r in repos)
+    if len(set(clean)) != len(clean) or len({os.path.realpath(c) for c in clean}) != len(clean):
+        # two entries for one repository (also through different spellings) would give one repository two ids
         raise AgentConfigError("repos must not contain duplicates")
     root = _abs_path(data["worktree_root"], "worktree_root")
     state = os.path.realpath(state_dir)
@@ -95,7 +184,7 @@ def _check_repos(data: dict, state_dir: Path) -> tuple[tuple[str, ...], str | No
             raise AgentConfigError("repos must not overlap the state directory or worktree_root")
     if _overlaps(root, state) or _overlaps(os.path.realpath(root), state):
         raise AgentConfigError("worktree_root must be outside the state directory")
-    return clean, root
+    return clean, root, entries
 
 
 def _approval_policy(data: dict, profile: ClaudeCliProfile) -> ApprovalPolicy:
@@ -144,7 +233,7 @@ def load_agent_config(path: Path, state_dir: Path) -> AgentConfig:
     if not isinstance(data, dict) or not _REQUIRED <= set(data) <= _REQUIRED | _OPTIONAL:
         raise AgentConfigError("config must contain executable, allowed_tools, enabled and only the optional keys "
                                "max_timeout_seconds, repos, worktree_root, require_approval, require_approval_for_modes, "
-                               "require_approval_for_tools, sandbox")
+                               "require_approval_for_tools, sandbox, allow_multi_repo_unsandboxed")
     tools = data["allowed_tools"]
     if not isinstance(tools, list) or any(not isinstance(t, str) for t in tools):
         raise AgentConfigError("allowed_tools must be a list of strings")
@@ -153,7 +242,7 @@ def load_agent_config(path: Path, state_dir: Path) -> AgentConfig:
     sandbox = data.get("sandbox", False)
     if not isinstance(sandbox, bool):
         raise AgentConfigError("sandbox must be a boolean")
-    repos, root = _check_repos(data, state_dir)
+    repos, root, registry = _check_repos(data, state_dir)
     extra = {"sandbox": sandbox, "git_repos": tuple(repos)}
     if "max_timeout_seconds" in data:
         extra["max_timeout_seconds"] = data["max_timeout_seconds"]
@@ -169,4 +258,7 @@ def load_agent_config(path: Path, state_dir: Path) -> AgentConfig:
         raise AgentConfigError("executable does not exist or is not executable")
     if profile.enabled and profile.sandbox and find_bwrap() is None:
         raise AgentConfigError("sandbox is requested but bwrap is not installed (no unsandboxed fallback)")
-    return AgentConfig(profile, repos, root, _approval_policy(data, profile))
+    waiver = data.get("allow_multi_repo_unsandboxed", False)
+    if not isinstance(waiver, bool):
+        raise AgentConfigError("allow_multi_repo_unsandboxed must be a boolean")
+    return AgentConfig(profile, repos, root, _approval_policy(data, profile), registry, waiver)

@@ -66,7 +66,7 @@ def stubs():
     threads = [{**THREAD, "cursor": n} for n in range(1, 8)]
     messages = [{**MESSAGE, "cursor": n} for n in range(1, 8)]
     approvals = [{**APPROVAL, "id": "a%d" % n} for n in range(1, 8)]
-    agent = {"run_id": "r1", "run_state": "running", "cancellation_requested": False, "attempts_resumed": 0, "outcome": None,
+    agent = {"run_id": "r1", "run_state": "running", "cancellation_requested": False, "attempts_resumed": 0, "profile": "default", "outcome": None,
              "summary_text": None, "tool_names": [], "worktree": None, "tasks": []}
 
     def read_run(run_id):
@@ -156,9 +156,34 @@ def stubs():
         "abandon_agent_run": lambda *a, **k: _result({"run_id": "r1", "state": "failed", "cancelled_tasks": 1}),
         "commit_agent_worktree": lambda run_id, message: {"run_id": run_id, "tasks": [
             {"task_id": "t1", "branch": "synapse/r/t1", "head": "a" * 40, "paths": 1}]},
+        "build_manifest": _manifest_stub(MANIFEST),
+        "list_manifests": _manifest_stub({"run_id": "r1", "manifests": [{
+            "manifest_sha256": SHA, "version": 2, "seq": 1, "artifact_id": "art", "bindings_sha256": SHA, "created_at": TS,
+            "valid": False, "invalidations": [INVALIDATION]}]}),
+        "show_manifest": _manifest_stub({
+            "run_id": "r1", "manifest_sha256": SHA, "version": 2, "seq": 1, "created_at": TS, "valid": True,
+            "manifest": {"v": 2, "run_id": "r1", "repos": []}, "invalidations": [],
+            "diffs": [{"repo_id": "portfolio", "diff": "d", "truncated": False}]}),
+        "recheck_manifest": _manifest_stub({"run_id": "r1", "manifest_sha256": SHA, "valid": True, "invalidations": []}),
+        "request_manifest_approval": lambda run_id, *a, **k: (_manifest_stub(None)(run_id), _result({
+            "approval_id": "a1", "run_id": "r1", "manifest_sha256": SHA, "operation": "deploy", "target": "STAGING",
+            "state": "requested", "state_version": 0, "expires_at": TS}))[1],
         "remove_agent_worktree": lambda run_id, force: {"run_id": run_id, "removed": True,
                                                         "tasks": [{"task_id": "t", "removed": True}]},
     }
+
+
+SHA = "0" * 64
+MANIFEST = {"run_id": "r1", "manifest_sha256": SHA, "artifact_id": "art", "seq": 1, "invalidated": [], "replayed": False}
+INVALIDATION = {"reason": "operator", "actor": "owner", "at": TS}
+
+
+def _manifest_stub(body):
+    def fn(run_id, *a, **k):
+        if run_id == "missing":
+            raise RunNotFound()
+        return body
+    return fn
 
 
 def raising(exc):
@@ -198,7 +223,7 @@ def _cmd(path, body=None, headers=CMD):
 
 
 def _post_cases(path, body, callback, success, *, conflict=StateConflict(SECRET), blank=False, headers=CMD):
-    sub = path.replace("{run_id}", "r1").replace("{approval_id}", "a1")
+    sub = path.replace("{run_id}", "r1").replace("{approval_id}", "a1").replace("{manifest_sha256}", SHA)
     cases = {
         success: ({}, _cmd(sub, body, headers)),
         400: ({}, _cmd(sub, body, {k: v for k, v in headers.items() if k != "Idempotency-Key"})),
@@ -290,6 +315,16 @@ CASES[("/api/v1/approvals/{approval_id}/decision", "post")] = {
     403: ({"decide_approval": raising(ApprovalAccessDenied(SECRET, code="not_permitted", principal="p"))},
           _cmd("", DECISION_BODY, DECISION_HEADERS)),
 }
+MANIFESTS = "/api/v1/runs/{run_id}/candidate-manifests"
+for _route, _body_, _cb in (((MANIFESTS, "post"), {}, "build_manifest"),
+                            ((MANIFESTS + "/{manifest_sha256}/recheck", "post"), None, "recheck_manifest"),
+                            ((MANIFESTS + "/{manifest_sha256}/approval", "post"), {"environment": "STAGING"},
+                             "request_manifest_approval")):
+    _cases = _post_cases(_route[0], _body_, _cb, 200, conflict=AgentRunError(409, "baseline_moved"), blank=True)
+    _cases[404] = ({_cb: raising(RunNotFound())}, _cmd(_route[0].replace("{run_id}", "r1").replace("{manifest_sha256}", SHA), _body_))
+    CASES[_route] = _cases
+CASES[(MANIFESTS, "get")] = _get_cases(MANIFESTS.replace("{run_id}", "r1"), "list_manifests", "run")
+CASES[(MANIFESTS + "/{manifest_sha256}", "get")] = _get_cases(MANIFESTS.replace("{run_id}", "r1") + "/" + SHA, "show_manifest", "run")
 COOLDOWN = "/api/v1/profiles/{profile_id}/cooldown"
 COOLDOWN_HEADERS = {**AUTH, "X-Correlation-ID": "corr-1", "Content-Type": "application/json"}
 CASES[("/api/v1/profiles", "get")] = {
@@ -319,7 +354,7 @@ def _url(route, request):
     path, _ = route
     if "alt_path" in request:
         return request["alt_path"]
-    return (path.replace("{run_id}", "r1").replace("{approval_id}", "a1").replace("{thread_id}", "th1").replace("{profile_id}", "reader"))
+    return (path.replace("{run_id}", "r1").replace("{approval_id}", "a1").replace("{manifest_sha256}", SHA).replace("{thread_id}", "th1").replace("{profile_id}", "reader"))
 
 
 def fire(route, status):
@@ -415,7 +450,7 @@ ROUTES = sorted(DOC_ROUTES)
 
 
 def _bare(route):
-    path = route[0].replace("{run_id}", "r1").replace("{approval_id}", "a1").replace("{thread_id}", "th1").replace("{profile_id}", "reader")
+    path = route[0].replace("{run_id}", "r1").replace("{approval_id}", "a1").replace("{manifest_sha256}", SHA).replace("{thread_id}", "th1").replace("{profile_id}", "reader")
     return route[1].upper(), path
 
 

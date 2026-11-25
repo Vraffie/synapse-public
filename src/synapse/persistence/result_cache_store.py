@@ -1,4 +1,4 @@
-"""SQLite ``CacheStore`` for the exact result cache (M5.4 cache 3/3, ADR 017 D3/D6, migration 0018).
+"""SQLite ``CacheStore`` for the exact result cache (M5.4 cache 3/3, ADR 017 D3/D6, migration 0020).
 
 Implements the ``synapse.application.result_cache.CacheStore`` port over the ``result_cache`` table.
 The daemon owns the connection; nothing else may write this table. Not wired into the engine yet.

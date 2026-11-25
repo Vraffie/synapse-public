@@ -45,6 +45,45 @@ class AgentSpecError(ValueError):
     """The supplied agent task specs are invalid for this run or operator profile."""
 
 
+# --- multi-repository task specs (ADR 026 D5) ------------------------------------------------------------------------
+# A multi-repository spec carries ``repos: [{repo_id, access}]`` and NO worktree, worktree_head, repo or base_ref: the
+# pinned baselines live in run_repo_bindings and each attempt's paths in attempt_worktrees. The recorded spec also
+# carries the run's ``bindings_sha256`` so the full-spec hash (what an approval binds) covers the declared
+# repositories, their access modes AND their pinned baselines.
+MAX_SPEC_REPOS = 16
+# The only operation a multi-repository spawn-gate approval_step may name. Migration 0019's approval_multi_repo_binding
+# trigger allowlists exactly this string for its spawn-gate branch (a test keeps the two in step), so a deploy-like
+# operation can only ever bind a live candidate manifest.
+MULTI_REPO_SPAWN_OPERATION = "agent.run"
+_REPO_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_MULTI_SPEC_KEYS = {"prompt", "allowed_tools", "permission_mode", "timeout_seconds", "repos", "profile_id"}
+_MULTI_REQUIRED = {"prompt", "allowed_tools", "permission_mode", "timeout_seconds", "repos"}
+
+
+def check_repo_decls(value: Any) -> list[dict[str, str]]:
+    """``[{repo_id, access}]``: 1 to 16 distinct repositories sorted by repo_id, access ``write`` or ``read``."""
+    if not isinstance(value, (list, tuple)) or not 1 <= len(value) <= MAX_SPEC_REPOS:
+        raise ValueError("repos must list 1 to %d repositories" % MAX_SPEC_REPOS)
+    out = []
+    for r in value:
+        if not isinstance(r, dict) or set(r) != {"repo_id", "access"}:
+            raise ValueError("each repos entry must be {repo_id, access}")
+        rid = r["repo_id"]
+        if not isinstance(rid, str) or not _REPO_ID.fullmatch(rid) or ".." in rid or rid.endswith((".", ".lock")):
+            raise ValueError("repo_id is invalid")
+        if r["access"] not in ("write", "read"):
+            raise ValueError("access must be write or read")
+        out.append({"access": r["access"], "repo_id": rid})
+    ids = [r["repo_id"] for r in out]
+    if ids != sorted(set(ids)):
+        raise ValueError("repos must be distinct and sorted by repo_id")
+    return out
+
+
+def is_multi_repo(spec: Any) -> bool:
+    return isinstance(spec, dict) and "repos" in spec
+
+
 @dataclass(frozen=True, slots=True)
 class ParsedSpecs:
     specs: dict[str, dict[str, Any]]   # canonical, without artifact ids
@@ -58,7 +97,18 @@ def spec_hash(spec: dict[str, Any]) -> str:
     was created), tool set, permission mode and timeout. The approval step itself (operation, target,
     ttl) is bound separately by the approval row. Changing any covered field changes this digest, so
     the execution-time binding recheck fails closed.
+
+    A multi-repository spec (``repos`` present) hashes a different, closed body: kind ``agent_run_multi``, the
+    declared repositories and access modes, and the run's ``bindings_sha256`` (pinned baselines); no path or HEAD.
     """
+    if "repos" in spec:
+        multi = {"v": SPEC_HASH_VERSION, "kind": "agent_run_multi", "prompt_sha256": spec["prompt_sha256"],
+                 "repos": spec["repos"], "bindings_sha256": spec["bindings_sha256"],
+                 "allowed_tools": sorted(spec["allowed_tools"]), "permission_mode": spec["permission_mode"],
+                 "timeout_seconds": float(spec["timeout_seconds"])}
+        if spec.get("profile_id") is not None:
+            multi["profile_id"] = spec["profile_id"]
+        return hashlib.sha256(json.dumps(multi, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     body = {"v": SPEC_HASH_VERSION, "prompt_sha256": spec["prompt_sha256"], "repo": spec.get("repo"),
             "base_ref": spec.get("base_ref"), "worktree": spec["worktree"], "worktree_head": spec.get("worktree_head"),
             "allowed_tools": sorted(spec["allowed_tools"]), "permission_mode": spec["permission_mode"],
@@ -85,7 +135,7 @@ def _check_timeout(value: Any, ceiling: float) -> None:
 
 
 def parse_task_specs(raw: Any, *, operator_tools: tuple[str, ...], max_timeout: float,
-                     state_dir: str) -> ParsedSpecs:
+                     state_dir: str, bindings_sha256: str | None = None) -> ParsedSpecs:
     """Validate the closed shape and operator bounds. The worktree is checked with
     the provider adapter's own ``validate_worktree`` (fails closed)."""
     if not isinstance(raw, dict) or not raw or len(raw) > MAX_NODES:
@@ -95,7 +145,13 @@ def parse_task_specs(raw: Any, *, operator_tools: tuple[str, ...], max_timeout: 
     seen_worktrees: set[str] = set()
     for node, spec in raw.items():
         validate_id(node)
-        if not isinstance(spec, dict) or not _REQUIRED_SPEC_KEYS <= set(spec) <= _SPEC_KEYS | {"approval_step"}:
+        multi = is_multi_repo(spec)
+        if multi:
+            if not _MULTI_REQUIRED <= set(spec) <= _MULTI_SPEC_KEYS | {"approval_step"}:
+                raise AgentSpecError("multi-repository task spec has missing or unknown fields")
+            if not isinstance(bindings_sha256, str) or not _SHA256.fullmatch(bindings_sha256):
+                raise AgentSpecError("a multi-repository task needs the run's repository bindings")
+        elif not isinstance(spec, dict) or not _REQUIRED_SPEC_KEYS <= set(spec) <= _SPEC_KEYS | {"approval_step"}:
             raise AgentSpecError("task spec has missing or unknown fields")
         prompt = spec["prompt"]
         if not isinstance(prompt, str) or not prompt.strip() or "\x00" in prompt:
@@ -117,6 +173,24 @@ def parse_task_specs(raw: Any, *, operator_tools: tuple[str, ...], max_timeout: 
         if mode not in AGENT_PERMISSION_MODES:
             raise AgentSpecError("permission_mode must be one of %s" % ", ".join(sorted(AGENT_PERMISSION_MODES)))
         _check_timeout(spec["timeout_seconds"], max_timeout)
+        profile_id = spec.get("profile_id")
+        if profile_id is not None and (not isinstance(profile_id, str) or not _PROFILE_ID.fullmatch(profile_id)
+                                       or profile_id == "default"):  # the default is represented by absence
+            raise AgentSpecError("profile_id is invalid")
+        digest = hashlib.sha256(data).hexdigest()
+        if multi:
+            try:
+                repos = check_repo_decls(spec["repos"])
+            except ValueError as exc:
+                raise AgentSpecError("invalid repos: %s" % exc) from exc
+            recorded = {"prompt_sha256": digest, "prompt_bytes": len(data), "repos": repos,
+                        "bindings_sha256": bindings_sha256, "allowed_tools": sorted(set(tools)),
+                        "permission_mode": mode, "timeout_seconds": spec["timeout_seconds"]}
+            if profile_id is not None:
+                recorded["profile_id"] = profile_id
+            specs[node] = {**recorded, "approval_step": _approval_step(node, spec, recorded)}
+            prompts[node] = data
+            continue
         try:
             worktree = validate_worktree(spec["worktree"], state_dir)
         except ValueError as exc:
@@ -143,19 +217,35 @@ def parse_task_specs(raw: Any, *, operator_tools: tuple[str, ...], max_timeout: 
                     "timeout_seconds": spec["timeout_seconds"]}
         if profile_id is not None:
             recorded["profile_id"] = profile_id
-        step = None
-        if "approval_step" in spec:
-            raw_step = spec["approval_step"]
-            if not isinstance(raw_step, dict) or not {"operation", "target", "policy_version"} <= set(raw_step) <= _STEP_INPUT_KEYS:
-                raise AgentSpecError("approval_step has missing or unknown fields")
-            try:
-                # The approval binds the WHOLE spec: candidate_sha256 is the full-spec hash.
-                step = ms.parse_approval_steps({node: {**raw_step, "candidate_sha256": spec_hash(recorded)}})[node]
-            except ms.ScenarioError as exc:
-                raise AgentSpecError(str(exc)) from exc
-        specs[node] = {**recorded, "approval_step": step}
+        specs[node] = {**recorded, "approval_step": _approval_step(node, spec, recorded)}
         prompts[node] = data
     return ParsedSpecs(specs, prompts)
+
+
+def _approval_step(node: str, spec: dict[str, Any], recorded: dict[str, Any]) -> dict[str, Any] | None:
+    if "approval_step" not in spec:
+        return None
+    raw_step = spec["approval_step"]
+    if not isinstance(raw_step, dict) or not {"operation", "target", "policy_version"} <= set(raw_step) <= _STEP_INPUT_KEYS:
+        raise AgentSpecError("approval_step has missing or unknown fields")
+    if "repos" in recorded and raw_step["operation"] != MULTI_REPO_SPAWN_OPERATION:
+        raise AgentSpecError("a multi-repository approval_step operation must be %r" % MULTI_REPO_SPAWN_OPERATION)
+    try:
+        # The approval binds the WHOLE spec: candidate_sha256 is the full-spec hash.
+        return ms.parse_approval_steps({node: {**raw_step, "candidate_sha256": spec_hash(recorded)}})[node]
+    except ms.ScenarioError as exc:
+        raise AgentSpecError(str(exc)) from exc
+
+
+def _check_multi_shape(node: str, spec: dict[str, Any]) -> None:
+    keys = {"prompt_sha256", "prompt_bytes", "prompt_artifact_id", "repos", "bindings_sha256", "allowed_tools",
+            "permission_mode", "timeout_seconds", "approval_step"}
+    if set(spec) - {"profile_id"} != keys:
+        raise ValueError("bad spec keys")
+    if check_repo_decls(spec["repos"]) != spec["repos"]:
+        raise ValueError("bad repos")
+    if not isinstance(spec["bindings_sha256"], str) or not _SHA256.fullmatch(spec["bindings_sha256"]):
+        raise ValueError("bad bindings digest")
 
 
 def _sha(tasks: dict[str, dict[str, Any]]) -> str:
@@ -193,7 +283,9 @@ def record_task_specs(db: sqlite3.Connection, run_id: str, tasks: dict[str, dict
 def _check_shape(node: str, spec: Any) -> None:
     keys = {"prompt_sha256", "prompt_bytes", "prompt_artifact_id", "worktree", "allowed_tools",
             "permission_mode", "timeout_seconds", "approval_step", "repo", "base_ref", "worktree_head"}
-    if not isinstance(spec, dict) or set(spec) - {"profile_id"} != keys:
+    if is_multi_repo(spec):
+        _check_multi_shape(node, spec)
+    elif not isinstance(spec, dict) or set(spec) - {"profile_id"} != keys:
         raise ValueError("bad spec keys")
     if "profile_id" in spec and (not isinstance(spec["profile_id"], str) or not _PROFILE_ID.fullmatch(spec["profile_id"])
                                  or spec["profile_id"] == "default"):
@@ -204,7 +296,7 @@ def _check_shape(node: str, spec: Any) -> None:
         raise ValueError("bad digest")
     if type(spec["prompt_bytes"]) is not int or not 1 <= spec["prompt_bytes"] <= MAX_PROMPT_BYTES:
         raise ValueError("bad length")
-    if not isinstance(spec["worktree"], str) or not spec["worktree"].startswith("/"):
+    if "repos" not in spec and (not isinstance(spec["worktree"], str) or not spec["worktree"].startswith("/")):
         raise ValueError("bad worktree")
     tools = spec["allowed_tools"]
     if (not isinstance(tools, list) or not tools or len(tools) > MAX_ALLOWED_TOOLS or tools != sorted(set(tools))
@@ -213,6 +305,13 @@ def _check_shape(node: str, spec: Any) -> None:
     if spec["permission_mode"] not in AGENT_PERMISSION_MODES:
         raise ValueError("bad mode")
     _check_timeout(spec["timeout_seconds"], MAX_TIMEOUT_SECONDS)
+    if "repos" in spec:
+        step = spec["approval_step"]
+        if step is not None and (ms.parse_approval_steps({node: step}) != {node: step}
+                                 or step["operation"] != MULTI_REPO_SPAWN_OPERATION
+                                 or step["candidate_sha256"] != spec_hash(spec)):
+            raise ValueError("bad approval step")
+        return
     try:
         for key, limit, absolute in (("repo", 4096, True), ("base_ref", 256, False)):
             _check_optional_text(spec, key, limit, absolute)
@@ -242,6 +341,15 @@ def load_task_specs(db: sqlite3.Connection, run_id: str) -> dict[str, dict[str, 
         nodes = {row[0] for row in db.execute("SELECT node_id FROM tasks WHERE run_id=?", (run_id,))}
         if set(tasks) != nodes:
             return None
+        multi = [s for s in tasks.values() if is_multi_repo(s)]
+        if multi:
+            # Every task of a multi-repository run declares repositories, and every spec names THIS run's bindings.
+            from synapse.persistence.repo_bindings import bindings_digest, load_run_repos
+            bound = load_run_repos(db, run_id)
+            if len(multi) != len(tasks) or not bound:
+                return None
+            if any(s.get("bindings_sha256") != bindings_digest(bound.values()) for s in multi):
+                return None
         for node, spec in tasks.items():
             _check_shape(node, spec)
             art = db.execute("SELECT sha256,byte_size FROM artifacts WHERE id=?", (spec["prompt_artifact_id"],)).fetchone()

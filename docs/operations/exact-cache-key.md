@@ -2,7 +2,7 @@
 
 `synapse.application.cache_key` decides whether a task result may be looked up in or stored to an exact cache, and if so derives the key. The design reference is [ADR 017](../adr/017-m5-token-optimization-and-analytics.md) D6.
 
-**Nothing is cached today.** The module is pure: it stores nothing, does no I/O, and no runtime code calls it. The storage exists since migration 0018 (`result_cache` table, `SqliteCacheStore`, see [exact-cache-logic.md](exact-cache-logic.md)), but nothing calls it: there are no `cache.lookup` / `cache.stored` events (ADR 017 D2) and no operator flag. When it is wired, it will be off by default and behind an operator flag (ADR 017, first slice).
+**Nothing is cached today.** The module is pure: it stores nothing, does no I/O, and no runtime code calls it. The storage exists since migration 0020 (`result_cache` table, `SqliteCacheStore`, see [exact-cache-logic.md](exact-cache-logic.md)), but nothing calls it: there are no `cache.lookup` / `cache.stored` events (ADR 017 D2) and no operator flag. When it is wired, it will be off by default and behind an operator flag (ADR 017, first slice).
 
 ## API
 
@@ -66,7 +66,7 @@ Settings are hashed, and only the digest enters the material. A secret value und
 
 ## Not done
 
-The `result_cache` table and its one-way `invalidated_at` trigger exist (migration 0018).
+The `result_cache` table and its one-way `invalidated_at` trigger exist (migration 0020).
 
 - The `cache.lookup` / `cache.stored` events.
 - The audited operator invalidation.

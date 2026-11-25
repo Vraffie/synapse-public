@@ -1,4 +1,4 @@
-"""SQL result cache store (M5.4 cache 3/3): migration 0018, triggers, CHECKs, races, tamper, round trip."""
+"""SQL result cache store (M5.4 cache 3/3): migration 0020, triggers, CHECKs, races, tamper, round trip."""
 from contextlib import closing
 from dataclasses import replace
 import hashlib
@@ -125,25 +125,25 @@ def _all_rows(db) -> dict[str, list[tuple]]:
             for t in tables if t != "result_cache"}
 
 
-def test_upgrade_from_0017_keeps_existing_rows_and_adds_only_the_cache_table(tmp_path):
+def test_upgrade_from_0019_keeps_existing_rows_and_adds_only_the_cache_table(tmp_path):
     with closing(open_database(tmp_path / "v17.db")) as old:
-        assert apply_migrations(old, MIGRATIONS, limit=17)[-1] == 17
+        assert apply_migrations(old, MIGRATIONS, limit=19)[-1] == 19
         _seed_v17(old)
         rows_before = _all_rows(old)
         assert rows_before["attempt_spawn_marks"] == [("att-1", "2026-01-01T00:00:00Z")]
         assert len(rows_before["task_attempts"]) == 2 and rows_before["events"]
         before = {r[0] for r in old.execute("SELECT name FROM sqlite_master")}
         assert "result_cache" not in before
-        assert apply_migrations(old, MIGRATIONS) == [18]
+        assert apply_migrations(old, MIGRATIONS) == [20]
         assert apply_migrations(old, MIGRATIONS) == []
         after = {r[0] for r in old.execute("SELECT name FROM sqlite_master")}
         assert after - before == {"result_cache", "sqlite_autoindex_result_cache_1", "result_cache_first_writer_wins",
                                   "result_cache_no_update", "result_cache_no_delete"}
-        assert max(r[0] for r in old.execute("SELECT version FROM schema_migrations")) == 18
+        assert max(r[0] for r in old.execute("SELECT version FROM schema_migrations")) == 20
         assert _all_rows(old) == rows_before  # every pre-existing row is unchanged, byte for byte
         assert old.execute("SELECT count(*) FROM result_cache").fetchone() == (0,)
     with closing(open_database(tmp_path / "v17.db")) as upgraded:
-        fresh = schema_fingerprint(MIGRATIONS, 18)
+        fresh = schema_fingerprint(MIGRATIONS, 20)
         actual = {(k, n): (t, " ".join(s.split()) if s else None) for k, n, t, s in upgraded.execute(
             "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\'")}
         assert actual == fresh

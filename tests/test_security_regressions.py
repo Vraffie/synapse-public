@@ -150,7 +150,7 @@ def _dirty(mgr, repo):
     ("merge.x.driver", "touch pwned"), ("core.attributesFile", "/tmp/attrs"), ("core.askPass", "x"),
     ("core.editor", "x"), ("core.gitProxy", "x"), ("credential.helper", "!x"),
     ("credential.https://h.helper", "!x"), ("gpg.program", "x"), ("gpg.ssh.program", "x"),
-    ("includeIf.gitdir:/.path", "/tmp/x"), ("diff.x.command", "x"), ("filter.x.smudge", "x"),
+    ("includeIf.gitdir:/.path", "/nonexistent-synapse-test/x"), ("diff.x.command", "x"), ("filter.x.smudge", "x"),
     ("alias.x", "  !touch pwned"), ("core.fsmonitor", "true"), ("core.fsmonitor", "/bin/true")])
 def test_f4_more_dangerous_keys_refused_on_every_tree_call(mgr, repo, key, value):
     _dirty(mgr, repo)

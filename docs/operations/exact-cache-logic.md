@@ -2,7 +2,7 @@
 
 `synapse.application.result_cache` holds the lookup and record logic for the exact result cache. It works against a storage port (`CacheStore`). The design reference is [ADR 017](../adr/017-m5-token-optimization-and-analytics.md) D6. The key and the cacheability rules come only from [`cache_key`](exact-cache-key.md).
 
-**Nothing is cached today.** The logic module is pure: no SQLite, no file or network I/O, no clock, no daemon. The SQL storage now exists: migration `0018_result_cache.sql` creates the `result_cache` table, and `synapse.persistence.result_cache_store.SqliteCacheStore` implements the port over it (see [SQL store](#sql-store-migration-0018) below). No runtime code calls either one: the engine is not wired, there is no operator flag and no events. `InMemoryCacheStore` remains for the logic tests.
+**Nothing is cached today.** The logic module is pure: no SQLite, no file or network I/O, no clock, no daemon. The SQL storage now exists: migration `0020_result_cache.sql` creates the `result_cache` table, and `synapse.persistence.result_cache_store.SqliteCacheStore` implements the port over it (see [SQL store](#sql-store-migration-0018) below). No runtime code calls either one: the engine is not wired, there is no operator flag and no events. `InMemoryCacheStore` remains for the logic tests.
 
 ## Which task classes can be cached
 
@@ -85,9 +85,9 @@ The one change an entry may get is a one-way invalidation marker. `InMemoryCache
 - Cache writes do not append to the audit hash chain. The append-only triggers are the protection.
 - Restored-from-backup databases are not yet invalidated as a whole.
 
-## SQL store (migration 0018)
+## SQL store (migration 0020)
 
-The schema is `src/synapse/persistence/migrations_sql/0018_result_cache.sql` (0017 is `attempt_spawn_marks`, ADR 024). It is the statement set below, re-verified against the real migration by `tests/test_result_cache_store.py`, with three additions that the scratch version lacked:
+The schema is `src/synapse/persistence/migrations_sql/0020_result_cache.sql` (0017 is `attempt_spawn_marks`, ADR 024). It is the statement set below, re-verified against the real migration by `tests/test_result_cache_store.py`, with three additions that the scratch version lacked:
 
 - every text column has `typeof(col) = 'text'`, so a BLOB with the same bytes (which `json_valid` and `length` would otherwise accept) is refused;
 - `json_type(entry_json) = 'object'`;
@@ -159,4 +159,4 @@ What `SqliteCacheStore` does (tests in `tests/test_result_cache_store.py`):
 - `get` reads `entry_json` and `invalidated_at` only. It parses strictly: duplicate object keys, `NaN`/`Infinity`, a number that overflows to infinity (`1e400`) in the key material, a non-object, or any field set other than the eight `CacheEntry.entry_json()` writes raise `CorruptCacheEntry`, which `lookup` reports as a `store_error` miss. Duplicate keys matter: SQLite's `json_extract` reads the first duplicate (so the column CHECK passes), Python's `json.loads` would read the last. Field values are left to `lookup` (wrong types give `malformed_entry`, a hand-edited field gives `entry_digest_mismatch`, edited material gives `material_mismatch`).
 - A hit through the SQL store is the same `CacheDecision` as before: never a verification, review, approval or mandatory check, and a lookup writes nothing (`total_changes` is unchanged).
 
-Migration numbering: 0017 is ADR 024's `attempt_spawn_marks` (PR #41). This branch is built on it. ADR 026 plans a later migration, which must be 0019 or later. The loader refuses gaps, so 0018 cannot merge before 0017.
+Migration numbering: 0017 is ADR 024's `attempt_spawn_marks`, 0018 and 0019 are ADR 026's multi-repository runs and candidate manifests, so the result cache is 0020. The loader refuses gaps.

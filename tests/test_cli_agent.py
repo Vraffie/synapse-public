@@ -169,7 +169,7 @@ def test_request_accepts_201_and_200_for_start_only():
 
 
 def test_profiles_and_cooldown_commands_use_plain_requests(calls, capsys):
-    assert run("profiles") == 0
+    assert run("profiles", "--json") == 0
     assert calls[-1] == ("/api/v1/profiles", {})
     assert run("profile-cooldown", "reader", "--seconds", "90") == 0
     endpoint, kw = calls[-1]
@@ -203,3 +203,148 @@ def test_worktree_commit_command(calls):
     assert json.loads(kw["body"]) == {"message": "fix: it"}
     with pytest.raises(SystemExit):  # the message is mandatory
         run("agent-worktree-commit", "run-1")
+
+
+def test_start_sends_profile_only_when_given_and_validates_it(calls, tmp_path, capsys):
+    f = tmp_path / "p.txt"
+    f.write_text("hello")
+    assert run(*START, "--prompt-file", str(f)) == 0
+    assert "profile" not in json.loads(calls[-1][1]["body"])
+    assert run(*START, "--prompt-file", str(f), "--profile", "claude-personal-ios") == 0
+    assert json.loads(calls[-1][1]["body"])["profile"] == "claude-personal-ios"
+    n = len(calls)
+    for bad in ("", "a b", "x" * 65, "../etc", "a/b"):
+        with pytest.raises(SystemExit):
+            run(*START, "--prompt-file", str(f), "--profile", bad)
+    assert len(calls) == n
+
+
+def test_tasks_file_profile_is_passed_per_task_and_validated(calls, tmp_path, capsys):
+    tasks = tmp_path / "t.json"
+    tasks.write_text(json.dumps([{"id": "a", "prompt": "p", "allowed_tools": ["Read"], "profile": "claude-work"}]))
+    assert run("agent-start", "--repo", "/r", "--tasks-file", str(tasks), "--idempotency-key", "k", "--correlation-id", "c") == 0
+    assert json.loads(calls[-1][1]["body"])["tasks"][0]["profile"] == "claude-work"
+    n = len(calls)
+    tasks.write_text(json.dumps([{"id": "a", "prompt": "p", "allowed_tools": ["Read"], "profile": "no good"}]))
+    assert run("agent-start", "--repo", "/r", "--tasks-file", str(tasks), "--idempotency-key", "k", "--correlation-id", "c") == 1
+    assert len(calls) == n
+
+
+def test_start_shows_the_daemons_422_reason_and_exits_nonzero(monkeypatch, tmp_path, capsys):
+    def refuse(*_a, **_k):
+        raise cli.DaemonHTTPError(422, reason="profile is disabled")
+    monkeypatch.setattr(cli, "_request", refuse)
+    f = tmp_path / "p.txt"
+    f.write_text("hello")
+    assert run(*START, "--prompt-file", str(f), "--profile", "claude-work") == 1
+    err = capsys.readouterr().err
+    assert "422" in err and "profile is disabled" in err and "hello" not in err
+
+
+class _Resp:
+    def __init__(self, status, body):
+        self.status, self._body = status, body
+
+    def getheader(self, _name):
+        return None
+
+    def read(self, n=None):
+        return self._body[:n]
+
+
+@pytest.mark.parametrize("body,expected", [
+    (b'{"detail": "unknown profile"}', "unknown profile"),
+    (b'{"detail": "bad\\u001b[31m thing"}', "bad[31m thing"),
+    (b'{"detail": [{"msg": "x", "input": "SECRET"}]}', None),
+    (b"not json", None),
+    (b'{"detail": "' + b"x" * 500 + b'"}', "x" * 200),
+])
+def test_refusal_reason_is_string_detail_only_sanitized_and_bounded(body, expected):
+    assert cli._refusal_reason(_Resp(422, body)) == expected
+
+
+def test_profiles_prints_id_enabled_cooldown_and_tolerates_missing_fields(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_request", lambda *a, **k: {"profiles": [
+        {"id": "claude-work", "enabled": True, "cooldown_remaining_seconds": 0.0},
+        {"id": "claude-personal", "enabled": True, "cooldown_remaining_seconds": 90.0},
+        {"id": "claude-personal-ios", "enabled": False}, "junk"]})
+    assert run("profiles") == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[0].split() == ["ID", "ENABLED", "COOLDOWN"]
+    assert out[1].split() == ["claude-work", "yes", "-"]
+    assert out[2].split()[:2] == ["claude-personal", "yes"] and "cooling down 90 s" in out[2]
+    assert out[3].split()[:2] == ["claude-personal-ios", "no"] and len(out) == 4
+
+
+def test_agent_show_prints_the_real_task_profiles_and_a_top_level_one_and_tolerates_absence(monkeypatch, capsys):
+    tasks = [{"task_id": "t1", "profile_id": "claude-work", "spec": {"profile": "claude-personal"}},
+             {"task_id": "t2", "profile_id": None, "spec": {"profile": "claude-personal-ios"}},
+             {"task_id": "t3", "profile_id": "claude-work", "spec": {}}, {"task_id": "t4", "profile_id": "bad id\n"}]
+    monkeypatch.setattr(cli, "_request", lambda *a, **k: {"outcome": "ok", "tasks": tasks})
+    assert run("agent-show", "r1") == 0
+    captured = capsys.readouterr()
+    assert captured.err.splitlines() == ["profile: claude-work", "profile: claude-personal-ios"]
+    assert json.loads(captured.out)["tasks"][0]["profile_id"] == "claude-work"
+    monkeypatch.setattr(cli, "_request", lambda *a, **k: {"outcome": "ok", "profile": "claude-work"})
+    assert run("agent-show", "r1") == 0
+    assert "profile: claude-work" in capsys.readouterr().err
+    monkeypatch.setattr(cli, "_request", lambda *a, **k: {"outcome": "ok"})
+    assert run("agent-show", "r1") == 0
+    assert "profile" not in capsys.readouterr().err
+
+
+def test_profile_flag_goes_top_level_next_to_tasks(calls, tmp_path):
+    tasks = tmp_path / "t.json"
+    tasks.write_text(json.dumps([{"id": "a", "prompt": "p", "allowed_tools": ["Read"]}]))
+    assert run("agent-start", "--repo", "/r", "--tasks-file", str(tasks), "--profile", "claude-work",
+               "--idempotency-key", "k", "--correlation-id", "c") == 0
+    body = json.loads(calls[-1][1]["body"])
+    assert body["profile"] == "claude-work" and "profile" not in body["tasks"][0]
+
+
+def test_request_attaches_the_422_reason_from_a_real_response(tmp_path, monkeypatch):
+    class Conn:
+        def __init__(self, *_): pass
+        def request(self, *a, **k): pass
+        def getresponse(self): return _Resp(422, b'{"detail": "profile is disabled"}')
+        def close(self): pass
+    monkeypatch.setattr(cli, "UnixConnection", Conn)
+    monkeypatch.setattr(cli, "_load_token", lambda _d: "T" * 43)
+    import socket
+    sock = tmp_path / "agentd.sock"
+    s = socket.socket(socket.AF_UNIX)
+    s.bind(str(sock))
+    sock.chmod(0o600)
+    try:
+        with pytest.raises(cli.DaemonHTTPError) as caught:
+            cli._request(tmp_path, "/api/v1/agent-runs", body=b"{}", idempotency_key="k", correlation_id="c")
+    finally:
+        s.close()
+    assert caught.value.status == 422 and caught.value.reason == "profile is disabled"
+    assert "profile is disabled" in str(caught.value)
+
+
+def test_manifest_commands_send_the_documented_routes(calls):
+    sha = "ab" * 32
+    base = "/api/v1/runs/run-1/candidate-manifests"
+    assert run("manifest-build", "run-1", "--source", "t1=2", "--idempotency-key", "k", "--correlation-id", "c") == 0
+    endpoint, kw = calls[-1]
+    assert endpoint == base and json.loads(kw["body"]) == {"sources": {"t1": 2}} and kw["idempotency_key"] == "k"
+    assert run("manifest-build", "run-1") == 0 and json.loads(calls[-1][1]["body"]) == {}
+    assert run("manifest-list", "run-1") == 0 and calls[-1] == (base, {})
+    assert run("manifest-show", "run-1", sha) == 0 and calls[-1] == (base + "/" + sha, {})
+    assert run("manifest-recheck", "run-1", sha) == 0
+    assert calls[-1][0] == base + "/" + sha + "/recheck" and calls[-1][1]["body"] == b"" and calls[-1][1]["idempotency_key"]
+    assert run("manifest-approve", "run-1", sha, "--environment", "STAGING") == 0
+    endpoint, kw = calls[-1]
+    assert endpoint == base + "/" + sha + "/approval"
+    assert json.loads(kw["body"]) == {"environment": "STAGING", "policy_version": "1", "ttl_seconds": 3600}
+    for bad in (["manifest-show", "run-1", "XYZ"], ["manifest-approve", "run-1", sha, "--environment", "PROD"],
+                ["manifest-approve", "run-1", sha, "--environment", "DEV"],
+                ["manifest-build", "run-1", "--source", "t1=%d" % 2**31],
+                ["manifest-build", "run-1", "--source", "t1"], ["manifest-build", "run-1", "--source", "t1=0"],
+                ["manifest-build", "../x"]):
+        n = len(calls)
+        with pytest.raises(SystemExit):
+            run(*bad)
+        assert len(calls) == n

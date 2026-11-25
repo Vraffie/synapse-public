@@ -16,6 +16,7 @@ import uuid
 from urllib.parse import quote, urlencode
 
 from synapse.persistence.migrations import default_migrations_dir
+from synapse.persistence.approval_environment import ALLOWED_ENVIRONMENTS
 
 _TOKEN = re.compile(rb"[A-Za-z0-9_-]{43}")
 _MAX_RESPONSE = 16 * 1024 * 1024
@@ -26,10 +27,13 @@ _COMMAND_HEADER = re.compile(r"[\x21-\x7e]{1,256}\Z")
 
 class DaemonHTTPError(RuntimeError):
     """HTTP rejection without retaining a potentially sensitive response body."""
-    def __init__(self, status: int, locked_until: str | None = None):
+    def __init__(self, status: int, locked_until: str | None = None, reason: str | None = None):
         self.status = status
         self.locked_until = locked_until  # validated HH:MM (UTC) from a fixed header, never a body
+        self.reason = reason  # only a 422's short string "detail" (the daemon's refusal reason), sanitized and bounded
         message = f"daemon returned HTTP {status}"
+        if reason:
+            message += f": {reason}"
         if locked_until:
             message += f"; the approver is locked until {locked_until} UTC (operator reset: agentctl approver-unlock)"
         super().__init__(message)
@@ -82,6 +86,46 @@ def _follow_fetch(state_dir: Path):
     return fetch
 
 
+_REASON_MAX = 200
+_PROFILE_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")  # the daemon's profile id pattern (api/agent_commands.py)
+
+
+def _refusal_reason(response) -> str | None:
+    """The daemon's 422 reason: only a plain string ``detail`` (its own fixed refusal text), read with a small cap,
+    stripped of control characters and truncated. Validation-error lists (which could echo input) yield nothing."""
+    try:
+        detail = json.loads(response.read(4096)).get("detail")
+    except (ValueError, AttributeError, OSError, http.client.HTTPException):
+        return None
+    if not isinstance(detail, str):
+        return None
+    text = re.sub(r"[^\x20-\x7e]", "", detail).strip()[:_REASON_MAX]
+    return text or None
+
+
+def _run_profiles(result) -> list[str]:
+    """Distinct account ids of an agent-show answer: tasks[].profile_id (claimed) else tasks[].spec.profile
+    (requested), plus a top-level ``profile`` if the daemon returns one. Non-id values are ignored."""
+    if not isinstance(result, dict):
+        return []
+    values = [result.get("profile")]
+    for task in (result.get("tasks") if isinstance(result.get("tasks"), list) else [])[:50]:
+        if isinstance(task, dict):
+            spec = task.get("spec") if isinstance(task.get("spec"), dict) else {}
+            values.append(task.get("profile_id") if task.get("profile_id") is not None else spec.get("profile"))
+    found = []
+    for value in values:
+        if isinstance(value, str) and _PROFILE_ID.fullmatch(value) and value not in found:
+            found.append(value)
+    return found
+
+
+def _profile_id(value: str) -> str:
+    if _PROFILE_ID.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError("profile ID must be 1-64 characters of [A-Za-z0-9._-]")
+    return value
+
+
 def _request(state_dir: Path, endpoint: str, *, body: bytes | None = None,
              idempotency_key: str | None = None, correlation_id: str | None = None,
              approver_token: str | None = None, plain_method: str | None = None) -> object:
@@ -104,7 +148,8 @@ def _request(state_dir: Path, endpoint: str, *, body: bytes | None = None,
         else:
             method = "POST"
             expected = 201 if endpoint == "/api/v1/workflows" else 200 if endpoint.endswith("/decision") else 202
-            if endpoint.split("?", 1)[0].endswith(("/agent-abandon", "/agent-worktree-remove", "/agent-worktree-commit")):
+            if endpoint.split("?", 1)[0].endswith(("/agent-abandon", "/agent-worktree-remove", "/agent-worktree-commit")) \
+                    or "/candidate-manifests" in endpoint:
                 expected = 200
             if endpoint == "/api/v1/agent-runs":
                 expected = (200, 201)  # 201 new start, 200 idempotent replay
@@ -119,7 +164,8 @@ def _request(state_dir: Path, endpoint: str, *, body: bytes | None = None,
         response = connection.getresponse()
         if response.status not in (expected if isinstance(expected, tuple) else (expected,)):
             until = response.getheader("X-Approver-Locked-Until") if response.status == 403 else None
-            raise DaemonHTTPError(response.status, until if until and re.fullmatch(r"[0-2][0-9]:[0-5][0-9]", until) else None)
+            raise DaemonHTTPError(response.status, until if until and re.fullmatch(r"[0-2][0-9]:[0-5][0-9]", until) else None,
+                                  _refusal_reason(response) if response.status in (409, 422) else None)
         data = response.read(_MAX_RESPONSE + 1)
         if len(data) > _MAX_RESPONSE:
             raise RuntimeError("daemon response exceeds size limit")
@@ -371,6 +417,10 @@ def _add_agent_parsers(commands) -> None:
     source.add_argument("--tasks-file", help="JSON file with the \"tasks\" list (id, prompt, allowed_tools, depends_on ...) "
                                              "for a multi-task run, instead of --prompt-file/--tool; - for stdin")
     start.add_argument("--tool", action="append", dest="tools", help="allowed tool (repeatable; with --prompt-file)")
+    start.add_argument("--profile", type=_profile_id,
+                       help="Claude account profile for this run (see `agentctl profiles`); omitted: the daemon default. "
+                            "There is no fallback: an unknown or disabled profile is refused at start (HTTP 422); a profile in a "
+                            "cooldown is not refused at start, the task fails closed before spawning")
     start.add_argument("--permission-mode", default="acceptEdits", choices=("acceptEdits", "plan", "dontAsk", "manual"))
     start.add_argument("--timeout-seconds", type=float, default=600)
     start.add_argument("--approval-operation")
@@ -404,6 +454,77 @@ def _add_agent_parsers(commands) -> None:
     commit.add_argument("--correlation-id", type=_command_header)
 
 
+def _add_manifest_parsers(commands) -> None:
+    def common(p, key=True):
+        p.add_argument("run_id")
+        if key:
+            p.add_argument("--idempotency-key", type=_command_header)
+            p.add_argument("--correlation-id", type=_command_header)
+    build = commands.add_parser("manifest-build", help="build the candidate manifest v2 of a finished multi-repository run")
+    common(build)
+    build.add_argument("--source", action="append", default=[], metavar="TASK=ATTEMPT",
+                       help="use this attempt of a writer task (default: its latest completed attempt); repeatable")
+    commands.add_parser("manifest-list", help="list a run's candidate manifests with their invalidations").add_argument("run_id")
+    show = commands.add_parser("manifest-show", help="show one candidate manifest, its invalidations and diffs")
+    show.add_argument("run_id")
+    show.add_argument("manifest_sha256", type=_sha256_arg)
+    recheck = commands.add_parser("manifest-recheck", help="re-verify a manifest (records baseline_moved or candidate_invalid)")
+    common(recheck)
+    recheck.add_argument("manifest_sha256", type=_sha256_arg)
+    approve = commands.add_parser("manifest-approve", help="request a deploy approval bound to a live manifest (rechecked first); "
+                                  "the owner decides it with approval-decide")
+    common(approve)
+    approve.add_argument("manifest_sha256", type=_sha256_arg)
+    approve.add_argument("--environment", required=True, choices=sorted(ALLOWED_ENVIRONMENTS),
+                         help="an ADR 022 allowlisted environment (" + ", ".join(sorted(ALLOWED_ENVIRONMENTS)) + ")")
+    approve.add_argument("--policy-version", default="1")
+    approve.add_argument("--ttl-seconds", type=_integer(1, 3600), default=3600)
+
+
+def _sha256_arg(value: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise argparse.ArgumentTypeError("must be 64 lowercase hex characters")
+    return value
+
+
+def _manifest_command(args, parser) -> int:
+    import uuid
+    if not args.run_id.strip() or len(args.run_id) > 256 or "/" in args.run_id or args.run_id in (".", ".."):
+        parser.error("run ID must be a nonempty path segment up to 256 characters")
+    base = "/api/v1/runs/" + quote(args.run_id, safe="") + "/candidate-manifests"
+    def post(endpoint, body):
+        return _request(args.state_dir, endpoint, body=json.dumps(body).encode("utf-8"),
+                        idempotency_key=args.idempotency_key or str(uuid.uuid4()),
+                        correlation_id=args.correlation_id or str(uuid.uuid4()))
+    try:
+        if args.command == "manifest-build":
+            sources = {}
+            for item in args.source:
+                task, _, attempt = item.partition("=")
+                if (not task or not attempt.isdecimal() or not 1 <= int(attempt) <= 2**31 - 1 or task in sources
+                        or re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", task) is None):
+                    parser.error("--source must be TASK=ATTEMPT (attempt 1 to 2**31-1), once per task")
+                sources[task] = int(attempt)
+            result = post(base, {"sources": sources} if sources else {})
+        elif args.command == "manifest-list":
+            result = _request(args.state_dir, base)
+        elif args.command == "manifest-show":
+            result = _request(args.state_dir, base + "/" + args.manifest_sha256)
+        elif args.command == "manifest-recheck":
+            result = _request(args.state_dir, base + "/" + args.manifest_sha256 + "/recheck", body=b"",
+                              idempotency_key=args.idempotency_key or str(uuid.uuid4()),
+                              correlation_id=args.correlation_id or str(uuid.uuid4()))
+        else:
+            result = post(base + "/" + args.manifest_sha256 + "/approval",
+                          {"environment": args.environment, "policy_version": args.policy_version,
+                           "ttl_seconds": args.ttl_seconds})
+    except (OSError, ValueError, RuntimeError, http.client.HTTPException) as exc:
+        print(f"agentctl: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
 def _agent_command(args, parser) -> int:
     import uuid
     if args.command != "agent-start" and (not args.run_id.strip() or len(args.run_id) > 256 or "/" in args.run_id
@@ -422,6 +543,10 @@ def _agent_command(args, parser) -> int:
                     raise ValueError("tasks file is not valid JSON") from None
                 if not isinstance(tasks, list):
                     raise ValueError("tasks file must hold a JSON list of tasks")
+                for task in tasks:
+                    if isinstance(task, dict) and task.get("profile") is not None and (
+                            not isinstance(task["profile"], str) or _PROFILE_ID.fullmatch(task["profile"]) is None):
+                        raise ValueError("a task's profile must be 1-64 characters of [A-Za-z0-9._-]")
                 body = {"repo": args.repo, "base_ref": args.base_ref, "tasks": tasks,
                         "permission_mode": args.permission_mode, "timeout_seconds": args.timeout_seconds}
             else:
@@ -430,6 +555,8 @@ def _agent_command(args, parser) -> int:
                 body = {"repo": args.repo, "base_ref": args.base_ref, "prompt": _read_prompt(args.prompt_file),
                         "allowed_tools": args.tools, "permission_mode": args.permission_mode,
                         "timeout_seconds": args.timeout_seconds}
+            if args.profile:
+                body["profile"] = args.profile
             if args.approval_operation:
                 step = {"operation": args.approval_operation, "target": args.approval_target}
                 if args.approval_ttl_seconds is not None:
@@ -440,6 +567,8 @@ def _agent_command(args, parser) -> int:
                               idempotency_key=args.idempotency_key, correlation_id=args.correlation_id)
         elif args.command == "agent-show":
             result = _request(args.state_dir, "/api/v1/runs/" + quote(args.run_id, safe="") + "/agent")
+            for account in _run_profiles(result):
+                print("profile: " + account, file=sys.stderr)
         elif args.command == "agent-abandon":
             result = _request(args.state_dir, "/api/v1/runs/" + quote(args.run_id, safe="") + "/agent-abandon",
                               body=json.dumps({"expected_run_version": args.expected_run_version,
@@ -468,10 +597,30 @@ def _agent_command(args, parser) -> int:
     return 0
 
 
+def _profiles_table(rows: list) -> str:
+    """id, enabled, cooldown, tolerant of missing fields; control characters are stripped from every cell."""
+    def cell(value) -> str:
+        return re.sub(r"[^\x20-\x7e]", "", str(value))[:64]
+    lines = ["%-32s %-8s %s" % ("ID", "ENABLED", "COOLDOWN")]
+    for row in rows[:100]:
+        if not isinstance(row, dict):
+            continue
+        remaining = row.get("cooldown_remaining_seconds")
+        cooling = isinstance(remaining, (int, float)) and not isinstance(remaining, bool) and remaining > 0
+        lines.append("%-32s %-8s %s" % (cell(row.get("id", "?")), "yes" if row.get("enabled") else "no",
+                                        "cooling down %.0f s" % remaining if cooling else "-"))
+    return "\n".join(lines)
+
+
 def _profile_command(args, parser) -> int:
     try:
         if args.command == "profiles":
             result = _request(args.state_dir, "/api/v1/profiles")
+            if not args.json:
+                if not isinstance(result, dict) or not isinstance(result.get("profiles"), list):
+                    raise ValueError("unexpected profiles response")
+                print(_profiles_table(result["profiles"]))
+                return 0
         else:
             if re.fullmatch(r"[A-Za-z0-9._][A-Za-z0-9._-]{0,63}", args.profile) is None:
                 parser.error("profile ID must be 1-64 characters of [A-Za-z0-9._-]")
@@ -522,7 +671,8 @@ def main(argv: list[str] | None = None) -> int:
     for query in (threads, messages):
         query.add_argument("--after", type=_integer(0, _MAX_SEQUENCE), default=0)
         query.add_argument("--limit", type=_integer(1, 100), default=100)
-    commands.add_parser("profiles", help="list agent profiles: enabled, cap, load, cooldown")
+    commands.add_parser("profiles", help="list agent profiles (id, enabled, cooldown); --json for the full daemon answer"
+                        ).add_argument("--json", action="store_true", help="print the daemon's JSON instead of the table")
     cooldown = commands.add_parser("profile-cooldown", help="set or clear an operator cooldown on a declared profile")
     cooldown.add_argument("profile", help="profile ID")
     group = cooldown.add_mutually_exclusive_group(required=True)
@@ -533,6 +683,7 @@ def main(argv: list[str] | None = None) -> int:
     approvals.add_argument("--limit", type=_integer(1, 1000), default=100)
     _add_runs_parser(commands)
     _add_agent_parsers(commands)
+    _add_manifest_parsers(commands)
     publish = commands.add_parser("publish-workflow", help="publish a workflow definition from JSON")
     publish.add_argument("file", type=Path, help="regular JSON workflow file")
     queue = commands.add_parser("queue-run", help="create a queued run")
@@ -584,6 +735,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command in ("agent-start", "agent-show", "agent-cancel", "agent-abandon", "agent-worktree-remove",
                         "agent-worktree-commit"):
         return _agent_command(args, parser)
+    if args.command.startswith("manifest-"):
+        return _manifest_command(args, parser)
     if args.command == "approver-unlock":
         return _approver_unlock(args.state_dir)
     if args.command == "approver-init":

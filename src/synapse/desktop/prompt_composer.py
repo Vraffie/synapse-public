@@ -135,6 +135,8 @@ class PromptComposer(AgentRunForm):
         title.setObjectName("h2")
         top.addWidget(title)
         top.addStretch(1)
+        top.addWidget(QLabel("Claude account"))
+        top.addWidget(self.profile)
         top.addWidget(QLabel("Repository"))
         self.repo.setMinimumWidth(240)
         top.addWidget(self.repo)
@@ -166,6 +168,7 @@ class PromptComposer(AgentRunForm):
         for widget in (self.base_ref, self.approval_operation, self.approval_target):
             widget.textChanged.connect(self.update_state)
         self.mode.currentTextChanged.connect(self.update_state)
+        self.profile.currentIndexChanged.connect(self.update_state)
         self.require_approval.toggled.connect(self.update_state)
         self.update_state()
 
@@ -194,6 +197,10 @@ class PromptComposer(AgentRunForm):
         self.counter.setStyleSheet("color: #ff7c8b; font-weight: 700;" if over else "")
         self.counter.setProperty("over", over)
         self.submit_button.setEnabled(self.can_send())
+
+    def set_profiles(self, raw):
+        super().set_profiles(raw)
+        self.update_state()
 
     def set_pending(self, pending: bool):
         super().set_pending(pending)

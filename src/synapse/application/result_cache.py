@@ -2,7 +2,7 @@
 
 Pure: no SQLite, no file or network I/O, no clock, no daemon. Storage is a ``CacheStore`` port; the
 ``InMemoryCacheStore`` here exists for tests. The SQL store over the ``result_cache`` table (ADR 017
-D3, migration 0018) is ``synapse.persistence.result_cache_store``. Nothing in Synapse calls this
+D3, migration 0020) is ``synapse.persistence.result_cache_store``. Nothing in Synapse calls this
 module at runtime today.
 
 Rules:

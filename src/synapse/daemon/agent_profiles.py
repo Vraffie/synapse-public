@@ -4,7 +4,8 @@ The file is operator-owned JSON, read with the same checks as the other operator
 regular file, not group/world writable, size bounded, duplicate keys and non-finite numbers refused).
 It declares *narrower views* of the base profile given by ``--claude-cli-config``: the executable,
 sandbox, repos, worktree root and approval policy always come from that base file, so a claude entry
-holds no paths and no secrets. Unknown keys are refused (a credential-looking key gets a specific message).
+holds no secrets and at most one path: an optional ``claude_config_dir`` naming the Claude config directory of the
+account it runs as (checked with ``lstat`` only, never read; see ``claude_cli.check_claude_config_dir``). Unknown keys are refused (a credential-looking key gets a specific message).
 
 A ``codex`` entry (ADR 016 decision 4) additionally names its absolute ``executable`` (required); its
 state dir is the daemon's, it carries no credentials (the adapter copies ``auth.json`` per run), no
@@ -22,10 +23,12 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import sqlite3
 
 from synapse.daemon.agent_config import AgentConfig, AgentConfigError, _abs_path
+from synapse.providers.claude_cli import check_claude_config_dir, claude_scratch_base
 from synapse.providers.codex_cli import CodexIneligible, sandbox_for_task
 from synapse.daemon.profile_registry import (
     _ID, _MODEL, _TOOL, MAX_CONCURRENCY, MAX_PROFILES, MAX_TIMEOUT_CEILING, ProfileRegistry, ProfileSpec,
@@ -37,7 +40,8 @@ DEFAULT_PROFILE_ID = "default"
 RESERVED_PREFIX = "synapse.builtin."
 REGISTRY_REF_PREFIX = "registry:"
 _REQUIRED = {"id", "provider", "allowed_tools", "permission_mode", "enabled"}
-_OPTIONAL = {"model", "max_timeout_seconds", "max_concurrency", "executable"}  # executable: codex only (required)
+_OPTIONAL = {"model", "max_timeout_seconds", "max_concurrency", "executable",  # executable: codex only (required)
+             "claude_config_dir"}  # claude only
 CODEX_SANDBOX_REFUSAL = ("%s: codex profiles are refused while the --claude-cli-config base has \"sandbox\": true; "
                          "Synapse does not run Codex inside bwrap, so a codex child could read the state dir "
                          "(approver/operator tokens) that the sandbox hides from Claude")
@@ -118,8 +122,23 @@ def _entry(raw, index: int, base: AgentConfig) -> ProfileSpec:
     if model is not None and (not isinstance(model, str) or not _MODEL.fullmatch(model)):
         raise RegistryError("%s model must be a 1-64 character alias of [A-Za-z0-9._:-]" % where)
     cap = _int_in(raw.get("max_concurrency", 1), 1, MAX_CONCURRENCY, "%s max_concurrency" % where)
+    config_dir = _config_dir(raw, where, base) if "claude_config_dir" in raw else None
     return ProfileSpec(pid, provider, executable, tuple(sorted(tools)), cap, raw["enabled"],
-                       float(timeout), model, mode)
+                       float(timeout), model, mode, config_dir)
+
+
+def _config_dir(raw: dict, where: str, base: AgentConfig) -> str:
+    """A claude profile's config dir: path only, lstat-vetted, outside everything an agent can write or read."""
+    if raw["provider"] != "claude":
+        raise RegistryError("%s: claude_config_dir is only supported for a claude profile" % where)
+    state = base.profile.state_dir
+    avoid = (state, os.path.join(state, "codex-run"), claude_scratch_base(), *base.repos,
+             *((base.worktree_root,) if base.worktree_root else ()))
+    try:
+        check_claude_config_dir(raw["claude_config_dir"], avoid=avoid)
+    except ValueError as exc:
+        raise RegistryError("%s: %s" % (where, exc)) from None
+    return raw["claude_config_dir"]
 
 
 def build_registry(base: AgentConfig, declared: tuple[ProfileSpec, ...] = ()) -> ProfileRegistry:
@@ -140,7 +159,13 @@ def load_agent_profiles(path: Path, base: AgentConfig) -> ProfileRegistry:
     if not isinstance(raw, list) or not 1 <= len(raw) <= MAX_PROFILES - 1:
         raise RegistryError("profiles must be a list of 1 to %d entries (%r is implicit)"
                             % (MAX_PROFILES - 1, DEFAULT_PROFILE_ID))
-    return build_registry(base, tuple(_entry(p, i, base) for i, p in enumerate(raw)))
+    declared = tuple(_entry(p, i, base) for i, p in enumerate(raw))
+    dirs = [s.claude_config_dir for s in declared if s.claude_config_dir is not None]
+    for i, a in enumerate(dirs):
+        if any(a == b or a.startswith(b + os.sep) or b.startswith(a + os.sep) for b in dirs[i + 1:]):
+            # One account per directory: two profiles sharing (or nesting) a dir would silently share a login.
+            raise RegistryError("claude_config_dir must be distinct (and not nested) for every profile")
+    return build_registry(base, declared)
 
 
 def spec_sha256(spec: ProfileSpec) -> str:
@@ -150,6 +175,8 @@ def spec_sha256(spec: ProfileSpec) -> str:
             "enabled": spec.enabled}
     if spec.provider == "codex":  # its own executable is part of what it is; claude hashes stay unchanged
         body["executable"] = spec.executable
+    if spec.claude_config_dir is not None:  # which account it runs as; absent keeps earlier hashes unchanged
+        body["claude_config_dir"] = spec.claude_config_dir
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
 

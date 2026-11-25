@@ -15,6 +15,7 @@ from enum import StrEnum
 
 from synapse.domain.contracts import validate_id
 from synapse.persistence import audit_chain
+from synapse.persistence.candidate_manifests import is_invalidated as is_manifest_invalidated
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
@@ -28,6 +29,7 @@ class DenialReason(StrEnum):
     REVOKED = "revoked"
     MALFORMED = "malformed"
     CHAIN_BROKEN = "chain_broken"
+    MANIFEST_INVALIDATED = "manifest_invalidated"
 
 
 class ApprovalNotGranted(Exception):
@@ -46,6 +48,7 @@ class ApprovalBindingMismatch(ApprovalNotGranted): ...
 class ApprovalRevoked(ApprovalNotGranted): ...
 class ApprovalMalformed(ApprovalNotGranted): ...
 class ApprovalChainBroken(ApprovalNotGranted): ...
+class ApprovalManifestInvalidated(ApprovalNotGranted): ...
 
 
 _ERRORS = {
@@ -53,6 +56,7 @@ _ERRORS = {
     DenialReason.NOT_APPROVED: ApprovalNotApproved, DenialReason.EXPIRED: ApprovalExpired,
     DenialReason.BINDING_MISMATCH: ApprovalBindingMismatch, DenialReason.REVOKED: ApprovalRevoked,
     DenialReason.MALFORMED: ApprovalMalformed, DenialReason.CHAIN_BROKEN: ApprovalChainBroken,
+    DenialReason.MANIFEST_INVALIDATED: ApprovalManifestInvalidated,
 }
 
 
@@ -152,6 +156,7 @@ def verify_approval_for_execution(connection: sqlite3.Connection, *, approval_id
             "expires_at,decided_at,decision_principal,requester_subject "
             "FROM approval_requests WHERE id=?", (approval_id,)
         ).fetchone()
+        invalidated = row is not None and is_manifest_invalidated(connection, row[3])
     finally:
         connection.execute("COMMIT")
     if row is None:
@@ -181,6 +186,8 @@ def verify_approval_for_execution(connection: sqlite3.Connection, *, approval_id
                _equal(s_policy, policy_version)]
     if not all(matches):
         raise _deny(DenialReason.BINDING_MISMATCH)
+    if invalidated:  # ADR 026 D9: a manifest invalidated after the decision authorizes nothing
+        raise _deny(DenialReason.MANIFEST_INVALIDATED)
     if (not isinstance(principal, str) or not principal.strip()
             or not isinstance(requester, str) or not requester.strip()):
         raise _deny(DenialReason.MALFORMED, "Approval lacks a decision principal or requester identity")

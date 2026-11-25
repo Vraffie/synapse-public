@@ -3,6 +3,8 @@ from copy import deepcopy
 
 from fastapi.openapi.utils import get_openapi
 
+from synapse.api.manifest_contracts import MANIFEST_RESPONSES
+
 
 def _object(properties, *, required=None):
     return {"type": "object", "properties": properties,
@@ -29,13 +31,33 @@ ATTEMPT = _object({"id": STRING, "attempt_no": INTEGER, "profile_id": _nullable(
 TASK = _object(TASK_FIELDS)
 TASK_DETAIL = _object({**TASK_FIELDS, "attempts": {"type": "array", "items": ATTEMPT}})
 DEPENDENCY = _object({"task_id": STRING, "depends_on_id": STRING})
-APPROVAL_SUBJECT = {"anyOf": [{"type": "null"}, _object({
-    "kind": {"type": "string", "const": "agent_run"}, "node_id": STRING, "repo": _nullable(), "base_ref": _nullable(),
-    "worktree_head": _nullable(), "allowed_tools": {"type": "array", "items": STRING}, "permission_mode": STRING,
+_SUBJECT_COMMON = {
+    "allowed_tools": {"type": "array", "items": STRING}, "permission_mode": STRING,
     "timeout_seconds": {"type": "number"}, "prompt_bytes": INTEGER, "prompt_preview": _nullable(),
-    "allowed_tools_truncated": {"type": "boolean"}, "prompt_preview_truncated": {"type": "boolean"}, "prompt_unavailable": {"type": "boolean"},
-    "spec_sha256": STRING})],
-    "description": "Read-only, bounded description of what an agent-run approval authorizes; null for other approvals. "
+    "allowed_tools_truncated": {"type": "boolean"}, "prompt_preview_truncated": {"type": "boolean"},
+    "prompt_unavailable": {"type": "boolean"}, "spec_sha256": STRING}
+_AGENT_RUN_SUBJECT = _object({
+    "kind": {"type": "string", "const": "agent_run"}, "node_id": STRING, "repo": _nullable(), "base_ref": _nullable(),
+    "worktree_head": _nullable(), **_SUBJECT_COMMON})
+_SUBJECT_REPO = _object({"repo_id": STRING, "access": {"type": "string", "enum": ["write", "read"]},
+                         "baseline_ref": STRING, "baseline_sha": STRING})
+_AGENT_RUN_MULTI_SUBJECT = _object({
+    "kind": {"type": "string", "const": "agent_run_multi"}, "node_id": STRING,
+    "repos": {"type": "array", "items": _SUBJECT_REPO}, **_SUBJECT_COMMON})
+_MANIFEST_REPO = _object({**_SUBJECT_REPO["properties"], "candidate_sha": _nullable(),
+                          "changed_paths": _nullable("integer"), "diff_bytes": _nullable("integer")})
+_MANIFEST_SUBJECT = _object({
+    "kind": {"type": "string", "const": "candidate_manifest"}, "manifest_sha256": STRING, "seq": INTEGER,
+    "bindings_sha256": STRING,
+    "invalidated": {"type": "array", "items": {"type": "string",
+                                               "enum": ["baseline_moved", "candidate_invalid", "operator"]}},
+    "repos": {"anyOf": [{"type": "null"}, {"type": "array", "items": _MANIFEST_REPO}]},
+    "manifest_unavailable": {"type": "boolean"}})
+APPROVAL_SUBJECT = {"anyOf": [{"type": "null"}, _AGENT_RUN_SUBJECT, _AGENT_RUN_MULTI_SUBJECT, _MANIFEST_SUBJECT],
+    "description": "Read-only, bounded description of what an approval authorizes: agent_run (single repository), "
+                   "agent_run_multi (multi-repository task: repositories, access and pinned baselines, no paths) or "
+                   "candidate_manifest (an approval bound to a v2 candidate manifest: per-repository baseline and "
+                   "candidate commits, invalidation reasons); null for other approvals. "
                    "prompt_preview (at most 8 KiB) is only present while the approval is pending."}
 APPROVAL = _object({"id": STRING, "run_id": STRING, "operation": STRING, "target": STRING,
                     "candidate_manifest_sha256": STRING, "policy_version": STRING, "state": STRING,
@@ -118,6 +140,7 @@ RESPONSES = {
                                                    "worktree_path": STRING, "repo": STRING, "base_ref": STRING})),
     ("/api/v1/runs/{run_id}/agent", "get"): (200, _object({"run_id": STRING, "run_state": STRING, "cancellation_requested": {"type": "boolean"},
                                                            "attempts_resumed": INTEGER,
+                                                           "profile": {"type": ["string", "null"], "description": "Run-level profile id selected at creation ('default' when none was named); null for runs started before it was recorded."},
                                                            "outcome": _nullable(), "summary_text": _nullable(),
                                                            "tool_names": {"type": "array", "items": STRING},
                                                            "worktree": {"anyOf": [{"type": "null"}, _object({"status": STRING, "head": STRING, "diff_stat": STRING, "diff": STRING, "truncated": {"type": "boolean"}})]},
@@ -134,6 +157,7 @@ RESPONSES = {
     ("/api/v1/profiles/{profile_id}/cooldown", "delete"): (200, _object({"id": STRING, "cooldown_remaining_seconds": {"type": "number"}})),
     ("/api/v1/runs/{run_id}/mock-cancel", "post"): (202, _object({"run_id": STRING, "state": {"type": "string", "const": "cancellation_requested"}})),
 }
+RESPONSES.update(MANIFEST_RESPONSES)
 
 
 def install_openapi_contracts(app):
@@ -155,7 +179,7 @@ def install_openapi_contracts(app):
                 errors = {401, 422, 500}
                 if path == "/api/v1/system/health":  # no input to validate and no failing dependency
                     errors = {401}
-                if path.startswith("/api/v1/runs/{run_id}") and method == "get":
+                if path.startswith("/api/v1/runs/{run_id}") and (method == "get" or "/candidate-manifests" in path):
                     errors.update({404, 503})
                 if path == "/api/v1/approvals" or (path == "/api/v1/runs" and method == "get"):
                     errors.add(503)
@@ -171,6 +195,8 @@ def install_openapi_contracts(app):
                         errors.update({403, 413, 415})
                     if path in ("/api/v1/workflows", "/api/v1/runs", "/api/v1/runs/{run_id}/mock-resume", "/api/v1/agent-runs"):
                         errors.update({413, 415})
+                if "/candidate-manifests" in path and method == "post" and not path.endswith("/recheck"):
+                    errors.update({413, 415})
                 for error_status in sorted(errors):
                     operation["responses"][str(error_status)] = {"description": "Error response", "content": {"application/json": {"schema": deepcopy(ERROR)}}}
             app.openapi_schema = schema

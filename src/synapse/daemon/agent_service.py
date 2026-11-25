@@ -16,11 +16,13 @@ import json
 import logging
 import re
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from synapse.api.agent_commands import AgentRunError
 from synapse.daemon.agent_profiles import DEFAULT_PROFILE_ID, mode_within
 from synapse.daemon.agent_runtime import AgentDisabled, AgentRuntime
+from synapse.daemon.multi_repo import MAX_RUN_REPOS, RepoRegistry, RepoRequestError, resolve_run_repos
 from synapse.daemon.profile_registry import Cooldowns, ProfileRegistry, ProfileSpec
 from synapse.domain.contracts import EventEnvelope, encode_payload
 from synapse.domain.runs import RunChange, RunState
@@ -55,6 +57,7 @@ SHOW_DIFF_BYTES = 16 * 1024
 # control or glob characters, no '..', '@{', trailing '.lock' or '/'.
 _REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/@+~^-]{0,255}")
 _TOKEN = re.compile(r"[A-Za-z0-9._:/@+-]{1,128}")
+_REPO_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
 def profile_policy(runtime):
@@ -81,9 +84,11 @@ def _bad(message: str) -> AgentRunError:
 
 class AgentRunService:
     def __init__(self, db: sqlite3.Connection, runtime: AgentRuntime, manager: WorktreeManager | None,
-                 registry: ProfileRegistry | None = None):
+                 registry: ProfileRegistry | None = None, repo_registry: RepoRegistry | None = None):
         self.db, self.runtime, self.manager = db, runtime, manager
         self.registry = registry  # None: only the implicit default profile (the --claude-cli-config one)
+        # Object entries of the operator's repos (ADR 026); empty: multi-repository runs are refused.
+        self.repo_registry = repo_registry or RepoRegistry()
         self._start_lock = asyncio.Lock()
 
     # ------------------------------------------------------------ validation
@@ -116,6 +121,9 @@ class AgentRunService:
             raise _bad("profile provider is not supported")
         if spec.provider == "codex" and getattr(self.runtime.profile, "sandbox", True) is not False:
             raise _bad("codex profiles are refused while the base profile is sandboxed")
+        if self.runtime.cooldowns.active(spec.id):
+            # Refused at creation (no run, no worktree, no spawn); never rerouted to another profile.
+            raise _bad("profile is cooling down")
         return spec
 
     def validate(self, req: dict, profile_id: str | None = None) -> dict:
@@ -126,6 +134,8 @@ class AgentRunService:
         """
         profile_id = profile_id if profile_id is not None else req.get("profile")
         spec = self.resolve_profile(profile_id)
+        if req.get("repos") is not None:
+            return self._validate_multi(req, spec)
         ref = req["base_ref"]
         if (not isinstance(ref, str) or not _REF.fullmatch(ref) or ".." in ref or "@{" in ref
                 or ref.endswith((".lock", "/", ".")) or "//" in ref):
@@ -151,6 +161,65 @@ class AgentRunService:
                                    default_mode=None, default_timeout=None, spec=spec)
         return {"repo": req["repo"], "base_ref": ref, "tasks": [task], "legacy": True,
                 "profile": self._explicit_profile(spec)}
+
+    def _validate_multi(self, req: dict, spec: ProfileSpec) -> dict:
+        """A multi-repository request (ADR 026 slice 1): ``repos: [{repo_id[, baseline_ref]}]`` for the run and
+        ``tasks[].repos: [{repo_id, access}]`` per task. Pure shape checks; registry membership and refs are checked
+        (and pinned) in ``_start`` before any state change."""
+        if req.get("repo") is not None or req.get("base_ref") is not None:
+            raise _bad("give either repo and base_ref or repos, not both")
+        raw = req["repos"]
+        if not isinstance(raw, list) or not 1 <= len(raw) <= MAX_RUN_REPOS:
+            raise _bad("repos must contain 1 to %d entries" % MAX_RUN_REPOS)
+        run_repos = []
+        for r in raw:
+            if not isinstance(r, dict) or not {"repo_id"} <= set(r) <= {"repo_id", "baseline_ref"}:
+                raise _bad("each repos entry must be {repo_id[, baseline_ref]}")
+            rid = r["repo_id"]
+            if not isinstance(rid, str) or not _REPO_ID.fullmatch(rid) or ".." in rid or rid.endswith((".", ".lock")):
+                raise _bad("repo_id must be 1-128 characters of [A-Za-z0-9._-]")
+            ref = r.get("baseline_ref")
+            if ref is not None and (not isinstance(ref, str) or not ref.startswith("refs/heads/") or not _REF.fullmatch(ref)
+                                    or ".." in ref or "@{" in ref or ref.endswith((".lock", "/", ".")) or "//" in ref):
+                raise _bad("baseline_ref must be a full refs/heads/<branch> name")
+            run_repos.append({"repo_id": rid, "baseline_ref": ref})
+        ids = [r["repo_id"] for r in run_repos]
+        if len(set(ids)) != len(ids):
+            raise _bad("repos must not repeat a repo_id")
+        if req.get("tasks") is None or any(req.get(k) is not None for k in ("prompt", "allowed_tools")):
+            raise _bad("a multi-repository run needs tasks (not a single prompt)")
+        tasks_raw = req["tasks"]
+        if not isinstance(tasks_raw, list) or not 1 <= len(tasks_raw) <= MAX_TASKS:
+            raise _bad("tasks must contain 1 to %d entries" % MAX_TASKS)
+        tasks, writers = [], set()
+        for t in tasks_raw:
+            tspec = spec if not isinstance(t, dict) or t.get("profile") is None else self.resolve_profile(t["profile"])
+            if tspec.provider != "claude":
+                raise _bad("multi-repository runs support claude profiles only")
+            task = self._validate_task(
+                t, default_mode=req.get("permission_mode", tspec.permission_mode or "acceptEdits"),
+                default_timeout=req.get("timeout_seconds", DEFAULT_TIMEOUT), spec=tspec)
+            declared = t.get("repos")
+            if not isinstance(declared, list) or not 1 <= len(declared) <= MAX_RUN_REPOS:
+                raise _bad("each task must declare 1 to %d repos" % MAX_RUN_REPOS)
+            mine = []
+            for d in declared:
+                if (not isinstance(d, dict) or set(d) != {"repo_id", "access"} or d["repo_id"] not in ids
+                        or d["access"] not in ("write", "read")):
+                    raise _bad("task repos must be {repo_id, access} naming the run's repos with access write or read")
+                mine.append({"repo_id": d["repo_id"], "access": d["access"]})
+            if len({d["repo_id"] for d in mine}) != len(mine):
+                raise _bad("task repos must not repeat a repo_id")
+            for d in mine:
+                if d["access"] == "write":
+                    if d["repo_id"] in writers:
+                        raise _bad("at most one task per run may write a repository")
+                    writers.add(d["repo_id"])
+            task["repos"] = sorted(mine, key=lambda d: d["repo_id"])
+            tasks.append(task)
+        self._check_graph(tasks)
+        return {"repo": None, "base_ref": None, "repos": sorted(run_repos, key=lambda r: r["repo_id"]),
+                "tasks": tasks, "legacy": False, "profile": self._explicit_profile(spec)}
 
     @staticmethod
     def _explicit_profile(spec: ProfileSpec) -> str | None:
@@ -242,6 +311,8 @@ class AgentRunService:
             t = one(req["tasks"][0])
             return {"repo": req["repo"], "base_ref": req["base_ref"], **{k: t[k] for k in (
                 "allowed_tools", "permission_mode", "timeout_seconds", "approval_step", "prompt_sha256")}, **extra}
+        if req.get("repos"):
+            extra["repos"] = req["repos"]
         return {"repo": req["repo"], "base_ref": req["base_ref"], "tasks": [one(t) for t in req["tasks"]], **extra}
 
     def _receipt(self, key: str, request_hash: str) -> dict | None:
@@ -268,6 +339,8 @@ class AgentRunService:
         receipt = self._receipt(key, request_hash)
         if receipt is not None:
             return CommandResult(receipt, replayed=True)
+        if req.get("repos"):
+            return await self._start_multi(key, req)
         # Side-effect-free git pre-flight: allowlist, ref resolves, no dangerous repo config.
         try:
             await asyncio.to_thread(self.manager.check_base, req["repo"], req["base_ref"])
@@ -308,7 +381,7 @@ class AgentRunService:
                     spec["approval_step"] = {**task["approval_step"], "policy_version": POLICY_VERSION}
                 specs[node] = spec
             try:
-                self.runtime.start(run_id, "agent-start:" + run_id, specs)
+                self.runtime.start(run_id, "agent-start:" + run_id, specs, run_profile=req.get("profile"))
             except AgentDisabled:
                 raise AgentRunError(503, "Agent runs are not configured") from None
             except at.AgentSpecError:
@@ -328,6 +401,60 @@ class AgentRunService:
         return execute_idempotent(self.db, principal=PRINCIPAL, operation=OPERATION, key=key,
                                   request=self._fingerprint(req),
                                   execute=lambda db: response)
+
+    async def _start_multi(self, key: str, req: dict) -> CommandResult:
+        """Multi-repository start (ADR 026 slice 1). Every baseline is pinned before any state change; the bindings
+        and specs are written by ``runtime.start`` in the transaction that starts the run. No worktree is created
+        here: each attempt creates all of its worktrees just before its spawn, or none."""
+        if not self.repo_registry.entries:
+            raise _bad("multi-repository runs are not configured (no repository objects in repos)")
+        hooks = getattr(self.runtime, "_workspaces", None)
+        if not getattr(self.runtime.profile, "sandbox", False) and not getattr(hooks, "allow_unsandboxed", False):
+            raise _bad("multi_repo_requires_sandbox: multi-repository runs need the sandbox "
+                       "(or the operator's allow_multi_repo_unsandboxed)")
+        try:
+            bindings = await asyncio.to_thread(resolve_run_repos, self.repo_registry, self.manager, req["repos"])
+        except RepoRequestError as exc:
+            raise _bad(str(exc)) from None
+        if self.runtime._busy() or self.db.execute(
+                "SELECT 1 FROM mock_run_config c JOIN runs r ON r.id=c.run_id WHERE r.state='running' LIMIT 1").fetchone():
+            raise AgentRunError(409, "Another run is active")
+        run_id, task_ids = self._queue_run(key, req)
+        writers = {d["repo_id"]: task_ids[t["id"]] for t in req["tasks"] for d in t["repos"] if d["access"] == "write"}
+        bindings = [replace(b, writer_task_id=writers.get(b.repo_id)) for b in bindings]
+        try:
+            specs = {}
+            for task in req["tasks"]:
+                node = task["id"]
+                # ADR 026 D5: the spec names repositories and access modes only; baselines live in the bindings and
+                # each attempt's paths in attempt_worktrees (created just before its spawn).
+                spec = {"prompt": task["prompt"], "allowed_tools": task["allowed_tools"],
+                        "permission_mode": task["permission_mode"], "timeout_seconds": task["timeout_seconds"],
+                        "repos": [{"repo_id": d["repo_id"], "access": d["access"]} for d in task["repos"]]}
+                named = task["profile"] if "profile" in task else req.get("profile")
+                if named and named != DEFAULT_PROFILE_ID:
+                    spec["profile_id"] = named
+                if task["approval_step"] is not None:
+                    spec["approval_step"] = {**task["approval_step"], "policy_version": POLICY_VERSION}
+                specs[node] = spec
+            try:
+                self.runtime.start(run_id, "agent-start:" + run_id, specs, repo_bindings=bindings,
+                                   run_profile=req.get("profile"))
+            except AgentDisabled:
+                raise AgentRunError(503, "Agent runs are not configured") from None
+            except at.AgentSpecError:
+                raise _bad("agent task specification was rejected") from None
+            except (StateConflict, IdempotencyConflict):
+                raise AgentRunError(409, "Agent run cannot be started") from None
+        except BaseException:
+            await self._cleanup(run_id, [])
+            raise
+        response = {"run_id": run_id, "state": "running",
+                    "repos": [{"repo_id": b.repo_id, "baseline_ref": b.baseline_ref, "baseline_sha": b.baseline_sha}
+                              for b in bindings],
+                    "tasks": [{"id": t["id"], "task_id": task_ids[t["id"]], "repos": t["repos"]} for t in req["tasks"]]}
+        return execute_idempotent(self.db, principal=PRINCIPAL, operation=OPERATION, key=key,
+                                  request=self._fingerprint(req), execute=lambda db: response)
 
     def _queue_run(self, key: str, req: dict) -> tuple[str, dict[str, str]]:
         """Idempotently publish the workflow (single node, or the requested DAG) and queue a fresh run.
@@ -594,16 +721,19 @@ class AgentRunService:
             tasks.append({
                 "task_id": task_id, "node_id": node, "state": state, "profile_id": assigned,
                 "spec": {**({"profile": spec["profile_id"]} if spec.get("profile_id") else {}),
-                         "repo": spec["repo"], "base_ref": spec["base_ref"], "worktree_head": spec["worktree_head"],
+                         "repo": spec.get("repo"), "base_ref": spec.get("base_ref"),
+                         "worktree_head": spec.get("worktree_head"),
+                         # multi-repository task (ADR 026): declared repositories; per-attempt trees are not shown here
+                         **({"repos": spec["repos"]} if "repos" in spec else {}),
                          "spec_sha256": None if step is None else step["candidate_sha256"],
                          "permission_mode": spec["permission_mode"], "allowed_tools": spec["allowed_tools"],
                          "timeout_seconds": spec["timeout_seconds"], "prompt_sha256": spec["prompt_sha256"],
-                         "prompt_bytes": spec["prompt_bytes"], "worktree_path": spec["worktree"],
+                         "prompt_bytes": spec["prompt_bytes"], "worktree_path": spec.get("worktree"),
                          "approval_step": None if step is None else {k: step[k] for k in ("operation", "target", "ttl_seconds")}},
                 "attempt": None if attempt is None else {"id": attempt[0], "attempt_no": attempt[1], "state": attempt[2],
                                                          "profile_id": attempt[3]},
                 "result": self._summary(task_id),
-                "worktree": await self._worktree(run_id, task_id),
+                "worktree": None if "repos" in spec else await self._worktree(run_id, task_id),
             })
         first = tasks[0] if tasks else None
         summary = first and first["result"]
@@ -619,7 +749,14 @@ class AgentRunService:
                 "worktree": flat,
                 "cancellation_requested": self.db.execute("SELECT 1 FROM events WHERE run_id=? AND type='agent.cancellation_requested' LIMIT 1", (run_id,)).fetchone() is not None,
                 "attempts_resumed": resumed_count(self.db, run_id),  # never-spawned attempts re-queued at startup (ADR 024)
+                "profile": self._run_profile(run_id),
                 "tasks": tasks}
+
+    def _run_profile(self, run_id: str) -> str | None:
+        """The run-level profile recorded at start (``agent.run_profile_selected``); None for older runs."""
+        row = self.db.execute("SELECT json_extract(payload_json,'$.profile_id') FROM events WHERE run_id=? "
+                              "AND type='agent.run_profile_selected' ORDER BY sequence LIMIT 1", (run_id,)).fetchone()
+        return row[0] if row is not None and isinstance(row[0], str) else None
 
     def _summary(self, task_id: str) -> dict | None:
         row = self.db.execute("SELECT sha256 FROM artifacts WHERE json_extract(provenance_json,'$.kind')='agent_summary' "
