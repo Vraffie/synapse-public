@@ -66,8 +66,10 @@ async def _call(fn, *args):
         raise HTTPException(404, detail="Run not found") from None
     except AgentRunError as exc:
         raise HTTPException(exc.status, detail=exc.message) from None
-    except (IdempotencyConflict, StateConflict):
+    except IdempotencyConflict:
         raise HTTPException(409, detail="Idempotency key conflicts with prior request") from None
+    except StateConflict:
+        raise HTTPException(409, detail="State changed concurrently; retry") from None
 
 
 def manifest_router(build: BuildManifest | None, list_: ListManifests | None, show: ShowManifest | None,
