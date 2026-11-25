@@ -474,7 +474,7 @@ def test_migration_0018_upgrade_keeps_data_and_tables_are_insert_only(tmp_path):
         assert applied[-1] == 17
         db.execute("INSERT INTO audit_entries(principal, action, resource, decision, details_json, created_at) "
                    "VALUES ('op','read','run','allowed','{}','now')")
-        assert apply_migrations(db, ROOT / "migrations") == [18]
+        assert apply_migrations(db, ROOT / "migrations", limit=18) == [18]
         assert db.execute("SELECT principal FROM audit_entries").fetchall() == [("op",)]
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert {"run_repo_bindings", "attempt_worktrees", "attempt_repo_commits"} <= tables

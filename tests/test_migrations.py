@@ -12,10 +12,10 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_initial_migration_and_idempotent_replay(tmp_path):
     connection = open_database(tmp_path / "synapse.sqlite")
     try:
-        assert apply_migrations(connection, ROOT / "migrations") == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+        assert apply_migrations(connection, ROOT / "migrations") == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
         assert apply_migrations(connection, ROOT / "migrations") == []
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
-        assert connection.execute("SELECT version FROM schema_migrations").fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,), (12,), (13,), (14,), (15,), (16,), (17,), (18,)]
+        assert connection.execute("SELECT version FROM schema_migrations").fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,), (12,), (13,), (14,), (15,), (16,), (17,), (18,), (19,)]
         tables = {r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert {"runs", "tasks", "messages", "events", "outbox"} <= tables
     finally:
@@ -96,7 +96,7 @@ def test_concurrent_migration_reads_history_under_write_lock(tmp_path):
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(lambda _: migrate(), range(2)))
-    assert sorted(results) == [[], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]]
+    assert sorted(results) == [[], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]]
 
 
 def test_missing_earlier_applied_migration_rejected(tmp_path):

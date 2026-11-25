@@ -82,6 +82,28 @@ task shows the approval subject kind `agent_run_multi` (repositories, access, pi
 (`evidence_multi_repo_unsupported`) until per-repository evidence lands. Single-repository runs are unchanged
 (operator-requested commit, no bindings rows).
 
+#### Candidate manifest v2 (ADR 026 D8, migration 0019)
+
+After a multi-repository run, the daemon (`daemon/manifest_builder.py`, `ManifestBuilder.build(run_id,
+sources=None)`; the HTTP route and `agentctl` command are B's lane) builds one manifest binding every repository
+of the run: read repositories with their pinned baseline, write repositories with the candidate commit, the
+source attempt, the diff hash and size, the changed-path count and the two passed validations. Steps, each a
+refusal with a fixed code: the pinned baselines are re-resolved (`baseline_moved` invalidates every manifest of
+the run and no further manifest can be built: start a new run); each writer task's latest `completed` attempt
+(or the one named in `sources`) must have `done`/`unchanged` for every repository it writes (`no_source_attempt`,
+`candidate_invalid:commit_incomplete`); the commit rule is re-run on `diff-tree baseline candidate` from the
+object store (`candidate_invalid:<reason>`); at least one repository must differ (`no_changes`). Diffs over
+60,000 bytes are refused (`candidate_invalid:diff_too_large`). The bytes go to the artifact store and a row to
+`candidate_manifests`; the same candidates always give the same `manifest_sha256`.
+
+In a multi-repository run every approval must bind either a live manifest of the run (the only form a `deploy`
+approval can take) or a task's recorded `agent_run_multi` approval step; the database refuses anything else.
+`ManifestBuilder.recheck` repeats the baseline and candidate checks (before a deploy approval is requested or
+decided, and before a deploy) and records `candidate_invalid` when the candidate no longer passes. An
+invalidated manifest is refused at request, at decision (`manifest_invalidated`, also enforced by a trigger) and
+at execution (`verify_approval_for_execution` denies `manifest_invalidated`). Approvals bound to a manifest show
+the subject kind `candidate_manifest` (per-repository baseline and candidate commits, invalidation reasons).
+
 Invalid values abort startup before any state is touched. Without `repos`/`worktree_root` (or with
 `enabled: false`, or no config) `POST /api/v1/agent-runs` returns **503** "Agent runs are not
 configured"; read and cancel endpoints still work for existing runs.

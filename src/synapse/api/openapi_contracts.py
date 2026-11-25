@@ -29,13 +29,33 @@ ATTEMPT = _object({"id": STRING, "attempt_no": INTEGER, "profile_id": _nullable(
 TASK = _object(TASK_FIELDS)
 TASK_DETAIL = _object({**TASK_FIELDS, "attempts": {"type": "array", "items": ATTEMPT}})
 DEPENDENCY = _object({"task_id": STRING, "depends_on_id": STRING})
-APPROVAL_SUBJECT = {"anyOf": [{"type": "null"}, _object({
-    "kind": {"type": "string", "const": "agent_run"}, "node_id": STRING, "repo": _nullable(), "base_ref": _nullable(),
-    "worktree_head": _nullable(), "allowed_tools": {"type": "array", "items": STRING}, "permission_mode": STRING,
+_SUBJECT_COMMON = {
+    "allowed_tools": {"type": "array", "items": STRING}, "permission_mode": STRING,
     "timeout_seconds": {"type": "number"}, "prompt_bytes": INTEGER, "prompt_preview": _nullable(),
-    "allowed_tools_truncated": {"type": "boolean"}, "prompt_preview_truncated": {"type": "boolean"}, "prompt_unavailable": {"type": "boolean"},
-    "spec_sha256": STRING})],
-    "description": "Read-only, bounded description of what an agent-run approval authorizes; null for other approvals. "
+    "allowed_tools_truncated": {"type": "boolean"}, "prompt_preview_truncated": {"type": "boolean"},
+    "prompt_unavailable": {"type": "boolean"}, "spec_sha256": STRING}
+_AGENT_RUN_SUBJECT = _object({
+    "kind": {"type": "string", "const": "agent_run"}, "node_id": STRING, "repo": _nullable(), "base_ref": _nullable(),
+    "worktree_head": _nullable(), **_SUBJECT_COMMON})
+_SUBJECT_REPO = _object({"repo_id": STRING, "access": {"type": "string", "enum": ["write", "read"]},
+                         "baseline_ref": STRING, "baseline_sha": STRING})
+_AGENT_RUN_MULTI_SUBJECT = _object({
+    "kind": {"type": "string", "const": "agent_run_multi"}, "node_id": STRING,
+    "repos": {"type": "array", "items": _SUBJECT_REPO}, **_SUBJECT_COMMON})
+_MANIFEST_REPO = _object({**_SUBJECT_REPO["properties"], "candidate_sha": _nullable(),
+                          "changed_paths": _nullable("integer"), "diff_bytes": _nullable("integer")})
+_MANIFEST_SUBJECT = _object({
+    "kind": {"type": "string", "const": "candidate_manifest"}, "manifest_sha256": STRING, "seq": INTEGER,
+    "bindings_sha256": STRING,
+    "invalidated": {"type": "array", "items": {"type": "string",
+                                               "enum": ["baseline_moved", "candidate_invalid", "operator"]}},
+    "repos": {"anyOf": [{"type": "null"}, {"type": "array", "items": _MANIFEST_REPO}]},
+    "manifest_unavailable": {"type": "boolean"}})
+APPROVAL_SUBJECT = {"anyOf": [{"type": "null"}, _AGENT_RUN_SUBJECT, _AGENT_RUN_MULTI_SUBJECT, _MANIFEST_SUBJECT],
+    "description": "Read-only, bounded description of what an approval authorizes: agent_run (single repository), "
+                   "agent_run_multi (multi-repository task: repositories, access and pinned baselines, no paths) or "
+                   "candidate_manifest (an approval bound to a v2 candidate manifest: per-repository baseline and "
+                   "candidate commits, invalidation reasons); null for other approvals. "
                    "prompt_preview (at most 8 KiB) is only present while the approval is pending."}
 APPROVAL = _object({"id": STRING, "run_id": STRING, "operation": STRING, "target": STRING,
                     "candidate_manifest_sha256": STRING, "policy_version": STRING, "state": STRING,

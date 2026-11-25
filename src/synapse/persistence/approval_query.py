@@ -3,15 +3,15 @@ from collections.abc import Callable
 import sqlite3
 from typing import Any
 
-from synapse.persistence.approval_subject import agent_subject
+from synapse.persistence.approval_subject import approval_subject
 
 
 def read_approvals(connection: sqlite3.Connection, *, after: str = "", limit: int = 100,
                    read_blob: Callable[[str], bytes] | None = None) -> list[dict[str, Any]]:
     """Return an ID-ordered page; caller must authorize access to every row.
 
-    Every row carries ``subject``: for an agent run's approval, a bounded read-only description of what
-    is being approved (see ``approval_subject``); otherwise null. The prompt preview is only read for
+    Every row carries ``subject``: for an agent run's approval or one bound to a candidate manifest, a bounded
+    read-only description of what is being approved (see ``approval_subject``); otherwise null. The prompt preview is only read for
     still-pending approvals (``read_blob`` is the private artifact reader); decided rows get the
     structured fields without it.
     """
@@ -26,6 +26,6 @@ def read_approvals(connection: sqlite3.Connection, *, after: str = "", limit: in
             "state", "state_version", "expires_at", "requested_at", "decided_at", "decision_principal", "decision_reason")
     out = [dict(zip(keys, row, strict=True)) for row in rows.fetchall()]
     for item in out:
-        item["subject"] = agent_subject(connection, read_blob, item["run_id"], item["candidate_manifest_sha256"],
-                                        with_prompt=item["state"] == "requested")
+        item["subject"] = approval_subject(connection, read_blob, item["run_id"], item["candidate_manifest_sha256"],
+                                           with_prompt=item["state"] == "requested")
     return out

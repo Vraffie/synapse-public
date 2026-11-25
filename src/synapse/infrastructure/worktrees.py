@@ -719,6 +719,40 @@ class AttemptWorktrees:
         self._check_blobs(repo, records)
         return len(records)
 
+    def commit_is_ancestor(self, repo: str, base: str, head: str) -> bool:
+        """True if commit ``base`` is an ancestor of (or equal to) commit ``head`` in ``repo``'s object store (no
+        work tree; replace refs and grafts are off). Raises ``WorktreeError`` when git cannot compare them (a
+        missing object). Read-only."""
+        for sha in (base, head):
+            if not isinstance(sha, str) or not _HEX_SHA.fullmatch(sha):
+                raise ValueError("sha must be a full lowercase hex commit id")
+        self._allowlisted(repo)
+        self._refuse_dangerous_config(repo)
+        rc, _, _ = _git(repo, ["merge-base", "--is-ancestor", "--end-of-options", base, head], check=False)
+        if rc not in (0, 1):
+            raise WorktreeError("git could not compare the commits")
+        return rc == 0
+
+    def commit_range_diff(self, repo: str, base: str, head: str, *, max_bytes: int) -> tuple[bytes, bool]:
+        """The exact bytes of ``git diff base head`` from the object store, made reproducible: attributes from the
+        empty tree (no filter, textconv or diff driver), no renames, no colour, fixed prefixes, context and
+        algorithm, full blob ids, and repository config that changes diff text overridden on the command line.
+        Returns ``(bytes, truncated)``. Read-only (manifest v2 ``diff_sha256``, ADR 026 D8)."""
+        for sha in (base, head):
+            if not isinstance(sha, str) or not _HEX_SHA.fullmatch(sha):
+                raise ValueError("sha must be a full lowercase hex commit id")
+        self._allowlisted(repo)
+        self._refuse_dangerous_config(repo)
+        pinned = ("-c", "core.quotePath=true", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false",
+                  "-c", "diff.suppressBlankEmpty=false", "-c", "diff.relative=false",
+                  "-c", "diff.interHunkContext=0", "-c", "core.abbrev=no", "-c", "diff.wsErrorHighlight=none")
+        _, out, trunc = _git_raw(repo, [*pinned, f"--attr-source={_EMPTY_TREE}", "diff", "--no-ext-diff",
+                                        "--no-textconv", "--no-color", "--no-renames", "--full-index", "--binary",
+                                        "--unified=3", "--diff-algorithm=myers", "--no-indent-heuristic",
+                                        "--ignore-submodules=none", "--src-prefix=a/", "--dst-prefix=b/",
+                                        "-O/dev/null", "--end-of-options", base, head, "--"], max_bytes=max_bytes)
+        return bytes(out), trunc
+
     @staticmethod
     def _check_blobs(repo: str, records) -> None:
         bad = 0
