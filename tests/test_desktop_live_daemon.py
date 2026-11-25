@@ -406,9 +406,9 @@ def test_daemon_restart_mid_run_ui_recovers(live):
     live.spin(lambda: live.window.connection_state == "reconnecting", "UI to notice the daemon is gone", 15)
     live.shot("8-daemon-down")
     assert live.tile(0)[1] == "Running" and cc.gate.state == "pending" and len(cc.layout_model.nodes) == 4  # last result stays visible
-    # fail closed while down: the last gate is still shown, a decision cannot be confirmed and is never recorded
-    live.decide_with(live.approver_secret, "approved")
-    live.spin(lambda: "could not confirm" in cc.gate_status.text().lower() or "not confirm" in cc.gate_status.text().lower(), "failure note while down", 15)
+    # fail closed while down: the last gate is still shown, but deciding is disabled (with the reason) and the alert bar is up
+    assert not cc.approve_button.isEnabled() and not cc.reject_button.isEnabled() and "offline" in cc.approve_button.toolTip()
+    assert live.window.offline_bar.isVisible() and not cc.composer.submit_button.isEnabled()
 
     live.start_daemon()
     live.spin(lambda: live.window.connection_state == "connected", "UI to reconnect", 20)

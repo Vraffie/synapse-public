@@ -14,7 +14,7 @@ from PySide6.QtWidgets import QLabel, QStatusBar, QToolButton
 from synapse.desktop import icons, theme
 from synapse.desktop.connection import API_VERSION
 
-OFFLINE_AFTER_FAILURES = 3  # reconnecting for the first attempts, then "Daemon offline"
+OFFLINE_AFTER_FAILURES = 1  # the first failed poll already means "Daemon offline"
 
 
 class ConsoleStatusBar(QObject):

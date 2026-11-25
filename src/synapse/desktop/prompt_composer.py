@@ -55,6 +55,9 @@ def read_text_file(path: str) -> tuple[str | None, str]:
     return text, "The file was larger than 256 KiB; only the start was read." if truncated else ""
 
 
+from synapse.desktop.offline import OFFLINE_TIP  # noqa: E402
+
+
 class PromptEdit(QPlainTextEdit):
     send_requested = Signal()
     notice = Signal(str)
@@ -252,7 +255,16 @@ class PromptComposer(AgentRunForm):
         chars, size = self.counts()
         return chars > MAX_PROMPT or size > MAX_PROMPT_BYTES
 
+    offline = False
+
+    def set_offline(self, offline: bool):
+        self.offline = offline
+        self.update_state()
+        self.submit_button.setToolTip(OFFLINE_TIP if offline else "")
+
     def can_send(self) -> bool:
+        if self.offline:
+            return False
         payload, _problems = validate(self.fields())
         return payload is not None and not self._pending and not self._counting
 

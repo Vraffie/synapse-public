@@ -20,9 +20,9 @@ def wait(app, predicate, timeout=5):
 
 
 def test_backoff_delay_grows_and_caps():
-    assert [backoff_delay(1.0, n) for n in (1, 2, 3, 4, 5, 6)] == [1, 2, 4, 8, 15, 15]
+    assert [backoff_delay(1.0, n) for n in (1, 2, 3, 4, 5, 6)] == [2, 4, 8, 15, 15, 15]
     assert backoff_delay(1.0, 10**6) == 15.0
-    assert backoff_delay(0.01, 1) == 0.01
+    assert backoff_delay(0.01, 1) == 0.02
 
 
 def test_reconnect_backoff_state_and_lossless_resume(tmp_path):

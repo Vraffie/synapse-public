@@ -440,6 +440,10 @@ class ControlCenter(QWidget):
             self.switcher.set_current(0)  # the window flips views; this page stays "Control Center" until it is shown again
             self.developer_requested.emit()
 
+    def focus_filter(self):
+        """Ctrl+F: put the keyboard on the Activity filter (arrow keys move between the segments)."""
+        self.filter_buttons[self.filter].setFocus(Qt.FocusReason.ShortcutFocusReason)
+
     def _filter_clicked(self, button):
         self.filter = button.property("filter_key")
         self.refresh_feed()

@@ -37,8 +37,8 @@ MULTIREPO_RETRY_POLLS = 30  # a run (or daemon) without multi-repository reads i
 
 
 def backoff_delay(interval: float, failures: int, cap: float = MAX_BACKOFF) -> float:
-    """Exponential reconnect delay: interval, 2x, 4x ... capped; failures counts consecutive failures (>= 1)."""
-    return min(cap, interval * (2 ** max(0, min(failures, 16) - 1)))
+    """Exponential reconnect delay after failure n: 2x, 4x, 8x ... capped (1 s interval: 2, 4, 8, 15 s)."""
+    return min(cap, interval * (2 ** max(0, min(failures, 16))))
 
 
 def _op_response_ok(action, run_id, result) -> bool:

@@ -5,17 +5,23 @@ from PySide6.QtWidgets import QDialog, QDialogButtonBox, QTableWidget, QTableWid
 
 # (action id, key sequence, description)
 SHORTCUTS = (
+    ("view_control", "Ctrl+1", "Switch to Control Center"),
+    ("view_developer", "Ctrl+2", "Switch to Developer"),
+    ("tab_events", "Alt+1", "Developer: Events"),
+    ("tab_runs", "Alt+2", "Developer: Runs"),
+    ("tab_messages", "Alt+3", "Developer: Messages"),
+    ("tab_approvals", "Alt+4", "Developer: Approvals"),
+    ("approval_gate", "Ctrl+Shift+A", "Jump to the active approval gate"),
+    ("new_run", "Ctrl+N", "Configure a new run"),
+    ("find_events", "Ctrl+F", "Search or filter the current view (Events or Activity)"),
+    ("send", "Ctrl+Enter", "Send the prompt from the launch bar"),
+    ("zoom_reset", "Ctrl+0", "Reset the topology zoom to 100%"),
     ("refresh", "F5", "Refresh now (poll the daemon immediately and reload the approvals page)"),
-    ("tab_approvals", "Ctrl+1", "Go to Approvals"),
-    ("tab_runs", "Ctrl+2", "Go to Runs"),
-    ("tab_events", "Ctrl+3", "Go to Events"),
-    ("tab_messages", "Ctrl+4", "Go to Messages"),
-    ("approve", "Ctrl+Shift+A", "Approve the selected approval (opens the decision dialog)"),
-    ("reject", "Ctrl+Shift+R", "Reject the selected approval (opens the decision dialog)"),
-    ("find_events", "Ctrl+F", "Search events"),
     ("shortcuts", "F1", "Show this list"),
     ("quit", "Ctrl+Q", "Quit"),
 )
+# Menu-only actions: deciding is never one keystroke (each opens the decision dialog).
+MENU_ONLY = (("approve", "&Approve selected…"), ("reject", "Re&ject selected…"))
 
 
 class ShortcutsDialog(QDialog):

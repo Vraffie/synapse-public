@@ -182,6 +182,7 @@ def test_launch_bar_toast_and_configure(app, tmp_path, monkeypatch):
     from synapse.desktop import agent_form
     win = window(app, tmp_path)
     try:
+        win._connection_changed("connected", 0, 0.0)  # no daemon in this test: pretend one is there so Send is enabled
         composer = win.control_center.composer
         assert composer.bar_widget.minimumHeight() >= 40 and composer.configure_button.text() == "Configure…"
         assert not composer.hint.isVisible() and not composer.status.isVisible()  # captions take no room while empty
@@ -198,5 +199,49 @@ def test_launch_bar_toast_and_configure(app, tmp_path, monkeypatch):
         composer.configure_dialog.close()
         win._new_run()
         assert win.views.currentWidget() is win.control_center
+    finally:
+        win.close()
+
+
+def test_offline_disables_mutating_controls_and_restores_them(app, tmp_path):
+    win = window(app, tmp_path)
+    try:
+        cc = win.control_center
+        win._connection_changed("connected", 0, 0.0)
+        cc.composer.set_profiles(None)
+        cc.composer.repo.setCurrentText("/work/repo")
+        cc.composer.prompt.setPlainText("do it")
+        cc.approve_button.setEnabled(True)
+        assert cc.composer.submit_button.isEnabled()
+        win._connection_changed("reconnecting", 1, 2.0)
+        assert win.offline_bar.isVisible() and "offline" in win.offline_bar.label.text().lower()
+        assert not cc.approve_button.isEnabled() and "offline" in cc.approve_button.toolTip()
+        cc.composer.prompt.setPlainText("typing while offline")
+        assert not cc.composer.submit_button.isEnabled()  # typing never re-enables Send while offline
+        win._connection_changed("connected", 0, 0.0)
+        assert not win.offline_bar.isVisible()
+        assert cc.approve_button.isEnabled() and cc.composer.submit_button.isEnabled()
+    finally:
+        win.close()
+
+
+def test_shortcut_map_matches_the_spec(app, tmp_path):
+    from synapse.desktop.shortcuts import SHORTCUTS
+    win = window(app, tmp_path)
+    try:
+        keys = {i: k for i, k, _ in SHORTCUTS}
+        assert keys == {"view_control": "Ctrl+1", "view_developer": "Ctrl+2", "tab_events": "Alt+1", "tab_runs": "Alt+2",
+                        "tab_messages": "Alt+3", "tab_approvals": "Alt+4", "approval_gate": "Ctrl+Shift+A", "new_run": "Ctrl+N",
+                        "find_events": "Ctrl+F", "send": "Ctrl+Enter", "zoom_reset": "Ctrl+0", "refresh": "F5", "shortcuts": "F1",
+                        "quit": "Ctrl+Q"}
+        win.shortcut_actions["view_developer"].trigger()
+        assert win.views.currentWidget() is win.tabs
+        win.shortcut_actions["tab_runs"].trigger()
+        assert win.tabs.currentWidget() is win.runs_tab
+        win.shortcut_actions["view_control"].trigger()
+        assert win.views.currentWidget() is win.control_center
+        win.control_center.topology.set_zoom(2.0)
+        win.shortcut_actions["zoom_reset"].trigger()
+        assert win.control_center.topology.zoom == 1.0
     finally:
         win.close()

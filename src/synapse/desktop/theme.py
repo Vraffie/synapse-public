@@ -178,6 +178,7 @@ QFrame#pane {{ background: {p['surface']}; border: none; border-radius: 0px; }}
 QFrame#pane QScrollArea, QFrame#pane QScrollArea > QWidget > QWidget, QFrame#drawer QScrollArea, QFrame#drawer QScrollArea > QWidget > QWidget {{ background: {p['surface']}; }}
 QFrame#paneHead {{ background: {p['surface']}; border: none; border-bottom: 1px solid {p['border_subtle']}; }}
 QFrame#toast {{ background: {p['running_tint']}; border: none; border-top: 1px solid {p['running']}; border-radius: 0px; }}
+QFrame#offlineBar {{ background: {p['failed_tint']}; border: none; border-bottom: 1px solid {p['failed']}; border-radius: 0px; }}
 QFrame#hairline {{ background: {p['border_subtle']}; border: none; }}
 QSplitter::handle {{ background: {p['border_subtle']}; }}
 QLabel#stateBadge {{ font-weight: 600; }}
