@@ -389,6 +389,16 @@ reviewed yet.
   later task could not be removed (that request answers 409 but the earlier removals stay audited).
   Unknown or non-agent runs give 404.
 
+### Restarting a stuck or finished run
+
+`agentctl agent-restart RUN --prompt-file FILE|-` starts a NEW run with the old run's repository, base ref, tools,
+permission mode, timeout and approval step (single-task runs only; the old run must be `recovering`, `failed`,
+`cancelled` or `succeeded`). The prompt is stored only as a SHA-256, so you pass it again and it must match, or the
+command refuses unless you add `--allow-changed-prompt`. It prints the old run's worktree change summary to stderr first
+so you can look before you restart. It does not touch the old run: a `recovering` run stays `recovering` until you
+`agent-abandon` it, and nothing is ever re-spawned inside the old run (see agent-runtime.md). The new run goes through the
+normal start checks, including any operator approval policy.
+
 ### Pruning old worktrees
 
 `agentctl agent-worktree-prune [--older-than 7d] [--dry-run]` removes the worktrees of finished (`succeeded`,

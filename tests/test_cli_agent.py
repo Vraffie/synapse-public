@@ -389,3 +389,42 @@ def test_worktree_prune_dry_run_removes_nothing_and_rejects_bad_age(monkeypatch,
     assert "would remove old" in capsys.readouterr().out
     assert run("agent-worktree-prune", "--older-than", "0d") == 2
     assert run("agent-worktree-prune", "--older-than", "week") == 2
+
+
+def _restart_fake(monkeypatch, *, state="recovering", tasks=1, prompt=SECRET, step=None):
+    import hashlib
+    seen = []
+    spec = {"repo": "/r", "base_ref": "main", "allowed_tools": ["Read"], "permission_mode": "plan", "timeout_seconds": 90.0,
+            "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(), "approval_step": step}
+    old = {"run_state": state, "worktree": {"diff_stat": " a | 1 +"}, "tasks": [{"spec": spec}] * tasks}
+    def fake(state_dir, endpoint, **kw):
+        seen.append((endpoint, kw))
+        return old if endpoint.endswith("/agent") else {"run_id": "new", "state": "running"}
+    monkeypatch.setattr(cli, "_request", fake)
+    return seen
+
+
+def test_restart_starts_a_new_run_from_the_old_request_when_the_prompt_matches(monkeypatch, tmp_path, capsys):
+    seen = _restart_fake(monkeypatch, step={"operation": "agent.run", "target": "t", "ttl_seconds": 60})
+    f = tmp_path / "p.txt"
+    f.write_text(SECRET)
+    assert run("agent-restart", "old-1", "--prompt-file", str(f)) == 0
+    endpoint, kw = seen[1]
+    assert endpoint == "/api/v1/agent-runs" and kw["idempotency_key"]
+    assert json.loads(kw["body"]) == {"repo": "/r", "base_ref": "main", "prompt": SECRET, "allowed_tools": ["Read"],
+                                      "permission_mode": "plan", "timeout_seconds": 90.0,
+                                      "approval_step": {"operation": "agent.run", "target": "t", "ttl_seconds": 60}}
+    assert SECRET not in capsys.readouterr().err
+
+
+def test_restart_refuses_a_changed_prompt_a_multi_task_run_and_an_active_run(monkeypatch, tmp_path, capsys):
+    f = tmp_path / "p.txt"
+    f.write_text("something else")
+    seen = _restart_fake(monkeypatch)
+    assert run("agent-restart", "old-1", "--prompt-file", str(f)) == 1
+    assert len(seen) == 1 and "differs" in capsys.readouterr().err
+    assert run("agent-restart", "old-1", "--prompt-file", str(f), "--allow-changed-prompt") == 0
+    for kw in ({"state": "running"}, {"tasks": 2}):
+        seen = _restart_fake(monkeypatch, **kw)
+        assert run("agent-restart", "old-1", "--prompt-file", str(f), "--allow-changed-prompt") == 1
+        assert len(seen) == 1
