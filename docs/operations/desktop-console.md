@@ -53,7 +53,11 @@ Permanent fields: daemon socket path, health, API version (`v1`, plus the daemon
 
 ## Keyboard shortcuts (Help > Shortcuts, F1)
 
-F5 refresh (polls immediately, reloads the approvals page, cuts a reconnect backoff short); Ctrl+1..4 Approvals, Runs, Events, Messages; Ctrl+Shift+A / Ctrl+Shift+R open the approve / reject dialog for the selected approval; Ctrl+F search events; F1 shortcuts; Ctrl+Q quit. The same table drives the actions and the dialog.
+Ctrl+1 / Ctrl+2 Control Center / Developer; Alt+1..4 Developer tabs (Events, Runs, Messages, Approvals); Ctrl+Shift+A jump to the active approval gate (focuses Approve; with no gate it opens the Approvals list); Ctrl+N Configure run; Ctrl+F search Events (Developer) or focus the Activity filter (Control Center); Ctrl+Enter send the prompt; Ctrl+0 reset topology zoom; F5 refresh (polls immediately, cuts a reconnect backoff short); F1 shortcuts; Ctrl+Q quit. Approve selected / Reject selected stay in the Approvals menu without a key. The same table drives the actions and the dialog.
+
+## Offline behaviour
+
+The poller retries after 2, 4, 8, then every 15 s. From the first failed poll the status bar says "Daemon offline", a slim bar at the top shows "Retry now", and Send, Approve, Reject, Stop and the Developer commit/abandon/remove/cancel buttons are disabled with a tooltip that says why; they come back on reconnect. Approval notifications never time out: the tray message and the status-bar message stay until no approval is pending.
 
 ## Start run panel
 

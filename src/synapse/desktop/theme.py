@@ -11,15 +11,16 @@ The older keys (bg, panel, cyan, ...) stay as aliases of the tokens so views not
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QGuiApplication, QPalette
 
 _DARK_TOKENS = {
-    "canvas": "#111214", "surface": "#17181b", "elevated": "#1e2025",
-    "border_subtle": "#24262c", "border_strong": "#343740",
-    "text_primary": "#e6e8ec", "text_secondary": "#9499a6", "text_muted": "#848996",
-    "accent_primary": "#e6e8ec", "on_primary": "#111214", "focus": "#5b8def", "selection": "#252a36",
+    "canvas": "#2a2c30", "surface": "#313338", "elevated": "#3a3d43",
+    "border_subtle": "#43464d", "border_strong": "#585c66",
+    "text_primary": "#eceef2", "text_secondary": "#c0c4cd", "text_muted": "#adb2bd",
+    "accent_primary": "#e6e8ec", "on_primary": "#1c1d20", "focus": "#6b9bf2", "selection": "#3b4252",
     "running": "#60a5fa", "running_tint": "#172538", "done": "#4ade80", "done_tint": "#142a1e",
     "waiting": "#fbbf24", "waiting_tint": "#2e2312", "failed": "#f87171", "failed_tint": "#2e1618",
 }
@@ -93,6 +94,7 @@ def base_point_size() -> float:
     return max(size if size > 0 else 10.0, 9.0)
 
 
+@lru_cache(maxsize=1)
 def mono_family() -> str:
     """The operational monospace face: the first installed of MONO_FAMILIES, else the system fixed font."""
     try:
@@ -142,6 +144,7 @@ QLabel#h2 {{ font-size: {title:.1f}pt; font-weight: 600; }}
 QLabel#eyebrow {{ color: {p['text_secondary']}; font-size: {dense:.1f}pt; font-weight: 600; }}
 QLabel#muted, QLabel#caption {{ color: {p['text_secondary']}; }}
 QLabel#caption {{ font-size: {dense:.1f}pt; }}
+QLabel#caption[over="true"] {{ color: {p['failed']}; font-weight: 600; }}
 QLabel#mono, QPlainTextEdit#mono, QTextEdit#mono {{ font-family: "{mono}"; font-size: {dense:.1f}pt; }}
 QLabel#metricValue {{ font-size: {title:.1f}pt; font-weight: 600; }}
 QLabel#pill {{ border: 1px solid {p['border_strong']}; border-radius: 4px; padding: 1px 6px; color: {p['text_secondary']}; font-size: {dense:.1f}pt; }}
@@ -170,6 +173,26 @@ QStatusBar QLabel, QStatusBar QToolButton, QStatusBar QPushButton {{ font-size: 
 QMenuBar {{ background: {p['surface']}; border-bottom: 1px solid {p['border_subtle']}; }}
 QMenu {{ background: {p['elevated']}; border: 1px solid {p['border_strong']}; }}
 QMenu::item:selected, QMenuBar::item:selected {{ background: {p['selection']}; }}
+QFrame#toolbar, QFrame#telemetry, QFrame#launchBar, QFrame#drawer {{ background: {p['surface']}; border: none; border-radius: 0px; }}
+QFrame#pane {{ background: {p['surface']}; border: none; border-radius: 0px; }}
+QFrame#pane QScrollArea, QFrame#pane QScrollArea > QWidget > QWidget, QFrame#drawer QScrollArea, QFrame#drawer QScrollArea > QWidget > QWidget {{ background: {p['surface']}; }}
+QFrame#paneHead {{ background: {p['surface']}; border: none; border-bottom: 1px solid {p['border_subtle']}; }}
+QFrame#toast {{ background: {p['running_tint']}; border: none; border-top: 1px solid {p['running']}; border-radius: 0px; }}
+QFrame#offlineBar {{ background: {p['failed_tint']}; border: none; border-bottom: 1px solid {p['failed']}; border-radius: 0px; }}
+QFrame#hairline {{ background: {p['border_subtle']}; border: none; }}
+QSplitter::handle {{ background: {p['border_subtle']}; }}
+QLabel#stateBadge {{ font-weight: 600; }}
+QPushButton#segment {{ background: {p['elevated']}; border: 1px solid {p['border_strong']}; border-radius: 0px; padding: 3px 10px; }}
+QPushButton#segment:checked {{ background: {p['accent_primary']}; color: {p['on_primary']}; border-color: {p['accent_primary']}; }}
+QPushButton#segment:focus {{ border: 2px solid {p['focus']}; padding: 2px 9px; }}
+QWidget#segmented QPushButton:first-child, QWidget#segmented QPushButton#segment:first {{ border-top-left-radius: 4px; border-bottom-left-radius: 4px; }}
+QFrame#drawer QTabBar::tab {{ background: transparent; border: none; border-bottom: 2px solid transparent; padding: 5px 12px; }}
+QFrame#drawer QTabBar::tab:selected {{ border-bottom: 2px solid {p['text_primary']}; color: {p['text_primary']}; background: transparent; border-top: none; }}
+QScrollBar:vertical {{ background: transparent; width: 10px; margin: 0; }}
+QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 0; }}
+QScrollBar::handle {{ background: {p['border_strong']}; border-radius: 4px; min-height: 24px; min-width: 24px; margin: 2px; }}
+QScrollBar::handle:hover {{ background: {p['text_muted']}; }}
+QScrollBar::add-line, QScrollBar::sub-line, QScrollBar::add-page, QScrollBar::sub-page {{ background: none; border: none; width: 0; height: 0; }}
 QToolTip {{ background: {p['elevated']}; color: {p['text_primary']}; border: 1px solid {p['border_strong']}; }}
 """
 

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import QStyle, QSystemTrayIcon
 
-FLASH_MS = 10000
+STICKY = 0  # a pending approval is never auto-dismissed: it stays until it is decided (timeout 0 = no expiry)
 MAX_FIELD = 80
 
 
@@ -42,9 +42,14 @@ class ApprovalNotifier:
     def notify(self, requests: list[dict]):
         title, body = approval_message(requests)
         if self.tray is not None and self.tray.isVisible():
-            self.tray.showMessage(title, body, QSystemTrayIcon.MessageIcon.Information, FLASH_MS)
+            self.tray.showMessage(title, body, QSystemTrayIcon.MessageIcon.Warning, STICKY)
             self.messages.append(("tray", title, body))
         else:
-            self.window.statusBar().showMessage(f"{title}: {body}", FLASH_MS)
+            self.window.statusBar().showMessage(f"{title}: {body}", STICKY)
             self.messages.append(("statusbar", title, body))
         del self.messages[:-20]
+
+    def clear(self):
+        """Nothing is waiting any more: drop the sticky notification."""
+        if self.tray is None or not self.tray.isVisible():
+            self.window.statusBar().clearMessage()

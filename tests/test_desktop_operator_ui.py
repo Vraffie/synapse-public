@@ -242,7 +242,7 @@ def test_status_bar_shows_live_signals_and_keeps_static_facts_in_diagnostics(tmp
         assert str(tmp_path / 'agentd.sock') in s.diagnostics_text()
         assert 'token' not in s.diagnostics_text().lower()
         w._connection_changed('reconnecting', 1, 4.0)
-        assert s.connection.text() == 'Reconnecting (4s)…'
+        assert s.connection.text() == 'Daemon offline'
         assert not s.retry.isHidden()
         assert s.health.text() == 'Health: unreachable'
         w._connection_changed('reconnecting', 5, 15.0)

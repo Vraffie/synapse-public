@@ -42,7 +42,8 @@ class Console:
         self.agent = agent
         self.usage = usage
         self.profiles = profiles
-        monkeypatch.setattr(agent_form, 'ask_confirm', lambda parent, title, text: self.confirms.append((title, text)) or self.answer)
+        monkeypatch.setattr(agent_form, 'ask_confirm', lambda parent, title, text: self.confirms.append((title, text)) or self.answer)  # cancel/abandon/remove
+        monkeypatch.setattr(agent_form, 'START_DELAY_MS', 0)  # a start has no modal; tests that exercise the countdown set it
 
         def fetch(_state, endpoint):
             if endpoint == '/api/v1/profiles':
@@ -203,11 +204,12 @@ def test_submission_payload_headers_and_recent_repos(console, tmp_path):
     assert c.form.approval_target.text().startswith('repo:') and ' ' not in c.form.approval_target.text()
     c.form.tool_boxes['Edit'].setChecked(True)
     c.form.submit()
-    assert 'WARNING' in c.confirms[0][1] and 'Approval required' in c.confirms[0][1]
     spin(c.app, lambda: c.sent)
     endpoint, kw = c.sent[0]
     assert endpoint == '/api/v1/agent-runs'
     body = json.loads(kw['body'])
+    summary = agent_form.summary_text(body)  # the details shown in the countdown toast's tooltip
+    assert 'WARNING' in summary and 'Approval required' in summary and c.confirms == []
     assert body['repo'] == '/work/repo' and body['base_ref'] == 'main' and body['prompt'] == 'fix the bug'
     assert body['allowed_tools'] == ['Read', 'Glob', 'Grep', 'Edit'] and body['permission_mode'] == 'plan'
     assert body['timeout_seconds'] == 900
@@ -220,14 +222,31 @@ def test_submission_payload_headers_and_recent_repos(console, tmp_path):
     assert 'fix the bug' not in open(tmp_path / 'ui.ini').read()
 
 
-def test_declined_confirmation_sends_nothing(console):
+def test_cancelled_start_sends_nothing(console, monkeypatch):
     c = console()
     c.fill()
-    c.answer = False
+    monkeypatch.setattr(agent_form, 'START_DELAY_MS', 5000)
     c.form.submit()
+    assert c.form._counting and c.form.cancel_start_button.isVisible() is not None and not c.form.submit_button.isEnabled()
+    assert 'Run starts in 5 s' in c.form.status.text() and 'Nothing has been sent yet' in c.form.status.text()
+    c.form.cancel_start()
     time.sleep(0.1)
     c.app.processEvents()
-    assert c.sent == [] and 'nothing was sent' in c.form.status.text()
+    assert c.sent == [] and not c.form._counting and 'nothing was sent' in c.form.status.text() and c.form.submit_button.isEnabled()
+
+
+def test_countdown_sends_once_after_the_delay(console, monkeypatch):
+    c = console(send_script=[{'run_id': 'run-1', 'task_id': 't', 'state': 'queued', 'worktree_path': '/w'}])
+    c.fill()
+    monkeypatch.setattr(agent_form, 'START_DELAY_MS', 2000)
+    lines = []
+    c.form.start_countdown.connect(lines.append)
+    c.form.submit()
+    c.form.submit()  # a second press while counting is ignored
+    assert lines == ['Run starts in 2 s · /work/repo · default account · may change files or run commands (Edit)'] or len(lines) == 1
+    assert c.sent == []
+    spin(c.app, lambda: c.sent, seconds=6)
+    assert len(c.sent) == 1 and not c.form._counting
 
 
 def test_retry_reuses_key_until_the_payload_changes(console):
@@ -368,7 +387,12 @@ def test_decision_dialog_context_is_read_only_and_token_handling_unchanged():
 def test_mock_mode_still_available(console):
     c = console()
     panel = c.window.start_panel
-    assert panel.mode.count() == 2 and panel.stack.currentIndex() == 0
+    assert panel.mode.isHidden() and panel.stack.currentWidget() is panel.agent_form  # mock fixture is a developer tool
+    assert c.window.cancel_mock_button.isHidden()
+    c.window.show_mock_fixture()  # Developer -> Run Mock Fixture…
+    assert not panel.mode.isHidden() and panel.mode.count() == 2 and panel.stack.currentIndex() == 0
+    assert not c.window.cancel_mock_button.isHidden()
+    c.window.start_dialog.close()
     panel.mode.setCurrentIndex(1)
     assert panel.stack.currentWidget() is panel.agent_form
 
@@ -381,7 +405,7 @@ def test_control_center_composer_sends_and_selects_new_run(console):
     composer.prompt.setPlainText('fix the bug')
     composer.submit_button.click()
     spin(c.app, lambda: c.window.run_id.text() == 'run-new')
-    assert c.confirms and len(c.sent) == 1 and c.sent[0][0].endswith('/agent-runs')
+    assert len(c.sent) == 1 and c.sent[0][0].endswith('/agent-runs')
     assert composer.prompt.toPlainText() == ''
     assert c.window.control_center.run_id == 'run-new'
 
@@ -709,7 +733,7 @@ def test_unavailable_state_is_explicit_and_sends_no_profile_but_says_so(console)
     c.form.submit()
     spin(c.app, lambda: c.sent)
     assert 'profile' not in json.loads(c.sent[0][1]['body'])
-    assert agent_form.DEFAULT_ACCOUNT_TEXT in c.confirms[0][1]
+    assert agent_form.DEFAULT_ACCOUNT_TEXT in agent_form.summary_text(json.loads(c.sent[0][1]['body']))
 
 
 def test_generic_failure_stays_loading_with_a_visible_reason_then_recovers(console):
@@ -777,7 +801,7 @@ def test_chosen_profile_is_sent_in_the_post_and_confirmed(console):
     spin(c.app, lambda: c.sent)
     endpoint, kwargs = c.sent[0]
     assert endpoint == '/api/v1/agent-runs' and json.loads(kwargs['body'])['profile'] == 'claude-personal-ios'
-    assert 'Claude account: claude-personal-ios (what you chose)' in c.confirms[0][1]
+    assert 'Claude account: claude-personal-ios (what you chose)' in agent_form.summary_text(json.loads(c.sent[0][1]['body']))
     spin(c.app, lambda: 'account claude-personal-ios' in c.form.status.text())
 
 

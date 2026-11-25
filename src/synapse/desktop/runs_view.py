@@ -12,7 +12,7 @@ from uuid import uuid4
 from PySide6.QtCore import QSignalBlocker, Qt
 from PySide6.QtWidgets import (
     QDialog, QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QPushButton, QVBoxLayout, QWidget,
+    QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
 from synapse.desktop import agent_form
@@ -20,7 +20,7 @@ from synapse.desktop.agent_usage import UsagePane
 from synapse.desktop.agent_view import AgentDetailPane, decision_context
 from synapse.desktop.mock_resume import PROFILE, confirm_evidence
 from synapse.desktop.multirepo_view import MultiRepoPane
-from synapse.desktop.start_panel import StartRunPanel
+from synapse.desktop.start_panel import StartRunPanel, dev_mode
 
 MAX_TASK_ROWS = 200
 ABANDON_TEXT = (
@@ -142,7 +142,20 @@ class RunsMixin:
         self.resume_mock_button.clicked.connect(self._resume_mock)
         self.discard_resume_button.clicked.connect(self._discard_resume)
         self.cancel_mock_button.clicked.connect(self._cancel_mock)
-        return widget
+        self.set_mock_ui(dev_mode())
+        scroll = QScrollArea()  # the tab is long: it scrolls instead of forcing the window taller than the screen
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setWidget(widget)
+        return scroll
+
+    def set_mock_ui(self, visible: bool):
+        """Mock-fixture controls (cancel / inspect recovery / discard, their statuses and the start dialog's mock page) are
+        developer tools: shown with SYNAPSE_DEV=1 or after Developer -> Run Mock Fixture…."""
+        for widget in (self.cancel_mock_button, self.resume_mock_button, self.discard_resume_button,
+                       self.cancel_mock_status, self.resume_mock_status):
+            widget.setVisible(visible)
+        self.start_panel.set_mock_available(visible)
 
     def _init_runs_state(self):
         self._active_run = ""

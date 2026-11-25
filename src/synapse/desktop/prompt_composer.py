@@ -9,15 +9,26 @@ from __future__ import annotations
 from PySide6.QtCore import QMimeData, Qt, Signal
 from PySide6.QtGui import QGuiApplication, QTextDocumentFragment
 from PySide6.QtWidgets import (
-    QFormLayout, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton, QToolButton, QVBoxLayout, QWidget,
+    QDialog, QFormLayout, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton, QToolButton, QVBoxLayout, QWidget,
 )
+
+from synapse.desktop import icons
 
 from synapse.desktop.agent_form import MAX_PROMPT, MAX_PROMPT_BYTES, AgentRunForm, utf8_len, validate
 
 PASTE_CAP = 100 * 1024  # characters kept from one paste or file; anything beyond is dropped with a message
 FILE_CAP = 256 * 1024  # bytes read from a dropped file
-PLACEHOLDER = "Type or paste a prompt…"
-HINT = "Enter adds a new line. Ctrl+Enter sends (you will be asked to confirm first)."
+PLACEHOLDER = "Describe the task. Enter sends, Shift+Enter adds a line."
+HINT = "Enter sends. Shift+Enter adds a new line. A start can be cancelled for 5 seconds."
+BAR_HEIGHT = 52
+
+
+class AutoLabel(QLabel):
+    """A caption that takes no room while it is empty."""
+
+    def setText(self, text: str):
+        super().setText(text)
+        self.setVisible(bool(text))
 
 
 def normalize_text(text: str) -> str:
@@ -42,6 +53,9 @@ def read_text_file(path: str) -> tuple[str | None, str]:
             return None, "That file is not UTF-8 text, so it was not added."
         text = data[:exc.start].decode("utf-8")  # cut mid-character at the cap
     return text, "The file was larger than 256 KiB; only the start was read." if truncated else ""
+
+
+from synapse.desktop.offline import OFFLINE_TIP  # noqa: E402
 
 
 class PromptEdit(QPlainTextEdit):
@@ -86,8 +100,11 @@ class PromptEdit(QPlainTextEdit):
         self.ensureCursorVisible()
 
     def keyPressEvent(self, event):
-        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            self.send_requested.emit()
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                super().keyPressEvent(event)  # Shift+Enter: a new line
+                return
+            self.send_requested.emit()  # Enter and Ctrl+Enter send
             event.accept()
             return
         super().keyPressEvent(event)
@@ -96,27 +113,38 @@ class PromptEdit(QPlainTextEdit):
 class PromptComposer(AgentRunForm):
     def _make_prompt(self) -> QPlainTextEdit:
         edit = PromptEdit()
-        edit.setMinimumHeight(70)
-        edit.setMaximumHeight(150)
+        edit.setMinimumHeight(36)
+        edit.setMaximumHeight(72)
         return edit
 
     def _build_layout(self):
+        """The pinned launch bar: prompt | account | repository | Configure… | Send (52 px), with one caption line that only
+        takes room when it has something to say. The advanced options live in the Configure dialog."""
         self.setObjectName("composer")
         self.submit_button.setText("Send")
         self.submit_button.setObjectName("primary")
+        self.submit_button.setIcon(icons.icon("send", "#ffffff", "#ffffff"))
+        self.submit_button.setAccessibleName("Send the prompt and start a run")
         self.paste_button = QPushButton("Paste from clipboard")
-        self.counter = QLabel("")
+        self.counter = AutoLabel("")
         self.counter.setObjectName("caption")
         self.hint = QLabel(HINT)
         self.hint.setObjectName("caption")
-        self.notice_label = QLabel("")
+        self.hint.setVisible(False)
+        self.notice_label = AutoLabel("")
         self.notice_label.setObjectName("caption")
         self.notice_label.setWordWrap(True)
-        self.options_toggle = QToolButton()
-        self.options_toggle.setText("Options")
+        for name in ("problems", "status"):
+            old = getattr(self, name)
+            new = AutoLabel()
+            new.setObjectName("caption")
+            new.setWordWrap(True)
+            new.setTextFormat(Qt.TextFormat.PlainText)
+            setattr(self, name, new)
+            old.deleteLater()
+        self.status.setText("")
+        self.options_toggle = QToolButton()  # kept for the Configure toggle API; the options live in the dialog
         self.options_toggle.setCheckable(True)
-        self.options_toggle.setArrowType(Qt.ArrowType.RightArrow)
-        self.options_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.options = QWidget()
         form = QFormLayout(self.options)
         form.setContentsMargins(0, 0, 0, 0)
@@ -131,31 +159,71 @@ class PromptComposer(AgentRunForm):
         form.addRow("Approval valid for", self.approval_ttl)
         self.options.setVisible(False)
         self.options_toggle.toggled.connect(self._options_toggled)
-        top = QHBoxLayout()
-        title = QLabel("Prompt")
-        title.setObjectName("h2")
-        top.addWidget(title)
-        top.addStretch(1)
-        top.addWidget(QLabel("Claude account"))
-        top.addWidget(self.profile)
-        top.addWidget(QLabel("Repository"))
-        self.repo.setMinimumWidth(240)
-        top.addWidget(self.repo)
-        bottom = QHBoxLayout()
-        bottom.addWidget(self.paste_button)
-        bottom.addWidget(self.options_toggle)
-        bottom.addWidget(self.counter, 1)
-        bottom.addWidget(self.submit_button)
+        self.configure_button = QPushButton("Configure…")
+        self.configure_button.setIcon(icons.icon("sliders"))
+        self.configure_button.setToolTip("Base ref, tools, permission mode, timeout, approval step, registered repositories (Ctrl+N)")
+        self.configure_button.setAccessibleName("Configure the run")
+        self.configure_dialog = None
+        self.profile.setMinimumWidth(150)
+        self.profile.setAccessibleName("Claude account")
+        self.repo.setMinimumWidth(180)
+        self.repo.setAccessibleName("Repository")
+        bar = QHBoxLayout()
+        bar.setContentsMargins(0, 0, 0, 0)
+        bar.setSpacing(8)
+        bar.addWidget(self.prompt, 1)
+        bar.addWidget(self.profile)
+        bar.addWidget(self.repo)
+        bar.addWidget(self.configure_button)
+        bar.addWidget(self.submit_button)
+        bar.addWidget(self.cancel_start_button)
+        self.bar_widget = QWidget()
+        self.bar_widget.setLayout(bar)
+        self.bar_widget.setMinimumHeight(BAR_HEIGHT - 12)
         layout = QVBoxLayout(self)
-        layout.addLayout(top)
-        layout.addWidget(self.prompt)
-        layout.addWidget(self.hint)
-        layout.addLayout(bottom)
-        layout.addWidget(self.options)
-        layout.addWidget(self.notice_label)
-        layout.addWidget(self.problems)
-        layout.addWidget(self.status)
-        self.status.setObjectName("caption")
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.addWidget(self.bar_widget)
+        for label in (self.counter, self.notice_label, self.problems, self.status):
+            layout.addWidget(label)
+        self.configure_button.clicked.connect(self.configure)
+
+    def configure(self):
+        """Open the full Configure dialog: the options form plus a summary of what the bar will send."""
+        if self.configure_dialog is None:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Configure run")
+            dialog.setModal(False)
+            column = QVBoxLayout(dialog)
+            self.configure_summary = QLabel("")
+            self.configure_summary.setTextFormat(Qt.TextFormat.PlainText)
+            self.configure_summary.setWordWrap(True)
+            column.addWidget(self.configure_summary)
+            column.addWidget(self.options)
+            row = QHBoxLayout()
+            row.addWidget(self.paste_button)
+            row.addStretch(1)
+            close = QPushButton("Close")
+            close.clicked.connect(dialog.close)
+            row.addWidget(close)
+            self.configure_start = QPushButton("Start")
+            self.configure_start.setObjectName("primary")
+            self.configure_start.clicked.connect(self._configure_start)
+            row.addWidget(self.configure_start)
+            column.addLayout(row)
+            self.configure_dialog = dialog
+        self.options.setVisible(True)
+        chars, size = self.counts()
+        self.configure_summary.setText(f"The prompt in the bar ({chars:,} characters) is sent with these settings. "
+                                       f"Account: {self.profile.currentText() or 'none chosen'}. Repository: {self.repo.currentText() or 'none chosen'}.")
+        self.configure_start.setEnabled(self.can_send())
+        self.configure_dialog.show()
+        self.configure_dialog.raise_()
+        self.configure_dialog.activateWindow()
+
+    def _configure_start(self):
+        self.configure_dialog.close()
+        self.submit_if_ready()
 
     def _connect_signals(self):
         super()._connect_signals()
@@ -187,17 +255,28 @@ class PromptComposer(AgentRunForm):
         chars, size = self.counts()
         return chars > MAX_PROMPT or size > MAX_PROMPT_BYTES
 
+    offline = False
+
+    def set_offline(self, offline: bool):
+        self.offline = offline
+        self.update_state()
+        self.submit_button.setToolTip(OFFLINE_TIP if offline else "")
+
     def can_send(self) -> bool:
+        if self.offline:
+            return False
         payload, _problems = validate(self.fields())
-        return payload is not None and not self._pending
+        return payload is not None and not self._pending and not self._counting
 
     def update_state(self, *_):
         chars, size = self.counts()
         over = self.over_limit()
-        self.counter.setText(f"{chars:,} / {MAX_PROMPT:,} characters · {size:,} / {MAX_PROMPT_BYTES:,} bytes"
-                             + ("  — too long: shorten it to send" if over else ""))
-        self.counter.setStyleSheet("color: #ff7c8b; font-weight: 700;" if over else "")
+        near = over or chars > MAX_PROMPT * 0.8 or (size or 0) > MAX_PROMPT_BYTES * 0.8
+        self.counter.setText((f"{chars:,} / {MAX_PROMPT:,} characters · {size:,} / {MAX_PROMPT_BYTES:,} bytes"
+                              + ("  — too long: shorten it to send" if over else "")) if near else "")
         self.counter.setProperty("over", over)
+        self.counter.style().unpolish(self.counter)
+        self.counter.style().polish(self.counter)
         self.submit_button.setEnabled(self.can_send())
 
     def set_profiles(self, raw):

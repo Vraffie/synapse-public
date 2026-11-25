@@ -17,7 +17,7 @@ import re
 from dataclasses import dataclass
 from uuid import uuid4
 
-from PySide6.QtCore import QSettings, Qt, Signal
+from PySide6.QtCore import QSettings, QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton,
     QSpinBox, QVBoxLayout, QWidget,
@@ -254,8 +254,24 @@ class AgentSubmission:
     correlation: str
 
 
+START_DELAY_MS = 5000  # a start can be cancelled for this long before anything is sent (tests set 0 for an immediate send)
+RISKY_TOOLS = ("Edit", "Write", "NotebookEdit", "Bash")
+
+
+def start_line(payload: dict, seconds: int) -> str:
+    """One line for the countdown toast: when it starts, what it runs on and, when relevant, what it may change."""
+    risky = [t for t in payload["allowed_tools"] if t in RISKY_TOOLS]
+    parts = [f"Run starts in {seconds} s", payload["repo"] if "repo" in payload else "several repositories"]
+    parts.append(f"account {payload['profile']}" if payload.get("profile") else "default account")
+    if risky:
+        parts.append("may change files or run commands (" + ", ".join(risky) + ")")
+    return " · ".join(parts)
+
+
 class AgentRunForm(QWidget):
     submit_requested = Signal(object)  # AgentSubmission
+    start_countdown = Signal(str)  # one line while the cancel window is open, refreshed every second
+    start_countdown_ended = Signal()
 
     def __init__(self, settings: QSettings | None = None, parent=None):
         super().__init__(parent)
@@ -303,7 +319,16 @@ class AgentRunForm(QWidget):
         self._approval_edited = False
         for widget in (self.approval_operation, self.approval_target, self.approval_ttl):
             widget.setEnabled(False)
-        self.submit_button = QPushButton("Start agent run…")
+        self.submit_button = QPushButton("Start agent run")
+        self.cancel_start_button = QPushButton("Cancel start")
+        self.cancel_start_button.setVisible(False)
+        self.cancel_start_button.setAccessibleName("Cancel the run that is about to start")
+        self._counting = False
+        self._remaining = 0
+        self._countdown_submission = None
+        self._countdown_timer = QTimer(self)
+        self._countdown_timer.setInterval(1000)
+        self._countdown_timer.timeout.connect(self._tick)
         self.problems = QLabel("")
         self.problems.setWordWrap(True)
         self.problems.setTextFormat(Qt.TextFormat.PlainText)
@@ -343,6 +368,7 @@ class AgentRunForm(QWidget):
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(self.submit_button)
+        layout.addWidget(self.cancel_start_button)
         layout.addWidget(self.problems)
         layout.addWidget(self.status)
 
@@ -447,7 +473,7 @@ class AgentRunForm(QWidget):
 
     def _update_submit(self, *_):
         ready = self._profile_state == "unavailable" or (self._profile_state == "loaded" and self.profile.currentData() is not None)
-        self.submit_button.setEnabled(not self._pending and ready)
+        self.submit_button.setEnabled(not self._pending and not self._counting and ready)
         if not self._pending and self._profile_notice:
             self.status.setText(self._profile_notice)
 
@@ -455,6 +481,7 @@ class AgentRunForm(QWidget):
         self.profile.activated.connect(self._profile_activated)
         self.profile.currentIndexChanged.connect(self._update_submit)
         self.submit_button.clicked.connect(self.submit)
+        self.cancel_start_button.clicked.connect(self.cancel_start)
         self.require_approval.toggled.connect(self._approval_toggled)
         self.repo.currentTextChanged.connect(self._autofill_approval)
         self.prompt.textChanged.connect(self._autofill_approval)
@@ -501,16 +528,52 @@ class AgentRunForm(QWidget):
         return AgentSubmission(payload, body, self._last[1], self._last[2])
 
     def submit(self):
-        if self._pending:
+        if self._pending or self._counting:
             return
         submission = self.build_submission()
         if submission is None:
             self.status.setText("Fix the problems above before starting.")
             return
-        if not ask_confirm(self, "Start agent run", summary_text(submission.payload)):
-            self.status.setText("Cancelled; nothing was sent.")
+        if START_DELAY_MS <= 0:
+            self.submit_requested.emit(submission)
             return
-        self.submit_requested.emit(submission)
+        # No modal: the run starts after a short, visible, cancellable countdown; nothing is sent before it ends.
+        self._counting = True
+        self._countdown_submission = submission
+        self._remaining = max(1, -(-START_DELAY_MS // 1000))
+        self.cancel_start_button.setVisible(True)
+        self._update_submit()
+        self._announce_countdown()
+        self._countdown_timer.start()
+
+    def _announce_countdown(self):
+        line = start_line(self._countdown_submission.payload, self._remaining)
+        self.status.setText(line + ". Nothing has been sent yet; Cancel stops it.")
+        self.start_countdown.emit(line)
+
+    def _tick(self):
+        self._remaining -= 1
+        if self._remaining > 0:
+            self._announce_countdown()
+            return
+        submission = self._countdown_submission
+        self._end_countdown()
+        if submission is not None:
+            self.submit_requested.emit(submission)
+
+    def cancel_start(self):
+        if not self._counting:
+            return
+        self._end_countdown()
+        self.status.setText("Cancelled; nothing was sent.")
+
+    def _end_countdown(self):
+        self._countdown_timer.stop()
+        self._counting = False
+        self._countdown_submission = None
+        self.cancel_start_button.setVisible(False)
+        self._update_submit()
+        self.start_countdown_ended.emit()
 
     def set_pending(self, pending: bool):
         self._pending = pending

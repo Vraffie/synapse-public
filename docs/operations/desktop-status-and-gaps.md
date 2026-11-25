@@ -23,7 +23,7 @@ acceptance tests), #131 (demo launcher). Do not duplicate them.
 | Control Center renders dark and light, empty and populated | render script PNGs; `img/control-center-*.png` |
 | Real daemon end to end on mock provider: connect, run list, topology, phases, approval card with operation/target, status bar (socket, health, API v1, pending approvals) | demo screenshot `img/desktop-live-mock-gate.png`; `test_desktop_live_daemon.py` |
 | Approval decision dialog with worktree diff, token entry, idempotency key | `test_desktop_approval_decision.py`, `test_desktop_approval_pages.py` |
-| Approvals / Runs / Events / Messages developer tabs with cursor paging, Ctrl+1..4, F5, Ctrl+F, F1 shortcuts table | `shortcuts.py`, `test_desktop_operator_ui.py` |
+| Approvals / Runs / Events / Messages developer tabs with cursor paging, Ctrl+1/2, Alt+1..4, Ctrl+Shift+A, Ctrl+N, Ctrl+F, Ctrl+0, F5, F1 shortcuts table | `shortcuts.py`, `test_desktop_operator_ui.py` |
 | Fixed-mock start, cancel and operator resume with explicit evidence confirmation | `test_desktop_mock_*.py`, `desktop.md` |
 | Real agent start (`POST /agent-runs`) and cancel (`agent-cancel`) from the form; run detail (`/runs/{id}/agent`): tools, worktree status, bounded diff | `agent_form.py`, `agent_view.py`, `test_desktop_agent_run.py` |
 | Reconnect with capped backoff, redaction of tokens, reduced-motion switch (`SYNAPSE_REDUCED_MOTION`) | `connection.py`, `redaction.py`, `theme.py`; offline path in tests only |

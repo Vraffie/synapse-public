@@ -151,10 +151,8 @@ def test_empty_state_text(app):
 # ---- composer -------------------------------------------------------------------------------------
 @pytest.fixture
 def composer(app, tmp_path, monkeypatch):
-    monkeypatch.setattr(agent_form, 'ask_confirm', lambda *a: calls.append(a) or answer[0])
-    calls, answer = [], [True]
+    monkeypatch.setattr(agent_form, 'START_DELAY_MS', 0)
     box = prompt_composer.PromptComposer(QSettings(str(tmp_path / 'c.ini'), QSettings.Format.IniFormat))
-    box.calls, box.answer = calls, answer
     box.sent = []
     box.submit_requested.connect(box.sent.append)
     box.set_profiles(None)  # the daemon explicitly lists no accounts: the default account, so Start is not gated
@@ -194,16 +192,19 @@ def test_typed_equals_pasted_including_multibyte(composer, text):
     assert composer.counts() == (4, 7)
 
 
-def test_enter_is_newline_and_ctrl_enter_sends(composer):
+def test_enter_sends_shift_enter_is_newline(composer):
     from PySide6.QtCore import Qt
     composer.prompt.setFocus()
     QTest.keyClicks(composer.prompt, 'one')
-    QTest.keyClick(composer.prompt, Qt.Key.Key_Return)
+    QTest.keyClick(composer.prompt, Qt.Key.Key_Return, Qt.KeyboardModifier.ShiftModifier)
     QTest.keyClicks(composer.prompt, 'two')
-    assert composer.prompt.toPlainText() == 'one\ntwo' and not composer.sent and not composer.calls
-    QTest.keyClick(composer.prompt, Qt.Key.Key_Return, Qt.KeyboardModifier.ControlModifier)
-    assert len(composer.calls) == 1 and len(composer.sent) == 1  # confirmation shown, then sent
-    assert 'Ctrl+Enter' in composer.hint.text()
+    assert composer.prompt.toPlainText() == 'one\ntwo' and not composer.sent
+    QTest.keyClick(composer.prompt, Qt.Key.Key_Return)  # Enter sends directly: no confirmation dialog
+    assert len(composer.sent) == 1
+    composer.finished('lost')
+    QTest.keyClick(composer.prompt, Qt.Key.Key_Return, Qt.KeyboardModifier.ControlModifier)  # Ctrl+Enter sends too
+    assert len(composer.sent) == 2
+    assert 'Enter sends' in composer.hint.text() and 'Shift+Enter' in composer.hint.text()
 
 
 def test_paste_strips_rich_text(composer):
@@ -265,12 +266,14 @@ def test_file_drop(composer, tmp_path):
     assert len(text) == prompt_composer.FILE_CAP and 'larger' in note
 
 
-def test_confirmation_cancel_sends_nothing_and_retry_is_idempotent(composer):
+def test_cancelled_start_sends_nothing_and_retry_is_idempotent(composer, monkeypatch):
     composer.prompt.setPlainText('do the thing')
-    composer.answer[0] = False
+    monkeypatch.setattr(agent_form, 'START_DELAY_MS', 4000)
     composer.submit_button.click()
-    assert composer.calls and not composer.sent
-    composer.answer[0] = True
+    assert composer._counting and not composer.sent and not composer.submit_button.isEnabled()
+    composer.cancel_start_button.click()
+    assert not composer.sent and not composer._counting and 'nothing was sent' in composer.status.text()
+    monkeypatch.setattr(agent_form, 'START_DELAY_MS', 0)
     composer.submit_button.click()
     composer.finished('lost')  # response lost: the prompt stays and the key is reused
     assert composer.prompt.toPlainText() == 'do the thing'
