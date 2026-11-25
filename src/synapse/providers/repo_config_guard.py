@@ -36,7 +36,7 @@ CLAUDE = "claude"
 CODEX = "codex"
 ADAPTERS = frozenset({CLAUDE, CODEX})
 
-MAX_ENTRIES = 200_000
+MAX_ENTRIES = 500_000  # a 190k-file repository scans in about a second
 MAX_DEPTH = 12
 
 

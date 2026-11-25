@@ -58,8 +58,11 @@ is the only allowed ref); `protected_paths` (at most 64) narrows what an agent m
 most 16 object entries; unknown keys refuse startup. The daemon records `registry_sha256` (the validated object
 entries) and their ids in an `agent.repo_registry_loaded` audit row at start. Only the operator edits the file.
 
-The daemon service (`AgentRunService.start`) accepts the multi-repository request; the HTTP route, `agentctl`
-flags and desktop views are B's lane and follow separately. Shape:
+The daemon service (`AgentRunService.start`) accepts the multi-repository request, and so does `POST /api/v1/agent-runs`
+(`repos` plus per-task `repos`, no `repo`/`base_ref`). `agentctl agent-start --repo-id ID[=refs/heads/BRANCH] ...` (repeatable)
+starts one task that writes every named repository with `--prompt-file`, or takes per-task `repos` from `--tasks-file`.
+`synapse_up.py up` registers each repository as an object entry (id = directory name, baseline = checked-out branch plus
+main/master/develop). The desktop start form follows separately. Shape:
 `{"repos": [{"repo_id", "baseline_ref"?}], "tasks": [{..., "repos": [{"repo_id", "access": "write"|"read"}]}]}`,
 1 to 16 repositories, no `repo`/`base_ref`, Claude profiles only (Codex has no per-worktree mount control yet).
 Exactly one task per run may write a given repository; a task may write several. Multi-repository runs require `"sandbox": true`: without bwrap a same-uid agent could rewrite a worktree's index or refs between the host checks and the commit, or write to its read-only repositories. The operator can waive this explicitly with `"allow_multi_repo_unsandboxed": true` in the config (refused otherwise with `multi_repo_requires_sandbox`, at the request and again before each attempt). Refusals (422, nothing

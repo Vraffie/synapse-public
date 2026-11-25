@@ -531,9 +531,11 @@ class ClaudeCliProvider:
             cwd, binds = validate_workspace(data.get("worktree"), data["workspace"], p.state_dir)
             for tree, _ in binds:
                 self._check_repo_config(tree)
+            # The attempt directory holds exactly these worktrees (validate_workspace): scanning it again would only
+            # count every file twice against the scan limit.
         else:
             cwd = validate_worktree(data.get("worktree"), p.state_dir)
-        self._check_repo_config(cwd)
+            self._check_repo_config(cwd)
         self._credential_source(cwd)  # refuse an unsafe credential source at start(), before any spawn
         # No positional prompt: `-p` reads it from stdin (verified, claude 2.1.329), so it never
         # appears in /proc/<pid>/cmdline. --setting-sources user + --settings: the repo's

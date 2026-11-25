@@ -177,7 +177,7 @@ no events; stderr is separate from the JSONL on stdout (the adapter discards std
 One data module, `src/synapse/providers/repo_config_guard.py`, is imported by both adapters. Each
 entry is "hard" (refuse the run) for the adapter that loads it and "warn" (log only) otherwise.
 Matching is case-insensitive, counts symlinks (also dangling), does not follow symlinked
-directories, skips `.git`, and fails closed if the tree has more than 200,000 entries.
+directories, skips `.git`, and fails closed if the tree has more than 500,000 entries.
 
 | Entry | Claude | Codex | Why |
 |---|---|---|---|

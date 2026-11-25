@@ -163,7 +163,7 @@ def test_register_several_merges_private_sandboxed_config(workspace_dir, fake_en
     rc = up.main(["up", "--workspace", str(workspace_dir), "--repo", "api", "--repo", "web app", "--no-desktop"])
     assert rc == 0
     data = json.loads(cfg.read_text())
-    assert data["repos"] == ["/srv/existing", str(workspace_dir / "api"), str(workspace_dir / "web app")]
+    assert [up._entry_path(r) for r in data["repos"]] == ["/srv/existing", str(workspace_dir / "api"), str(workspace_dir / "web app")]
     assert data["sandbox"] is True and stat.S_IMODE(cfg.stat().st_mode) == 0o600
     assert data["allowed_tools"] == ["Edit", "Glob", "Grep", "Read"]
     out = capsys.readouterr().out
@@ -209,7 +209,7 @@ def test_up_argument_combinations(workspace_dir, fake_env, capsys):
 def test_legacy_up_repo_still_registers_one_repo(workspace_dir, fake_env):
     assert up.main(["up", str(workspace_dir / "api"), "--no-desktop"]) == 0
     data = json.loads((fake_env / "agent.json").read_text())
-    assert data["repos"] == [str(workspace_dir / "api")] and data["sandbox"] is True
+    assert [up._entry_path(r) for r in data["repos"]] == [str(workspace_dir / "api")] and data["sandbox"] is True
 
 
 def test_config_write_never_follows_a_planted_tmp_symlink(tmp_path):
@@ -292,7 +292,7 @@ def test_up_without_a_repo_registers_the_default_repositories(workspace_dir, fak
     listing.write_text("# my repos\n%s\n" % (workspace_dir / "api"))
     assert up.main(["up", "--no-desktop"]) == 0
     data = json.loads((fake_env / "agent.json").read_text())
-    assert data["repos"] == [str(workspace_dir / "api")] and data["sandbox"] is True
+    assert [up._entry_path(r) for r in data["repos"]] == [str(workspace_dir / "api")] and data["sandbox"] is True
 
 
 def test_default_repositories_need_a_private_list_of_absolute_git_paths(workspace_dir, fake_env, tmp_path, monkeypatch):
@@ -303,3 +303,28 @@ def test_default_repositories_need_a_private_list_of_absolute_git_paths(workspac
         listing.write_text(text)
         assert up.main(["up", "--no-desktop"]) == 1
     assert not fake_env.exists()
+
+
+def test_registered_git_repos_become_registry_objects_with_ids_and_baselines(workspace_dir, fake_env):
+    assert up.main(["up", "--workspace", str(workspace_dir), "--repo", "api", "--repo", "web app", "--no-desktop"]) == 0
+    repos = json.loads((fake_env / "agent.json").read_text())["repos"]
+    assert repos[0] == {"id": "api", "path": str(workspace_dir / "api"), "baseline_refs": ["refs/heads/main"],
+                        "default_baseline_ref": "refs/heads/main"}
+    assert repos[1] == str(workspace_dir / "web app")  # "web app" is not a safe id: stays a plain single-repo entry
+
+
+def test_a_plain_entry_is_upgraded_and_existing_objects_survive_a_rerun(workspace_dir, fake_env):
+    cfg = fake_env / "agent.json"
+    obj = {"id": "keep", "path": str(workspace_dir / "web app"), "baseline_refs": ["refs/heads/x"], "default_baseline_ref": "refs/heads/x"}
+    fake_env.mkdir(mode=0o700)
+    cfg.write_text(json.dumps({"sandbox": True, "repos": [str(workspace_dir / "api"), obj]}))
+    cfg.chmod(0o600)
+    assert up.main(["up", str(workspace_dir / "api"), "--no-desktop"]) == 0
+    repos = json.loads(cfg.read_text())["repos"]
+    assert repos[0]["id"] == "api" and repos[1] == obj
+
+
+def test_two_repositories_with_the_same_directory_name_are_refused(workspace_dir, fake_env, tmp_path):
+    other = make_repo(tmp_path / "elsewhere" / "api")
+    assert up.main(["up", str(workspace_dir / "api"), "--no-desktop"]) == 0
+    assert up.main(["up", str(other), "--no-desktop"]) == 1

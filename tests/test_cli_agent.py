@@ -465,3 +465,51 @@ def test_default_profile_file_must_be_private_and_not_a_link(tmp_path):
     assert read_default_profile(tmp_path) == "claude-work"
     (tmp_path / "default-profile").chmod(0o666)
     assert read_default_profile(tmp_path) is None
+
+
+def _multi_sent(monkeypatch, tmp_path, extra, prompt="do it"):
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700, exist_ok=True)
+    f = tmp_path / "p.txt"
+    f.write_text(prompt)
+    sent = []
+    monkeypatch.setattr(cli, "_request", lambda state_dir, endpoint, **kw: sent.append(json.loads(kw["body"])) or {"run_id": "r1"})
+    base = ["--state-dir", str(state), "agent-start", "--idempotency-key", "k", "--correlation-id", "c"]
+    return cli.main([*base, *extra(f)]), sent
+
+
+def test_repo_ids_build_one_task_that_writes_every_repository(monkeypatch, tmp_path):
+    code, sent = _multi_sent(monkeypatch, tmp_path, lambda f: [
+        "--repo-id", "product-config=refs/heads/main", "--repo-id", "portfolio", "--repo-id", "tenant",
+        "--prompt-file", str(f), "--tool", "Read", "--tool", "Edit", "--permission-mode", "plan"])
+    assert code == 0
+    body = sent[0]
+    assert "repo" not in body and "base_ref" not in body and "prompt" not in body
+    assert body["repos"] == [{"repo_id": "product-config", "baseline_ref": "refs/heads/main"}, {"repo_id": "portfolio"}, {"repo_id": "tenant"}]
+    task, = body["tasks"]
+    assert task["prompt"] == "do it" and task["allowed_tools"] == ["Read", "Edit"]
+    assert task["repos"] == [{"repo_id": i, "access": "write"} for i in ("product-config", "portfolio", "tenant")]
+    assert body["permission_mode"] == "plan"
+
+
+def test_repo_ids_with_a_tasks_file_keep_each_tasks_own_repos(monkeypatch, tmp_path):
+    tasks = tmp_path / "t.json"
+    t = [{"id": "a", "prompt": "p", "allowed_tools": ["Read"], "repos": [{"repo_id": "x", "access": "write"}]}]
+    tasks.write_text(json.dumps(t))
+    code, sent = _multi_sent(monkeypatch, tmp_path, lambda f: ["--repo-id", "x", "--tasks-file", str(tasks)])
+    assert code == 0 and sent[0]["tasks"] == t and sent[0]["repos"] == [{"repo_id": "x"}] and "repo" not in sent[0]
+
+
+@pytest.mark.parametrize("extra", [
+    ["--repo", "/r", "--repo-id", "a"],           # both shapes
+    [],                                           # neither
+    ["--repo-id", "a", "--repo-id", "a"],         # repeated id
+    ["--repo-id", "bad id"],                      # id pattern
+    ["--repo-id", "a=main"],                      # baseline must be refs/heads/...
+    ["--repo-id", "a"],                           # no --tool with --prompt-file
+])
+def test_bad_repo_selection_is_refused_before_any_request(monkeypatch, tmp_path, extra):
+    def args(f):
+        return [*extra, "--prompt-file", str(f)]
+    with pytest.raises(SystemExit):
+        _multi_sent(monkeypatch, tmp_path, args)

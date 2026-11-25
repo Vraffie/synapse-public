@@ -3214,11 +3214,12 @@ Start Agent Run.
 | --- | --- | --- |
 | `allowed_tools` | no | array or null |
 | `approval_step` | no | object or null |
-| `base_ref` | yes | string, minLength=1, maxLength=256 |
+| `base_ref` | no | string, minLength=1, maxLength=256 or null |
 | `permission_mode` | no | string, maxLength=32, default="acceptEdits" |
 | `profile` | no | string, pattern=`^[A-Za-z0-9._-]{1,64}$` or null |
 | `prompt` | no | string, minLength=1, maxLength=32768 or null |
-| `repo` | yes | string, minLength=1, maxLength=4096 |
+| `repo` | no | string, minLength=1, maxLength=4096 or null |
+| `repos` | no | array or null |
 | `tasks` | no | array or null |
 | `timeout_seconds` | no | number, max=3600, default=600 |
 
@@ -3228,6 +3229,12 @@ Example:
 {
   "repo": "string",
   "base_ref": "string",
+  "repos": [
+    {
+      "repo_id": "string",
+      "baseline_ref": "string"
+    }
+  ],
   "prompt": "string",
   "allowed_tools": [
     "string"
@@ -3256,7 +3263,13 @@ Example:
         "target": "string",
         "ttl_seconds": 1
       },
-      "profile": "string"
+      "profile": "string",
+      "repos": [
+        {
+          "repo_id": "string",
+          "access": "write"
+        }
+      ]
     }
   ],
   "profile": "string"
