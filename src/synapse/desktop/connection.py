@@ -17,6 +17,7 @@ from synapse.cli.__main__ import DaemonHTTPError, _get, _request
 from synapse.desktop import approval_decision, multirepo_routes
 from synapse.desktop.agent_usage import MAX_ROWS, sanitize_usage
 from synapse.desktop.agent_view import UNAVAILABLE_STATUSES, clean, sanitize_detail
+from synapse.desktop.control_model import RUNS_SHOWN
 from synapse.desktop.cursor_store import Cursor, CursorError, cursor_path, read_cursor, valid_event_id, write_cursor
 from synapse.desktop.mock_resume import ASSERTION, collect_evidence, fetch_all_tasks
 from synapse.desktop.multirepo_model import (
@@ -444,9 +445,9 @@ class Poller(QThread):
         if self._cycle % FEED_EVERY:
             return
         try:
-            page = self.fetch(self.state_dir, "/api/v1/runs?limit=25")
+            page = self.fetch(self.state_dir, "/api/v1/runs?limit=%d" % RUNS_SHOWN)
             if isinstance(page, dict) and isinstance(page.get("runs"), list):
-                self.runs_list.emit(page["runs"][:100])
+                self.runs_list.emit(page["runs"][:RUNS_SHOWN])
         except Exception:
             pass
         if self._feed_run != run_id:
