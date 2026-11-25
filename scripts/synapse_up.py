@@ -54,6 +54,7 @@ except ImportError:  # run from a checkout without the package installed
 PROTECTED_HOME_SUBDIRS = (".local/share", ".config", ".claude", ".codex", ".ssh", ".gnupg")
 DEFAULT_TOOLS = ("Read", "Glob", "Grep")
 _PROFILE_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
+_SAFE_ID = re.compile(r"[A-Za-z0-9._-]{1,128}")
 MAX_REPOS = 32  # the daemon's limit for the `repos` allowlist (docs/operations/agent-runs.md)
 
 
@@ -110,26 +111,61 @@ def read_config(path: Path) -> dict:
     return cfg
 
 
-def merge_repos(existing: list, new: list[Path]) -> tuple[list[str], list[str]]:
-    """(merged allowlist, paths actually added). Refuses a new repo nested in (or containing) another one:
+def _entry_path(entry) -> str | None:
+    if isinstance(entry, str):
+        return os.path.normpath(entry)
+    if isinstance(entry, dict) and isinstance(entry.get("path"), str):
+        return os.path.normpath(entry["path"])
+    return None
+
+
+def repo_entry(repo: Path) -> dict | str:
+    """The registry object for a repository: id = directory name (the manifest and multi-repo runs name repositories
+    by it), baseline = the checked-out branch plus main/master/develop when they exist (edit agent.json for more)."""
+    def branches() -> list[str]:
+        out = subprocess.run(["git", "-C", str(repo), "for-each-ref", "--format=%(refname)", "refs/heads"],
+                             capture_output=True, text=True, timeout=20, check=False)
+        return out.stdout.split() if out.returncode == 0 else []
+    head = subprocess.run(["git", "-C", str(repo), "symbolic-ref", "-q", "HEAD"], capture_output=True, text=True,
+                          timeout=20, check=False).stdout.strip()
+    existing = branches()
+    refs = [r for r in dict.fromkeys([head, "refs/heads/main", "refs/heads/master", "refs/heads/develop"]) if r in existing]
+    if not refs or not _SAFE_ID.fullmatch(repo.name):
+        return str(repo)  # not a git checkout, detached HEAD or an unusable directory name: a plain single-repo entry
+    return {"id": repo.name, "path": str(repo), "baseline_refs": refs, "default_baseline_ref": refs[0]}
+
+
+def merge_repos(existing: list, new: list[Path]) -> tuple[list, list[str]]:
+    """(merged allowlist, paths actually added). New repositories become registry objects (see repo_entry); existing
+    entries, plain or object, are kept as they are. Refuses a new repo nested in (or containing) another one:
     the daemon refuses nested allowlist entries at start."""
-    repos: list[str] = []
+    repos: list = []
+    paths: list[str] = []
     for r in existing:  # normalised so "/a/b/" and "/a/b" are one entry
-        if isinstance(r, str) and os.path.normpath(r) not in repos:
-            repos.append(os.path.normpath(r))
+        path = _entry_path(r)
+        if path is not None and path not in paths:
+            repos.append(r if isinstance(r, dict) else path)
+            paths.append(path)
     added: list[str] = []
     for repo in new:
         repo = Path(os.path.realpath(repo))
         s = str(repo)
-        if s in repos:
+        if s in paths:
+            i = paths.index(s)
+            if isinstance(repos[i], str):  # a plain entry registered earlier becomes an object (multi-repo runs need it)
+                repos[i] = repo_entry(repo)
             continue
-        for other in repos:
+        for other in paths:
             if Path(other) in repo.parents or repo in Path(other).parents:
                 raise UpError("%s is nested with already registered %s; the allowlist must not nest" % (s, other))
-        repos.append(s)
+        repos.append(repo_entry(repo))
+        paths.append(s)
         added.append(s)
     if len(repos) > MAX_REPOS:
         raise UpError("agent.json would list %d repos; the daemon accepts at most %d" % (len(repos), MAX_REPOS))
+    ids = [r["id"] for r in repos if isinstance(r, dict) and "id" in r]
+    if len(set(ids)) != len(ids):
+        raise UpError("two registered repositories share the directory name %s; rename one" % next(i for i in ids if ids.count(i) > 1))
     return repos, added
 
 

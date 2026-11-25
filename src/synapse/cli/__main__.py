@@ -490,9 +490,23 @@ def _read_prompt(source: str, limit: int = _MAX_PROMPT) -> str:
     return data.decode("utf-8")
 
 
+_REPO_ID = re.compile(r"[A-Za-z0-9._-]{1,128}")
+
+
+def _repo_spec(text: str) -> dict:
+    repo_id, sep, ref = text.partition("=")
+    if _REPO_ID.fullmatch(repo_id) is None or (sep and (not ref.startswith("refs/heads/") or len(ref) > 256)):
+        raise argparse.ArgumentTypeError("use ID or ID=refs/heads/BRANCH (ID: 1-128 characters of letters, digits . _ -)")
+    return {"repo_id": repo_id, "baseline_ref": ref} if sep else {"repo_id": repo_id}
+
+
 def _add_agent_parsers(commands) -> None:
     start = commands.add_parser("agent-start", help="start a REAL Claude agent run in a fresh git worktree")
-    start.add_argument("--repo", required=True, help="absolute path of an operator-allowlisted repository")
+    start.add_argument("--repo", help="absolute path of an operator-allowlisted repository (single-repository run)")
+    start.add_argument("--repo-id", action="append", dest="repo_ids", type=_repo_spec, metavar="ID[=refs/heads/BRANCH]",
+                       help="multi-repository run (ADR 026): a registered repository id with an optional baseline branch "
+                            "(repeatable; instead of --repo). With --prompt-file one task writes all of them; with "
+                            "--tasks-file each task declares its own \"repos\" ([{repo_id, access}])")
     start.add_argument("--base-ref", default="HEAD", help="commit-ish to branch the worktree from (default HEAD)")
     # One of the two is required, so a mistyped prompt option fails with "one of ... is required" and
     # argparse never echoes the stray value (which could be prompt text) in an "unrecognized arguments" error.
@@ -631,7 +645,22 @@ def _agent_command(args, parser) -> int:
         if args.command == "agent-start":
             if bool(args.approval_operation) != bool(args.approval_target):
                 parser.error("--approval-operation and --approval-target must be given together")
-            if args.tasks_file:
+            if bool(args.repo) == bool(args.repo_ids):
+                parser.error("give either --repo or --repo-id (repeatable)")
+            ids = [r["repo_id"] for r in args.repo_ids or ()]
+            if len(set(ids)) != len(ids):
+                parser.error("--repo-id must not repeat an id")
+            if args.repo_ids and args.tasks_file is None:  # one task that writes every named repository
+                if not args.tools:
+                    parser.error("--tool is required with --prompt-file")
+                task = {"id": "main", "prompt": _read_prompt(args.prompt_file), "allowed_tools": args.tools,
+                        "repos": [{"repo_id": i, "access": "write"} for i in ids]}
+                if args.approval_operation:
+                    task["approval_step"] = {"operation": args.approval_operation, "target": args.approval_target,
+                                             **({"ttl_seconds": args.approval_ttl_seconds} if args.approval_ttl_seconds is not None else {})}
+                body = {"repos": args.repo_ids, "tasks": [task], "permission_mode": args.permission_mode,
+                        "timeout_seconds": args.timeout_seconds}
+            elif args.tasks_file:
                 if args.tools or args.approval_operation:
                     parser.error("--tasks-file excludes --tool and --approval-*")
                 try:
@@ -644,8 +673,8 @@ def _agent_command(args, parser) -> int:
                     if isinstance(task, dict) and task.get("profile") is not None and (
                             not isinstance(task["profile"], str) or _PROFILE_ID.fullmatch(task["profile"]) is None):
                         raise ValueError("a task's profile must be 1-64 characters of [A-Za-z0-9._-]")
-                body = {"repo": args.repo, "base_ref": args.base_ref, "tasks": tasks,
-                        "permission_mode": args.permission_mode, "timeout_seconds": args.timeout_seconds}
+                body = ({"repos": args.repo_ids} if args.repo_ids else {"repo": args.repo, "base_ref": args.base_ref})
+                body.update({"tasks": tasks, "permission_mode": args.permission_mode, "timeout_seconds": args.timeout_seconds})
             else:
                 if not args.tools:
                     parser.error("--tool is required with --prompt-file")

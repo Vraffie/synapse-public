@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Awaitable, Callable
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Path, Query, Request, Security
 from fastapi.responses import JSONResponse
@@ -54,6 +55,22 @@ class AbandonRequest(BaseModel):
     assertion: str = Field(strict=True, min_length=1, max_length=128)
 
 
+_ID = r"^[A-Za-z0-9._-]{1,128}$"
+
+
+class RunRepoRequest(BaseModel):
+    """A repository of a multi-repository run (ADR 026): a registry id and an optional full refs/heads/ baseline."""
+    model_config = ConfigDict(extra="forbid")
+    repo_id: str = Field(strict=True, pattern=_ID)
+    baseline_ref: str | None = Field(default=None, strict=True, min_length=1, max_length=256)
+
+
+class TaskRepoRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    repo_id: str = Field(strict=True, pattern=_ID)
+    access: Literal["write", "read"]
+
+
 class TaskRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str = Field(strict=True, min_length=1, max_length=64)
@@ -64,13 +81,15 @@ class TaskRequest(BaseModel):
     depends_on: list[str] = Field(default_factory=list, max_length=6)
     approval_step: ApprovalStepRequest | None = None
     profile: str | None = Field(default=None, strict=True, pattern=r"^[A-Za-z0-9._-]{1,64}$")
+    repos: list[TaskRepoRequest] | None = Field(default=None, min_length=1, max_length=16)
 
 
 class AgentRunRequest(BaseModel):
     """Either the single-task body (prompt + allowed_tools) or ``tasks`` (1 to 6, with depends_on)."""
     model_config = ConfigDict(extra="forbid")
-    repo: str = Field(strict=True, min_length=1, max_length=4096)
-    base_ref: str = Field(strict=True, min_length=1, max_length=256)
+    repo: str | None = Field(default=None, strict=True, min_length=1, max_length=4096)
+    base_ref: str | None = Field(default=None, strict=True, min_length=1, max_length=256)
+    repos: list[RunRepoRequest] | None = Field(default=None, min_length=1, max_length=16)
     prompt: str | None = Field(default=None, strict=True, min_length=1, max_length=32768)
     allowed_tools: list[str] | None = Field(default=None, min_length=1, max_length=50)
     permission_mode: str = Field(default="acceptEdits", strict=True, max_length=32)
@@ -81,6 +100,15 @@ class AgentRunRequest(BaseModel):
 
     @model_validator(mode="after")
     def _one_shape(self):
+        if self.repos is not None:  # multi-repository (ADR 026): registry ids, tasks declare their repositories
+            if self.repo is not None or self.base_ref is not None:
+                raise ValueError("give either repo and base_ref or repos, not both")
+            if self.tasks is None or any(t.repos is None for t in self.tasks):
+                raise ValueError("a multi-repository run needs tasks and each task declares its repos")
+        elif self.repo is None or self.base_ref is None:
+            raise ValueError("repo and base_ref are required without repos")
+        elif self.tasks is not None and any(t.repos is not None for t in self.tasks):
+            raise ValueError("task repos need run-level repos")
         if self.tasks is not None:
             if self.prompt is not None or self.allowed_tools is not None or self.approval_step is not None:
                 raise ValueError("tasks excludes prompt, allowed_tools and approval_step")
@@ -96,7 +124,16 @@ def _schema():
     task = {k: v for k, v in definitions["TaskRequest"].items()}
     task["properties"] = {**task["properties"], "approval_step": {"anyOf": [definitions["ApprovalStepRequest"], {"type": "null"}]}}
     schema["properties"]["tasks"] = {"anyOf": [{"type": "array", "minItems": 1, "maxItems": 6, "items": task}, {"type": "null"}]}
-    return schema
+
+    def inline(node):  # the published contract carries no $ref/$defs
+        if isinstance(node, dict):
+            if "$ref" in node:
+                return inline(definitions[node["$ref"].rsplit("/", 1)[1]])
+            return {k: inline(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [inline(v) for v in node]
+        return node
+    return inline(schema)
 
 
 def agent_command_router(start: StartAgent | None, read: ReadAgent | None, cancel: CancelAgent | None,
@@ -122,13 +159,18 @@ def agent_command_router(start: StartAgent | None, read: ReadAgent | None, cance
             del data["approval_step"]["ttl_seconds"]
         if data["profile"] is None:
             del data["profile"]  # absent and null both mean the default profile
+        for k in ("repo", "base_ref", "repos"):
+            if data[k] is None:
+                del data[k]  # exactly one shape is given: repo + base_ref, or repos (ADR 026)
+        if "repos" in data:
+            data["repos"] = [{k: v for k, v in r.items() if v is not None} for r in data["repos"]]
         if data["tasks"] is None:
             del data["tasks"]
         else:
             for k in ("prompt", "allowed_tools", "approval_step"):
                 data.pop(k, None)
             for task in data["tasks"]:
-                for k in ("permission_mode", "timeout_seconds", "profile"):
+                for k in ("permission_mode", "timeout_seconds", "profile", "repos"):
                     if task[k] is None:
                         del task[k]  # the service applies the request-level defaults
                 step = task["approval_step"]

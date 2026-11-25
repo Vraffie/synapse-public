@@ -1309,3 +1309,26 @@ def test_one_repository_is_one_lock_and_duplicate_realpaths_are_refused(cfg_worl
         assert taken == sorted([p, repos["product-config"]])  # one lock per resolved path, in path order
     finally:
         WorktreeManager._lock = real
+
+
+def test_workspace_start_scans_each_worktree_once_not_the_attempt_directory(mgr, repos, tmp_path, monkeypatch):
+    """The scan limit counts every file: scanning the attempt directory too would double-count all worktrees."""
+    import synapse.providers.claude_cli as cc
+    from synapse.providers.claude_cli import ClaudeCliProvider
+    from synapse.providers.contracts import ExecutionRequest
+    state = tmp_path / "state"
+    state.mkdir()
+    paths = mgr.create_attempt("r", "t", 1, attempt_repos(repos))
+    adir = mgr.attempt_dir("r", "t", 1)
+    scanned = []
+    monkeypatch.setattr(cc, "check_repo_config", lambda cwd, adapter, allow=False: scanned.append(cwd))
+    profile = ClaudeCliProfile(executable="/bin/true", allowed_tools=("Read",), state_dir=str(state), enabled=True,
+                               permission_mode="plan", git_repos=tuple(repos.values()))
+    provider = ClaudeCliProvider(profile)
+    request = ExecutionRequest("p", "task", {"prompt": "x", "worktree": adir, "timeout_seconds": 5,
+                                             "workspace": [{"path": p, "access": "write"} for p in paths.values()]})
+    try:
+        provider._plan(request)
+    except Exception:
+        pass  # only the scan targets matter here (the credential source may refuse in this fixture)
+    assert sorted(scanned) == sorted(paths.values()) and adir not in scanned

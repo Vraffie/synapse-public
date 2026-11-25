@@ -769,8 +769,9 @@ class AgentWorkflowEngine(MockWorkflowEngine):
                     mark_spawn_begun(self.db, attempt_id=attempt_id)
                 try:
                     await self.provider.execute(request, emit)
-                except BaseException:
+                except BaseException as exc:
                     if task_id in self.router.start_failed and terminal is None:
+                        _LOG.warning("provider refused to start task %s: %s: %s", task_id, type(exc).__name__, str(exc)[:300])
                         # no process was ever spawned; a known fixed refusal reason is kept (e.g. codex_ineligible)
                         terminal = ProviderEvent("failed", getattr(self.router, "start_refusals", {}).get(
                             task_id, "start_rejected"))
