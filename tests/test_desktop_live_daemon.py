@@ -179,7 +179,7 @@ class Live(demo_mock.Demo):
 
     # -- displayed state
     def tile(self, index):
-        return tuple(label.text() for label in self.cc.tiles[index])
+        return tuple(self.cc.metric_rows[index])
 
     def node_states(self):
         return {n.node_id: n.state for n in self.cc.layout_model.nodes.values()}

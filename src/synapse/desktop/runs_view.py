@@ -12,7 +12,7 @@ from uuid import uuid4
 from PySide6.QtCore import QSignalBlocker, Qt
 from PySide6.QtWidgets import (
     QDialog, QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QPushButton, QVBoxLayout, QWidget,
+    QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
 from synapse.desktop import agent_form
@@ -142,7 +142,11 @@ class RunsMixin:
         self.resume_mock_button.clicked.connect(self._resume_mock)
         self.discard_resume_button.clicked.connect(self._discard_resume)
         self.cancel_mock_button.clicked.connect(self._cancel_mock)
-        return widget
+        scroll = QScrollArea()  # the tab is long: it scrolls instead of forcing the window taller than the screen
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setWidget(widget)
+        return scroll
 
     def _init_runs_state(self):
         self._active_run = ""

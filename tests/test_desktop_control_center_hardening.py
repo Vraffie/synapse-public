@@ -48,7 +48,7 @@ def test_plain_labels_never_render_markup(app, evil):
     center.set_messages('r1', [{'id': 'm1', 'type': evil, 'created_at': '2026-01-01T00:00:00Z', 'payload': {'task_id': 't1'}}])
     center.add_event({'sequence': 1, 'type': evil, 'run_id': 'r1', 'aggregate_id': 't1', 'occurred_at': '2026-01-01T00:00:01Z', 'payload': {}})
     center.set_runs([{'id': evil, 'state': 'running'}])
-    plain = [center.gate_body, center.gate_context, center.sel_name, center.connection_pill, center.gate_title, center.gate_status]
+    plain = [center.gate_body, center.gate_context, center.sel_name, center.state_badge, center.repo_pill, center.gate_title, center.gate_status]
     feed = [center.feed_box.itemAt(i).widget() for i in range(center.feed_box.count())]
     assert feed
     for frame in feed:
@@ -134,7 +134,7 @@ def test_message_count_not_capped_or_reduced_by_events(app):
     for seq in range(1, 500):
         center.add_event({'sequence': seq, 'type': 'task.state_changed', 'run_id': 'r1', 'occurred_at': '2027-01-01T00:00:00+00:00', 'payload': {}})
     center.set_messages('r1', [{'id': 'm0', 'type': 'ack'}, {'id': 'new', 'type': 'ack'}])
-    assert center.message_count == 451 and center.tiles[3][1].text() == '451'
+    assert center.message_count == 451 and center.metric_rows[3][1] == '451'
     assert len(center._feed) <= 400
     dispose(center)
 

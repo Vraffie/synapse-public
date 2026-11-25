@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import QLabel, QMainWindow, QTabWidget, QVBoxLayout, QWidget
 
@@ -17,6 +17,7 @@ from synapse.default_profile import read_default_profile
 from synapse.desktop.runs_view import RunsMixin
 from synapse.desktop.shortcuts import SHORTCUTS, ShortcutsDialog
 from synapse.desktop.status_bar import ConsoleStatusBar
+from synapse.desktop.workbench import SegmentedSwitcher
 
 
 class MainWindow(RunsMixin, MessagesMixin, ApprovalsMixin, EventsMixin, QMainWindow):
@@ -54,10 +55,22 @@ class MainWindow(RunsMixin, MessagesMixin, ApprovalsMixin, EventsMixin, QMainWin
         self.views.addTab(self.control_center, "Control Center")
         self.views.addTab(self.tabs, "Developer")
         self.views.setCurrentWidget(self.control_center)
+        self.views.tabBar().setVisible(False)  # the segmented switcher in each view's toolbar replaces the tab bar
+        self.views.setDocumentMode(True)
+        self.dev_switcher = SegmentedSwitcher()
+        self.dev_switcher.set_current(1)
+        self.dev_switcher.switched.connect(self._switch_view)
+        self.tabs.setCornerWidget(self.dev_switcher, Qt.Corner.TopRightCorner)
+        self.control_center.switcher.switched.connect(self._switch_view)
+        self.views.currentChanged.connect(self._views_changed)
         layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         layout.addWidget(self.health_label)
         layout.addWidget(self.connection_detail)
         layout.addWidget(self.cursor_notice)
+        for label in (self.health_label, self.connection_detail, self.cursor_notice):
+            label.setVisible(False)  # the status bar and the offline alert now carry this; kept for tests and diagnostics
         layout.addWidget(self.views)
         root = QWidget()
         root.setLayout(layout)
@@ -165,6 +178,14 @@ class MainWindow(RunsMixin, MessagesMixin, ApprovalsMixin, EventsMixin, QMainWin
         self.event_search.setFocus()
         self.event_search.selectAll()
 
+    def _switch_view(self, index: int):
+        self.views.setCurrentWidget(self.control_center if index == 0 else self.tabs)
+
+    def _views_changed(self, _index: int):
+        on_developer = self.views.currentWidget() is self.tabs
+        self.control_center.switcher.set_current(1 if on_developer else 0)
+        self.dev_switcher.set_current(1 if on_developer else 0)
+
     def _open_approvals_tab(self):
         self.show_developer(self.approvals_tab)
 
@@ -173,6 +194,8 @@ class MainWindow(RunsMixin, MessagesMixin, ApprovalsMixin, EventsMixin, QMainWin
         text = self.pending_text()
         self.tabs.setTabText(index, f"{APPROVALS_TAB_TITLE} ({text})" if count else APPROVALS_TAB_TITLE)
         self.console_status.set_pending(text)
+        for switcher in (self.control_center.switcher, self.dev_switcher):
+            switcher.set_pending(count)
 
     def _connection_changed(self, state, failures, delay):
         was = self.connection_state
