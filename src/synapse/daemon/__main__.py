@@ -21,6 +21,7 @@ from synapse.api.app import create_app
 from synapse.application.message_gateway import MessageGateway
 from synapse.application.session_authority import SessionAuthority
 from synapse.application.approval_service import ApprovalService
+from synapse.application.approval_requests import DaemonApprovalRequester
 from synapse.infrastructure.passphrase_approver import build_approver_authority
 from synapse.infrastructure.daemon_lock import daemon_lock
 from synapse.infrastructure.socket_reclaim import reclaim_stale_socket
@@ -35,6 +36,8 @@ from synapse.infrastructure.spawn_journal import SpawnJournal
 from synapse.daemon.agent_runtime import AgentRuntime
 from synapse.daemon.same_user_gate import ENV as ALLOW_ENV, SameUserAgentsRefused, check_same_user_agents, record_acknowledgement
 from synapse.daemon.agent_service import AgentRunService, worktree_checker
+from synapse.daemon.manifest_builder import ManifestBuilder
+from synapse.daemon.manifest_service import ManifestService
 from synapse.daemon.multi_repo import AttemptWorkspaces, RepoRegistry, resolve_commit_intents
 from synapse.infrastructure.worktrees import WorktreeManager
 from synapse.providers.credential_sweep import sweep_startup
@@ -341,6 +344,9 @@ def run(state_dir: Path, migrations: Path, *, enable_mock_mcp_ipc: bool = False,
                 sync_profiles(connection, profile_registry)
             agent_service = AgentRunService(connection, agent_runtime, worktrees, profile_registry,
                                             RepoRegistry(() if agent_config is None else agent_config.registry))
+            manifests = ManifestService(
+                connection, None if worktrees is None else ManifestBuilder(connection, agent_runtime.blobs, worktrees),
+                DaemonApprovalRequester(connection))
             def resume_parked():
                 mock_runtime.resume_parked()
                 agent_runtime.resume_parked()
@@ -355,6 +361,8 @@ def run(state_dir: Path, migrations: Path, *, enable_mock_mcp_ipc: bool = False,
                 abandon_agent_run=agent_runtime.abandon,
                 remove_agent_worktree=agent_service.remove_worktree,
                 commit_agent_worktree=agent_service.commit_worktree,
+                build_manifest=manifests.build, list_manifests=manifests.list, show_manifest=manifests.show,
+                recheck_manifest=manifests.recheck, request_manifest_approval=manifests.request_approval,
                 list_profiles=agent_service.list_profiles,
                 set_profile_cooldown=agent_service.set_cooldown,
                 clear_profile_cooldown=agent_service.clear_cooldown,

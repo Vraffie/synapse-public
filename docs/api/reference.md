@@ -23,6 +23,11 @@ Generated from the contracts in `src/synapse/api/openapi_contracts.py`; regenera
 - Runs: `POST /api/v1/runs/{run_id}/agent-worktree-commit`
 - Runs: `POST /api/v1/runs/{run_id}/agent-worktree-remove`
 - Runs: `GET /api/v1/runs/{run_id}/analytics`
+- Runs: `GET /api/v1/runs/{run_id}/candidate-manifests`
+- Runs: `POST /api/v1/runs/{run_id}/candidate-manifests`
+- Runs: `GET /api/v1/runs/{run_id}/candidate-manifests/{manifest_sha256}`
+- Runs: `POST /api/v1/runs/{run_id}/candidate-manifests/{manifest_sha256}/approval`
+- Runs: `POST /api/v1/runs/{run_id}/candidate-manifests/{manifest_sha256}/recheck`
 - Runs: `POST /api/v1/runs/{run_id}/mock-cancel`
 - Runs: `POST /api/v1/runs/{run_id}/mock-resume`
 - Runs: `POST /api/v1/runs/{run_id}/mock-start`
@@ -1397,6 +1402,712 @@ Missing or invalid operator bearer token.
 #### 404
 
 The addressed run, thread or approval does not exist.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 422
+
+Validation error: a parameter or body field is outside its documented bounds.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 500
+
+Internal error (the body never contains traces or file paths).
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 503
+
+A dependency is temporarily unavailable; retry later.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+### `GET /api/v1/runs/{run_id}/candidate-manifests`
+
+List Manifests.
+
+**Auth:** operator bearer token (`Authorization: Bearer <token>`).
+
+**Parameters**
+
+| Name | In | Required | Constraints |
+| --- | --- | --- | --- |
+| `run_id` | path | yes | string, minLength=1, maxLength=256 |
+
+**Responses**
+
+#### 200
+
+Success (or idempotent replay of an earlier command).
+
+```json
+{
+  "run_id": "string",
+  "manifests": [
+    {
+      "manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "version": 1,
+      "seq": 1,
+      "artifact_id": "string",
+      "bindings_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "created_at": "string",
+      "valid": false,
+      "invalidations": [
+        {
+          "reason": "baseline_moved",
+          "actor": "string",
+          "at": "string"
+        }
+      ]
+    }
+  ]
+}
+```
+
+#### 401
+
+Missing or invalid operator bearer token.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 404
+
+The addressed run, thread or approval does not exist.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 422
+
+Validation error: a parameter or body field is outside its documented bounds.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 500
+
+Internal error (the body never contains traces or file paths).
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 503
+
+A dependency is temporarily unavailable; retry later.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+### `POST /api/v1/runs/{run_id}/candidate-manifests`
+
+Build Manifest.
+
+**Auth:** operator bearer token (`Authorization: Bearer <token>`).
+
+**Parameters**
+
+| Name | In | Required | Constraints |
+| --- | --- | --- | --- |
+| `run_id` | path | yes | string, minLength=1, maxLength=256 |
+| `Idempotency-Key` | header | yes | string, minLength=1, maxLength=256, pattern=`^[!-~]+$` |
+| `X-Correlation-ID` | header | yes | string, minLength=1, maxLength=256, pattern=`^[!-~]+$` |
+
+**Request body** (`application/json`, required)
+
+| Field | Required | Constraints |
+| --- | --- | --- |
+| `sources` | no | object or null |
+
+Example:
+
+```json
+{
+  "sources": {}
+}
+```
+
+**Responses**
+
+#### 200
+
+Success (or idempotent replay of an earlier command).
+
+```json
+{
+  "run_id": "string",
+  "manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "artifact_id": "string",
+  "seq": 1,
+  "invalidated": [
+    "baseline_moved"
+  ],
+  "replayed": false
+}
+```
+
+#### 400
+
+Bad request: malformed header, body or idempotency key.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 401
+
+Missing or invalid operator bearer token.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 404
+
+The addressed run, thread or approval does not exist.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 409
+
+Conflict: stale state version, or the idempotency key was reused with a different request.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 413
+
+Request body too large.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 415
+
+Content-Type must be application/json.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 422
+
+Validation error: a parameter or body field is outside its documented bounds.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 500
+
+Internal error (the body never contains traces or file paths).
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 503
+
+A dependency is temporarily unavailable; retry later.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+### `GET /api/v1/runs/{run_id}/candidate-manifests/{manifest_sha256}`
+
+Show Manifest.
+
+**Auth:** operator bearer token (`Authorization: Bearer <token>`).
+
+**Parameters**
+
+| Name | In | Required | Constraints |
+| --- | --- | --- | --- |
+| `manifest_sha256` | path | yes | string, pattern=`^[0-9a-f]{64}$` |
+| `run_id` | path | yes | string, minLength=1, maxLength=256 |
+
+**Responses**
+
+#### 200
+
+Success (or idempotent replay of an earlier command).
+
+```json
+{
+  "run_id": "string",
+  "manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "version": 1,
+  "seq": 1,
+  "created_at": "string",
+  "valid": false,
+  "manifest": {},
+  "invalidations": [
+    {
+      "reason": "baseline_moved",
+      "actor": "string",
+      "at": "string"
+    }
+  ],
+  "diffs": [
+    {
+      "repo_id": "string",
+      "diff": "string",
+      "truncated": false
+    }
+  ]
+}
+```
+
+#### 401
+
+Missing or invalid operator bearer token.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 404
+
+The addressed run, thread or approval does not exist.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 422
+
+Validation error: a parameter or body field is outside its documented bounds.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 500
+
+Internal error (the body never contains traces or file paths).
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 503
+
+A dependency is temporarily unavailable; retry later.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+### `POST /api/v1/runs/{run_id}/candidate-manifests/{manifest_sha256}/approval`
+
+Request Manifest Approval.
+
+**Auth:** operator bearer token (`Authorization: Bearer <token>`).
+
+**Parameters**
+
+| Name | In | Required | Constraints |
+| --- | --- | --- | --- |
+| `manifest_sha256` | path | yes | string, pattern=`^[0-9a-f]{64}$` |
+| `run_id` | path | yes | string, minLength=1, maxLength=256 |
+| `Idempotency-Key` | header | yes | string, minLength=1, maxLength=256, pattern=`^[!-~]+$` |
+| `X-Correlation-ID` | header | yes | string, minLength=1, maxLength=256, pattern=`^[!-~]+$` |
+
+**Request body** (`application/json`, required)
+
+| Field | Required | Constraints |
+| --- | --- | --- |
+| `environment` | yes | ["STAGING"] |
+| `policy_version` | no | string, pattern=`^[A-Za-z0-9._-]{1,64}$`, default="1" |
+| `ttl_seconds` | no | integer, min=1, max=3600, default=3600 |
+
+Example:
+
+```json
+{
+  "environment": "STAGING",
+  "policy_version": "1",
+  "ttl_seconds": 3600
+}
+```
+
+**Responses**
+
+#### 200
+
+Success (or idempotent replay of an earlier command).
+
+```json
+{
+  "approval_id": "string",
+  "run_id": "string",
+  "manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "operation": "deploy",
+  "target": "STAGING",
+  "state": "string",
+  "state_version": 1,
+  "expires_at": "string"
+}
+```
+
+#### 400
+
+Bad request: malformed header, body or idempotency key.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 401
+
+Missing or invalid operator bearer token.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 404
+
+The addressed run, thread or approval does not exist.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 409
+
+Conflict: stale state version, or the idempotency key was reused with a different request.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 413
+
+Request body too large.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 415
+
+Content-Type must be application/json.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 422
+
+Validation error: a parameter or body field is outside its documented bounds.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 500
+
+Internal error (the body never contains traces or file paths).
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 503
+
+A dependency is temporarily unavailable; retry later.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+### `POST /api/v1/runs/{run_id}/candidate-manifests/{manifest_sha256}/recheck`
+
+Recheck Manifest.
+
+**Auth:** operator bearer token (`Authorization: Bearer <token>`).
+
+**Parameters**
+
+| Name | In | Required | Constraints |
+| --- | --- | --- | --- |
+| `manifest_sha256` | path | yes | string, pattern=`^[0-9a-f]{64}$` |
+| `run_id` | path | yes | string, minLength=1, maxLength=256 |
+| `Idempotency-Key` | header | yes | string, minLength=1, maxLength=256, pattern=`^[!-~]+$` |
+| `X-Correlation-ID` | header | yes | string, minLength=1, maxLength=256, pattern=`^[!-~]+$` |
+
+**Responses**
+
+#### 200
+
+Success (or idempotent replay of an earlier command).
+
+```json
+{
+  "run_id": "string",
+  "manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "valid": true,
+  "invalidations": []
+}
+```
+
+#### 400
+
+Bad request: malformed header, body or idempotency key.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 401
+
+Missing or invalid operator bearer token.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 404
+
+The addressed run, thread or approval does not exist.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 409
+
+Conflict: stale state version, or the idempotency key was reused with a different request.
 
 ```json
 {

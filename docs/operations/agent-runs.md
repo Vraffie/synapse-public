@@ -85,7 +85,7 @@ task shows the approval subject kind `agent_run_multi` (repositories, access, pi
 #### Candidate manifest v2 (ADR 026 D8, migration 0019)
 
 After a multi-repository run, the daemon (`daemon/manifest_builder.py`, `ManifestBuilder.build(run_id,
-sources=None)`; the HTTP route and `agentctl` command are B's lane) builds one manifest binding every repository
+sources=None)`; operator routes and `agentctl` commands below) builds one manifest binding every repository
 of the run: read repositories with their pinned baseline, write repositories with the candidate commit, the
 source attempt, the diff hash and size, the changed-path count and the two passed validations. Steps, each a
 refusal with a fixed code: the pinned baselines are re-resolved, before collecting and again after publishing and before
@@ -108,6 +108,59 @@ re-run git: it refuses only on invalidations already recorded. An invalidated ma
 `manifest_sha256` alone) is refused at request, at decision (`manifest_invalidated`, also enforced by a trigger)
 and at execution (`verify_approval_for_execution` denies `manifest_invalidated`). Approvals bound to a manifest show
 the subject kind `candidate_manifest` (per-repository baseline and candidate commits, invalidation reasons).
+
+##### Manifest routes and `agentctl manifest-*`
+
+All routes are operator-Bearer, under `/api/v1/runs/{run_id}/candidate-manifests`, 503 when the daemon has no
+`repos`/`worktree_root` (reads of the manifest list still work) and 404 `Run not found` for an unknown run. POSTs need
+the usual `Idempotency-Key` and `X-Correlation-ID` headers. A refusal answers with the fixed ManifestBuilder code as
+the error `detail` (for example `baseline_moved`, `manifest_invalidated`, `candidate_invalid:diff_mismatch`,
+`no_changes`); agentctl prints it. Statuses: 404 `manifest_not_found` (also a manifest of another run); 409
+`baseline_moved`, `manifest_invalidated`, `candidate_invalid[:reason]`; 422 `not_multi_repo`, `no_changes`,
+`not_a_writer`, `no_source_attempt`, `manifest_invalid`; 503 `candidate_unverifiable`, `artifact_publish_failed`.
+
+| Route | agentctl | Body | 200 response |
+|---|---|---|---|
+| `POST .../candidate-manifests` | `manifest-build RUN [--source TASK=ATTEMPT]` | `{"sources"?: {task_id: attempt_no}}` (at most 6; task id 1-128 chars of `[A-Za-z0-9._:-]`, attempt 1 to 2^31-1; anything else is 422) | `{run_id, manifest_sha256, artifact_id, seq, invalidated[], replayed}` |
+| `GET .../candidate-manifests` | `manifest-list RUN` | none | `{run_id, manifests: [{manifest_sha256, version, seq, artifact_id, bindings_sha256, created_at, valid, invalidations: [{reason, actor, at}]}]}` |
+| `GET .../candidate-manifests/{sha}` | `manifest-show RUN SHA` | none | `{run_id, manifest_sha256, version, seq, created_at, valid, manifest (v2 object), invalidations[], diffs: [{repo_id, diff, truncated}]}` |
+| `POST .../candidate-manifests/{sha}/recheck` | `manifest-recheck RUN SHA` | none | `{run_id, manifest_sha256, valid: true, invalidations: []}` |
+| `POST .../candidate-manifests/{sha}/approval` | `manifest-approve RUN SHA --environment STAGING` | `{"environment", "policy_version"? = "1", "ttl_seconds"? = 3600 (max 3600)}` | `{approval_id, run_id, manifest_sha256, operation: "deploy", target, state, state_version, expires_at}` |
+
+`GET` reads never run git: `valid` only means no invalidation is recorded; `diffs` are cut at 64 KiB per
+repository (`truncated`). Build is idempotent (`replayed`). Recheck is the D9 step-2 check: a moved baseline records
+`baseline_moved` (every manifest of the run) and a candidate that no longer verifies records `candidate_invalid`;
+both answer 409 and leave the manifest permanently invalid. The approval route always rechecks first and only then
+asks the daemon requester (`daemon:workflow`) for a `deploy` approval whose target is the environment and whose
+candidate hash is the `manifest_sha256`; the operator token can neither request nor decide it alone (the owner
+decides with `approval-decide` and `X-Approver-Token`). The environment must be in ADR 022's `ALLOWED_ENVIRONMENTS`
+(`persistence/approval_environment.py`, currently `STAGING` only; `DEV` and anything else is 422 until the allowlist
+is extended in its own reviewed change). The route only puts the environment in the approval's `target`: the ADR 022
+environment binding (`approval_environment_binding`, checked by `verify_approval_for_environment`) is not wired here
+yet and belongs to the deploy slice. Idempotency: right before the approval is requested the service stores a
+receipt of the whole request (run, manifest, environment, `policy_version`, `ttl_seconds`) in `idempotency_keys`
+(principal `local-operator`, operation `manifest.approval`). The replay lookup, the recheck and the request run under
+one lock, so concurrent requests with one key get one approval and replays. Repeating a request with the same
+`Idempotency-Key` returns the earlier approval (`Idempotency-Replayed: true`) without a new recheck, but only while the
+manifest has no recorded invalidation (else 409 `manifest_invalidated`); the same key with another manifest,
+environment, `policy_version` or `ttl_seconds` is 409. Manifest approval keys are namespaced (`manifest:` + key, so
+at most 247 characters; a longer key is 422 before any git runs), so they can never reuse the approval id of a spawn
+gate (`gate:<task_id>`) or any other requester. The operation is fixed to
+`deploy`: this route cannot create an `agent.run` or any other approval. It audits `agent.manifest_built`,
+`agent.manifest_rechecked` and `agent.manifest_refused` (code only, no paths). Nothing here deploys anything; the deploy
+service is a later slice.
+
+Build, recheck and the approval's recheck run the blocking builder in a worker thread on its own SQLite connection
+(the daemon's connection stays on the event loop), one at a time (a lock held for the whole call). Before opening
+that connection the thread re-runs the startup check on the database file (user-owned, mode without group/other
+bits, one link, no symlink; `check_private_database`) and answers 503 if it fails. Each request has an overall
+deadline (120 s, including the wait for the lock); when it passes the route answers 503
+`candidate_unverifiable:deadline` (audited as `agent.manifest_refused` with code `deadline`) and the thread keeps
+running, holding the lock until git returns (git calls carry their own timeouts). A timed-out request is therefore
+not a no-op: the late builder can still index a manifest or record `baseline_moved` / `candidate_invalid`, exactly as
+an in-time one would. Whatever it did is audited when it finishes (`agent.manifest_built`, `agent.manifest_rechecked`
+or `agent.manifest_refused` with `"late": true`); a late recheck never requests an approval. Use `manifest-list` to see
+the outcome.
 
 Invalid values abort startup before any state is touched. Without `repos`/`worktree_root` (or with
 `enabled: false`, or no config) `POST /api/v1/agent-runs` returns **503** "Agent runs are not
