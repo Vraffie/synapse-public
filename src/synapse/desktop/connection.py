@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 from threading import Event, Lock
 from urllib.parse import quote, urlencode
@@ -13,11 +14,14 @@ from urllib.parse import quote, urlencode
 from PySide6.QtCore import QThread, Signal
 
 from synapse.cli.__main__ import DaemonHTTPError, _get, _request
-from synapse.desktop import approval_decision
+from synapse.desktop import approval_decision, multirepo_routes
 from synapse.desktop.agent_usage import MAX_ROWS, sanitize_usage
 from synapse.desktop.agent_view import UNAVAILABLE_STATUSES, clean, sanitize_detail
 from synapse.desktop.cursor_store import Cursor, CursorError, cursor_path, read_cursor, valid_event_id, write_cursor
 from synapse.desktop.mock_resume import ASSERTION, collect_evidence, fetch_all_tasks
+from synapse.desktop.multirepo_model import (
+    build_view, mark_stale, sanitize_manifest_detail, sanitize_manifest_list, sanitize_run_repos,
+)
 
 API_VERSION = "v1"  # the only API prefix this client speaks (/api/v1/...)
 MAX_BACKOFF = 15.0
@@ -28,6 +32,7 @@ FEED_MESSAGES = 50
 FEED_PAGES = 2  # message pages per thread per cycle, so a long backlog is caught up over several cycles
 APPROVAL_PAGES = 5  # pages (100 rows each) the Control Center walks, independent of the Developer tab's paging
 AGENT_RETRY_POLLS = 10  # after 'unavailable', re-probe the agent endpoint only every Nth poll
+MULTIREPO_RETRY_POLLS = 30  # a run (or daemon) without multi-repository reads is re-probed only every Nth poll
 
 
 def backoff_delay(interval: float, failures: int, cap: float = MAX_BACKOFF) -> float:
@@ -86,6 +91,7 @@ class Poller(QThread):
     agent_usage_error = Signal(str, object, str)  # run id, generation, 'unavailable' | 'failed'
     agent_detail = Signal(str, object, object)  # run id, generation, sanitized detail
     agent_detail_error = Signal(str, object, str)  # run id, generation, 'unavailable' | 'failed'
+    multirepo_view = Signal(str, object, object)  # run id, generation, multirepo_model.build_view() dict or None (hide)
     profiles_list = Signal(object)  # raw GET /api/v1/profiles answer for the run-start pickers; None: explicit 404/503 (unavailable)
     profiles_failed = Signal(str)  # the profiles could not be loaded (not 404/503): short fixed reason, pickers stay disabled
     runs_list = Signal(object)  # recent runs (GET /api/v1/runs) for the Control Center switcher
@@ -123,6 +129,9 @@ class Poller(QThread):
         self._approval_cursor = ""
         self._approval_page_generation = 0
         self._agent_skip = 0
+        self._multirepo_skip = None  # (run id, generation, polls left) after the daemon said 'not served'
+        self._multirepo_seen = None
+        self._multirepo_last = None  # (run id, generation, last good view, HH:MM of it, consecutive failures)
         self._cycle = 0
         self._feed_cursors = {}  # (run id, thread id) -> last message cursor already delivered
         self._feed_run = None
@@ -145,6 +154,7 @@ class Poller(QThread):
             self._thread_id = ""
             self._thread_generation += 1
             self._agent_skip = 0
+            self._multirepo_skip = None
             return self._run_generation
 
     def select_thread(self, thread_id: str):
@@ -356,6 +366,58 @@ class Poller(QThread):
         except Exception:
             self.agent_detail_error.emit(run_id, generation, 'failed')
 
+    def _fetch_optional(self, endpoint):
+        """A proposed ADR 026 read: None when this daemon does not serve it (old single-repository daemon)."""
+        try:
+            return self.fetch(self.state_dir, endpoint)
+        except DaemonHTTPError as exc:
+            if exc.status in multirepo_routes.NOT_SUPPORTED_STATUSES:
+                return None
+            raise
+
+    def _poll_multirepo(self, run_id, generation):
+        """Per-repository rows and the newest candidate manifest; read only, refreshed every FEED_EVERY polls."""
+        with self._run_lock:
+            skip = self._multirepo_skip
+            if skip is not None and skip[:2] == (run_id, generation) and skip[2] > 0:
+                self._multirepo_skip = (run_id, generation, skip[2] - 1)
+                return
+        if self._multirepo_seen == (run_id, generation) and self._cycle % FEED_EVERY:
+            return
+        self._multirepo_seen = (run_id, generation)
+        try:
+            errors = []
+            raw_repos = self._fetch_optional(multirepo_routes.run_repos(run_id))
+            run_repos = None if raw_repos is None else sanitize_run_repos(raw_repos, run_id)
+            if raw_repos is not None and run_repos is None:
+                errors.append("the run's repository list was not understood")
+            raw_list = self._fetch_optional(multirepo_routes.run_manifests(run_id))
+            manifests = None if raw_list is None else sanitize_manifest_list(raw_list)
+            if raw_list is not None and manifests is None:
+                errors.append("the manifest list was not understood")
+            detail, newest = None, None
+            if manifests:
+                newest = manifests[-1]["manifest_sha256"]
+                raw_detail = self._fetch_optional(multirepo_routes.run_manifest(run_id, newest))
+                detail = None if raw_detail is None else sanitize_manifest_detail(raw_detail, run_id)
+                if raw_detail is not None and detail is None:
+                    errors.append("the manifest detail was not understood")
+            if raw_repos is None and raw_list is None:
+                with self._run_lock:
+                    self._multirepo_skip = (run_id, generation, MULTIREPO_RETRY_POLLS)
+                self._multirepo_last = None
+                self.multirepo_view.emit(run_id, generation, None)
+                return
+            view = build_view(run_repos, manifests, detail, newest, errors)
+            self._multirepo_last = (run_id, generation, view, time.strftime("%H:%M"), 0)
+            self.multirepo_view.emit(run_id, generation, view)
+        except Exception:  # transient failure: keep the last view but say it is stale; never show exception text
+            last = self._multirepo_last
+            if last is not None and last[:2] == (run_id, generation):
+                failures = last[4] + 1
+                self._multirepo_last = last[:4] + (failures,)
+                self.multirepo_view.emit(run_id, generation, mark_stale(last[2], last[3], failures))
+
     def _poll_profiles(self):
         """Fetch the accounts for the run-start pickers. Called right after connecting and retried every loop until it
         succeeds (or the daemon says 404/503), then refreshed every FEED_EVERY cycles."""
@@ -558,6 +620,7 @@ class Poller(QThread):
                     self.run_error.emit(run_id, generation)
                 else:
                     self._poll_agent_detail(run_id, generation)
+                    self._poll_multirepo(run_id, generation)
             run_id, generation, thread_id, thread_generation, thread_cursor, thread_page, message_cursor, message_page = self._selection()
             self._cycle += 1
             if not run_id:
