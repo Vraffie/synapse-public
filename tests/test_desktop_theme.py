@@ -4,6 +4,7 @@ import os
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+pytest.importorskip("PySide6")  # the sqlite-schema CI job has no Qt
 from PySide6.QtWidgets import QApplication
 
 from synapse.desktop import icons, theme
