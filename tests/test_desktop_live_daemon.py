@@ -294,7 +294,11 @@ def test_gated_run_lifecycle_approve_through_control_center(live):
     approval = live.api_approval(run)
     assert approval["state"] == "requested"
     live.spin(lambda: cc.gate.state == "pending" and cc.approve_button.isEnabled(), "gate card to show the pending approval")
-    assert live.node_states() == live.api_tasks(run)
+    # The gate (approvals poll) and the topology (run snapshot poll) are separate reads in one poller cycle: the snapshot
+    # can predate the park by one cycle, so wait for the topology to catch up instead of sampling it once.
+    truth = live.api_tasks(run)
+    assert truth == {"plan": "completed", "build-a": "completed", "build-b": "completed", "review": "awaiting_approval"}
+    live.spin(lambda: live.node_states() == truth, "topology to show the parked review")
     assert "approval is needed" in cc.gate_title.text()
     assert approval["operation"] in cc.gate_body.text() and approval["target"] in cc.gate_body.text()
     assert cc.reject_button.isEnabled() and "Waiting for you" in cc.gate_status.text()

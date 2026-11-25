@@ -10,6 +10,11 @@ import httpx
 from synapse.infrastructure.daemon_database import daemon_database
 
 ROOT = Path(__file__).resolve().parents[1]
+# Generous bounds: these are deadlines on polled conditions, not sleeps, so a fast machine is not slowed down. Under
+# heavy CPU load a cold daemon start (imports, migrations, audit check) was measured at over 10 s, past the old 8 s.
+STARTUP_SECONDS = 60
+SHUTDOWN_SECONDS = 30
+REQUEST_SECONDS = 30  # httpx's 5 s default read timeout is also reachable under load
 
 
 def test_run_queries_over_real_daemon(tmp_path):
@@ -32,7 +37,7 @@ def test_run_queries_over_real_daemon(tmp_path):
     proc = subprocess.Popen([sys.executable, '-m', 'synapse.daemon', '--state-dir', str(tmp_path),
                              '--migrations', str(ROOT / 'migrations')], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
-        deadline = time.monotonic() + 8
+        deadline = time.monotonic() + STARTUP_SECONDS
         while not (tmp_path / 'agentd.sock').exists():
             if proc.poll() is not None:
                 raise AssertionError(proc.stderr.read().decode())
@@ -42,7 +47,8 @@ def test_run_queries_over_real_daemon(tmp_path):
         token = (tmp_path / 'operator.token').read_text()
         while True:
             try:
-                with httpx.Client(transport=httpx.HTTPTransport(uds=str(tmp_path / 'agentd.sock')), base_url='http://localhost') as probe:
+                with httpx.Client(transport=httpx.HTTPTransport(uds=str(tmp_path / 'agentd.sock')), base_url='http://localhost',
+                                  timeout=REQUEST_SECONDS) as probe:
                     if probe.get('/api/v1/system/health', headers={'Authorization': 'Bearer ' + token}).status_code == 200:
                         break
             except httpx.ConnectError:
@@ -51,7 +57,8 @@ def test_run_queries_over_real_daemon(tmp_path):
                 raise AssertionError('daemon did not become ready')
             time.sleep(0.02)
         headers = {'Authorization': 'Bearer ' + token}
-        with httpx.Client(transport=httpx.HTTPTransport(uds=str(tmp_path / 'agentd.sock')), base_url='http://localhost') as client:
+        with httpx.Client(transport=httpx.HTTPTransport(uds=str(tmp_path / 'agentd.sock')), base_url='http://localhost',
+                          timeout=REQUEST_SECONDS) as client:
             assert client.get('/api/v1/runs/run').status_code == 401
             assert client.get('/api/v1/runs/run/tasks').status_code == 401
             snapshot = client.get('/api/v1/runs/run', headers=headers)
@@ -87,7 +94,7 @@ def test_run_queries_over_real_daemon(tmp_path):
     finally:
         if proc.poll() is None:
             proc.send_signal(signal.SIGTERM)
-        proc.communicate(timeout=8)
+        proc.communicate(timeout=SHUTDOWN_SECONDS)
     assert proc.returncode == 0
 
 
@@ -100,7 +107,7 @@ def test_run_analytics_over_real_daemon(tmp_path):
     proc = subprocess.Popen([sys.executable, '-m', 'synapse.daemon', '--state-dir', str(tmp_path),
                              '--migrations', str(ROOT / 'migrations')], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
-        deadline = time.monotonic() + 8
+        deadline = time.monotonic() + STARTUP_SECONDS
         while not (tmp_path / 'agentd.sock').exists():
             if proc.poll() is not None:
                 raise AssertionError(proc.stderr.read().decode())
@@ -108,7 +115,8 @@ def test_run_analytics_over_real_daemon(tmp_path):
                 raise AssertionError('daemon did not start')
             time.sleep(0.02)
         headers = {'Authorization': 'Bearer ' + (tmp_path / 'operator.token').read_text()}
-        with httpx.Client(transport=httpx.HTTPTransport(uds=str(tmp_path / 'agentd.sock')), base_url='http://localhost') as client:
+        with httpx.Client(transport=httpx.HTTPTransport(uds=str(tmp_path / 'agentd.sock')), base_url='http://localhost',
+                          timeout=REQUEST_SECONDS) as client:
             while True:
                 try:
                     if client.get('/api/v1/system/health', headers=headers).status_code == 200:
@@ -136,5 +144,5 @@ def test_run_analytics_over_real_daemon(tmp_path):
     finally:
         if proc.poll() is None:
             proc.send_signal(signal.SIGTERM)
-        proc.communicate(timeout=8)
+        proc.communicate(timeout=SHUTDOWN_SECONDS)
     assert proc.returncode == 0
