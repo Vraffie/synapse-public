@@ -389,6 +389,15 @@ reviewed yet.
   later task could not be removed (that request answers 409 but the earlier removals stay audited).
   Unknown or non-agent runs give 404.
 
+### Pruning old worktrees
+
+`agentctl agent-worktree-prune [--older-than 7d] [--dry-run]` removes the worktrees of finished (`succeeded`,
+`failed`, `cancelled`) agent runs whose last change is older than the given age (`12h`, `7d`; default `7d`, at
+least 1 hour). It runs in `agentctl` only: it lists the runs and calls `agent-worktree-remove` for each one, **never
+with `force`**, so a tree with uncommitted changes is kept and reported (`kept RUN: ...`), and every removal is
+audited as `agent.worktree_removed`. Nothing in the daemon deletes worktrees on its own; run it when you want to.
+`--dry-run` lists what would be removed. A run in `recovering` is never touched.
+
 ## Removing a finished run's worktree
 
 ## Verification and caveats
