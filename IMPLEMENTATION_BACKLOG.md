@@ -58,7 +58,7 @@ Step 4 result (2026-11-25): PR #57. Daemon-restart recovery of the desktop was a
 
 Step 5 result (2026-11-25): the per-profile concurrency limit already exists (see M4-B). What blocks parallel work is the global one-active-run limit: a second `agent-start` got `409 Another run is active`. By owner decision no code was written; a multi-task run with three independent tasks started two together and the third when one finished (engine cap 2). Concurrent separate runs stay open under M4-B.
 
-Step 6 result (2026-11-25): `docs/operations/daily-use.md`, covering only what was run live; its last section lists what was not (the sandboxed `synapse_up.py up` start, the approval-gated path, process groups that escape, Codex).
+Step 6 result (2026-11-25): `docs/operations/daily-use.md`, covering only what was run live. Later the same day the sandboxed `synapse_up.py up` start, the approval-gated path and an escaping child process (killed on cancel with the sandbox on, surviving with it off) were each run live and added to it. Still open: the documented Claude version range and fixtures (the real-binary test run against 2.1.332 was not done), Codex, concurrent separate runs.
 
 Known open item found while preparing this track: `tests/test_desktop_live_daemon.py::test_cancelled_run_is_shown_as_stopped` errored in a full-suite run on the PR #44 branch. The cause is not yet known and it is not yet checked against `main`.
 
