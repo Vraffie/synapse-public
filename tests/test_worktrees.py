@@ -232,7 +232,7 @@ def test_info_attributes_refused(mgr, repo, tmp_path):
 
 @pytest.mark.parametrize("key,value", [
     ("alias.x", "!touch pwned"), ("core.fsmonitor", "touch pwned"), ("core.hooksPath", "/tmp"),
-    ("extensions.worktreeConfig", "true"), ("include.path", "/tmp/x"), ("diff.x.textconv", "cat"),
+    ("extensions.worktreeConfig", "true"), ("include.path", "/nonexistent-synapse-test/x"), ("diff.x.textconv", "cat"),
     ("diff.external", "cat"), ("core.sshCommand", "cat"), ("filter.y.process", "cat")])
 def test_dangerous_config_refused_before_every_tree_git_call(mgr, repo, tmp_path, key, value):
     _dirty(mgr, repo, tmp_path)
