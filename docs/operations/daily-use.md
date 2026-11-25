@@ -9,6 +9,13 @@ Details live in [agent-runs](agent-runs.md), [agentctl](agentctl.md), [install](
 
 - Start: `python scripts/synapse_up.py up /abs/path/to/repo` (state dir `~/.local/state/synapse`, sandbox on, daemon
   plus desktop; add `--no-desktop` for no console). Stop: `python scripts/synapse_up.py down`.
+- Default Claude account: if `~/.config/synapse/default-account` (or `SYNAPSE_DEFAULT_ACCOUNT`) holds one line
+  `ID /absolute/path/to/claude-config-dir` (for example `claude-work /home/me/.claude`, the directory you would give
+  `CLAUDE_CONFIG_DIR`; mode 0700), `up` declares that account as profile `ID` (up to 2 tasks at once, your `--tools`,
+  `acceptEdits`), starts the daemon with it and writes `<state>/default-profile`. `agentctl agent-start` then names
+  that profile when you give no `--profile`, and the desktop preselects it (you can still pick another). The daemon is
+  unchanged: its built-in `default` profile is still what a request naming no profile means, and the profile file only
+  holds a path, never a credential. Remove the file and rerun `up` to go back; `up` then deletes `default-profile`.
 - Check: `agentctl --state-dir ~/.local/state/synapse health` prints `{"status": "ok"}`.
 - Keep the state directory path short (about 100 characters or fewer): the daemon's Unix socket `agentd.sock`
   lives in it, and a longer path fails with `AF_UNIX path too long`, visible only in the daemon log.

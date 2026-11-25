@@ -11,6 +11,11 @@ see docs/operations/workspace.md) and how to register them. `up --workspace FOLD
 the chosen ones (NAME as shown in that table); unusable repositories and anything outside FOLDER are refused.
 `--dry-run` prints which paths would be added and writes nothing.
 
+If ~/.config/synapse/default-account (or $SYNAPSE_DEFAULT_ACCOUNT) holds one line `ID /abs/path/to/claude-config-dir`,
+`up` declares that Claude account as profile ID (see docs/operations/agent-profiles.md), starts the daemon with it and
+records ID as the default profile that agentctl and the desktop use when none is named. Also private, also not in
+this repository.
+
 What `up` does (idempotent; safe to run again for another repo):
   1. creates the private state dir (default ~/.local/state/synapse, mode 0700; SYNAPSE_STATE overrides);
   2. finds the Claude binary (SYNAPSE_CLAUDE_EXE or `claude` on PATH); if it lies under a directory the sandbox
@@ -27,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -44,6 +50,7 @@ except ImportError:  # run from a checkout without the package installed
 # Mirrors providers/claude_cli.py::_DENY_HOME_SUBDIRS for the ones an executable realistically lives under.
 PROTECTED_HOME_SUBDIRS = (".local/share", ".config", ".claude", ".codex", ".ssh", ".gnupg")
 DEFAULT_TOOLS = ("Read", "Glob", "Grep")
+_PROFILE_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
 MAX_REPOS = 32  # the daemon's limit for the `repos` allowlist (docs/operations/agent-runs.md)
 
 
@@ -240,6 +247,52 @@ def workspace(args) -> int:
     return 0
 
 
+def default_account_file() -> Path:
+    return Path(os.environ.get("SYNAPSE_DEFAULT_ACCOUNT") or Path.home() / ".config" / "synapse" / "default-account")
+
+
+def default_account() -> tuple[str, Path] | None:
+    """(profile id, Claude config dir) from the operator's private file, or None when there is no such file."""
+    path = default_account_file()
+    try:
+        lines = [x.strip() for x in path.read_text(encoding="utf-8").splitlines()]
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise UpError("cannot read %s" % _show(str(path))) from None
+    lines = [x for x in lines if x and not x.startswith("#")]
+    parts = lines[0].split(None, 1) if len(lines) == 1 else []
+    if len(parts) != 2 or not _PROFILE_ID.fullmatch(parts[0]) or parts[0] == "default" or parts[0].startswith("synapse.builtin."):
+        raise UpError("%s must hold one line: ID /absolute/path/to/claude-config-dir" % _show(str(path)))
+    config_dir = Path(parts[1])
+    if not config_dir.is_absolute() or not config_dir.is_dir() or config_dir.is_symlink():
+        raise UpError("the Claude config dir of account %s must be an existing absolute directory (not a symlink)" % parts[0])
+    if config_dir.stat().st_mode & 0o077:
+        raise UpError("%s must be mode 0700 (the daemon refuses anything wider)" % _show(str(config_dir)))
+    return parts[0], config_dir
+
+
+def write_private(path: Path, text: str) -> None:
+    """Write a 0600 file next to its final name and rename it over, never following a planted link."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.replace(tmp, path)
+
+
+def write_account_profile(state: Path, account: tuple[str, Path], tools: tuple[str, ...]) -> Path:
+    """<state>/agent-profiles.json declaring the account as a claude profile, and <state>/default-profile naming it."""
+    profile_id, config_dir = account
+    profiles = state / "agent-profiles.json"
+    write_private(profiles, json.dumps({"profiles": [{
+        "id": profile_id, "provider": "claude", "allowed_tools": list(tools), "permission_mode": "acceptEdits",
+        "max_concurrency": 2, "enabled": True, "claude_config_dir": str(config_dir)}]}, indent=1) + "\n")
+    write_private(state / "default-profile", profile_id + "\n")
+    return profiles
+
+
 def chosen_repos(args) -> list[Path]:
     """Validate the requested repos before anything is created or written."""
     if args.workspace is None:
@@ -262,12 +315,15 @@ def chosen_repos(args) -> list[Path]:
 def up(args) -> int:
     home, state = Path.home(), state_dir()
     new = chosen_repos(args)
+    account = default_account()
     cfg_path = state / "agent.json"
     _, added = merge_repos(read_config(cfg_path).get("repos", []), new)
     if added:
         print("%s: will add to repos:\n%s" % (cfg_path, "\n".join("  " + _show(a) for a in added)))
     else:
         print("%s: already lists:\n%s" % (cfg_path, "\n".join("  " + _show(str(p)) for p in new)))
+    if account:
+        print("default account: profile %s runs as the Claude account in %s" % (account[0], _show(str(account[1]))))
     if args.dry_run:
         print("dry run: nothing written, nothing started")
         return 0
@@ -279,12 +335,17 @@ def up(args) -> int:
     exe = usable_executable(find_claude(), home)
     tools = tuple(t for t in args.tools.split(",") if t)
     write_config(cfg_path, exe, new, tools, worktrees)
+    extra: list[str] = []
+    if account:
+        extra = ["--agent-config", str(write_account_profile(state, account, tools))]
+    else:  # no account any more: a stale default would make clients name a profile the daemon does not have
+        (state / "default-profile").unlink(missing_ok=True)
     pidfile = state / "daemon.pid"
     if alive(pidfile) and healthy(state):
         print("daemon already running; agent.json updated (restart it with `down` then `up` to pick up a new repo)")
     else:
         spawn([*runner(), "synapse.daemon", "--state-dir", str(state), "--claude-cli-config", str(cfg_path),
-               "--allow-same-user-agents"], state / "daemon.log", pidfile)
+               "--allow-same-user-agents", *extra], state / "daemon.log", pidfile)
         for _ in range(100):
             if healthy(state):
                 break

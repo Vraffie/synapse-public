@@ -236,6 +236,8 @@ class AgentRunForm(QWidget):
         self.base_ref = QLineEdit("main")
         self.profile = QComboBox()
         self._profile_state = "loading"  # loading | unavailable | loaded
+        self._default_profile = None  # the operator's default account (default-profile file), preselected once
+        self._profile_chosen_by_user = False
         self._profile_rows = []
         self._profile_notice = ""
         self._set_profile_items()
@@ -305,9 +307,17 @@ class AgentRunForm(QWidget):
         layout.addWidget(self.problems)
         layout.addWidget(self.status)
 
+    def set_default_profile(self, profile_id: str | None):
+        """The operator's default account: preselected when the list loads and the operator has not chosen another."""
+        self._default_profile = profile_id if isinstance(profile_id, str) and _PROFILE.fullmatch(profile_id) else None
+        self._set_profile_items()
+        self._update_submit()
+
     def _set_profile_items(self):
         """Rebuild the picker: index 0 is the empty 'choose' entry; unusable profiles are listed but not selectable."""
         chosen = self.profile.currentData() if self.profile.count() else None
+        if chosen is None and not self._profile_chosen_by_user:
+            chosen = self._default_profile
         self.profile.blockSignals(True)
         self.profile.clear()
         rows = self._profile_rows
@@ -369,6 +379,7 @@ class AgentRunForm(QWidget):
             self.status.setText(self._profile_notice)
 
     def _connect_signals(self):
+        self.profile.activated.connect(lambda _index: setattr(self, "_profile_chosen_by_user", True))
         self.profile.currentIndexChanged.connect(self._update_submit)
         self.submit_button.clicked.connect(self.submit)
         self.require_approval.toggled.connect(self._approval_toggled)

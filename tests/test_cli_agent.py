@@ -428,3 +428,40 @@ def test_restart_refuses_a_changed_prompt_a_multi_task_run_and_an_active_run(mon
         seen = _restart_fake(monkeypatch, **kw)
         assert run("agent-restart", "old-1", "--prompt-file", str(f), "--allow-changed-prompt") == 1
         assert len(seen) == 1
+
+
+def test_agent_start_names_the_operators_default_profile_unless_another_is_given(monkeypatch, tmp_path, capsys):
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    (state / "default-profile").write_text("claude-work\n")
+    f = tmp_path / "p.txt"
+    f.write_text("do it")
+    sent = []
+    monkeypatch.setattr(cli, "_request", lambda state_dir, endpoint, **kw: sent.append(json.loads(kw["body"])) or {"run_id": "r1"})
+    base = ["--state-dir", str(state), "agent-start", "--repo", "/r", "--tool", "Read", "--prompt-file", str(f),
+            "--idempotency-key", "k", "--correlation-id", "c"]
+    assert cli.main(base) == 0
+    assert cli.main([*base, "--profile", "other"]) == 0
+    assert [b["profile"] for b in sent] == ["claude-work", "other"]
+    (state / "default-profile").unlink()
+    assert cli.main(base) == 0 and "profile" not in sent[2]
+
+
+@pytest.mark.parametrize("content", ["default\n", "synapse.builtin.agent.claude.v1\n", "bad id\n", "x" * 200 + "\n", ""])
+def test_default_profile_file_rejects_reserved_and_malformed_ids(tmp_path, content):
+    from synapse.default_profile import read_default_profile
+    (tmp_path / "default-profile").write_text(content)
+    assert read_default_profile(tmp_path) is None
+
+
+def test_default_profile_file_must_be_private_and_not_a_link(tmp_path):
+    from synapse.default_profile import read_default_profile
+    real = tmp_path / "real"
+    real.write_text("claude-work\n")
+    (tmp_path / "default-profile").symlink_to(real)
+    assert read_default_profile(tmp_path) is None
+    (tmp_path / "default-profile").unlink()
+    real.rename(tmp_path / "default-profile")
+    assert read_default_profile(tmp_path) == "claude-work"
+    (tmp_path / "default-profile").chmod(0o666)
+    assert read_default_profile(tmp_path) is None

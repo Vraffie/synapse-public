@@ -302,3 +302,11 @@ Fallback selection and `allow_fallback`; Codex as primary/fallback; a probe API 
 claim) and on its latest `attempt`. `spec.profile` is only what was requested; the two can differ for a task that named
 no profile (it runs under the built-in `agent` profile). Usage per profile is already recorded on
 `usage_observations.profile_id`; the `/usage` view is not changed here.
+
+## Operator default account (client side)
+
+`scripts/synapse_up.py up` can declare one account profile from a private one-line file and record its id in
+`<state dir>/default-profile` (see [daily use](daily-use.md)). The daemon never reads that file and its meaning of an
+unnamed profile (`default`) is unchanged; `agentctl agent-start` and the desktop picker use it only to *name* the profile
+when the operator did not (`src/synapse/default_profile.py`). The id must match the profile id pattern, may not be
+`default` or start with `synapse.builtin.`, and the file must be a regular file owned by you and not writable by others.
