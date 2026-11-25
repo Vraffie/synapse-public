@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 
 from synapse.desktop import narrative
 
+RUNS_SHOWN = 100  # newest runs in the Control Center switcher; older ones: agentctl runs --cursor, or paste the ID
+
 RUNNING_STATES = ("assigned", "running", "verifying")
 ACTIVE_STATES = RUNNING_STATES + ("ready", "awaiting_approval", "retry_wait", "changes_required")
 BAD_STATES = ("failed", "blocked", "cancelled")

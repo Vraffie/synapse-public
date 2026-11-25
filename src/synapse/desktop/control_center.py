@@ -332,6 +332,9 @@ class ControlCenter(QWidget):
                 self.run_combo.addItem(label, run_id)
                 self.run_combo.setItemData(self.run_combo.count() - 1, narrative.safe_tip(f"Run id: {run_id[:128]}"), Qt.ItemDataRole.ToolTipRole)
             index = self.run_combo.findData(self.run_id)
+            if len(runs) >= control_model.RUNS_SHOWN:  # a full page: older runs exist that this list cannot show
+                self.run_combo.addItem("Newest %d shown; older: agentctl runs --cursor" % control_model.RUNS_SHOWN)
+                self.run_combo.model().item(self.run_combo.count() - 1).setEnabled(False)
             self.run_combo.setCurrentIndex(index if index >= 0 else -1)
             if index < 0 and entries:
                 self.run_combo.setPlaceholderText("Pick a run")
