@@ -167,3 +167,18 @@ def test_gate_note_is_tied_to_the_approval(app):
     center.set_approvals([{'id': 'B', 'run_id': 'r2', 'state': 'requested'}])
     assert 'note about B' not in center.gate_status.text()
     dispose(center)
+
+
+def test_run_switcher_lists_a_full_page_and_says_older_runs_exist(app):
+    center = make()
+    runs = [{'id': 'run-%03d' % i, 'state': 'succeeded'} for i in range(control_model.RUNS_SHOWN)]
+    center.set_runs(runs)
+    combo = center.run_combo
+    assert combo.count() == control_model.RUNS_SHOWN + 2  # the run on screen (r1) is added, plus the note
+    note = combo.model().item(combo.count() - 1)
+    assert not note.isEnabled() and 'agentctl runs --cursor' in note.text()
+    assert combo.itemData(combo.count() - 1) is None  # never selectable as a run
+    center.set_runs(runs[:3])
+    assert combo.count() == 4 and all(combo.model().item(i).isEnabled() for i in range(combo.count()))
+    center.set_runs(runs[:control_model.RUNS_SHOWN - 1])  # one short of a full page: nothing is hidden, no note
+    assert all(combo.model().item(i).isEnabled() for i in range(combo.count()))

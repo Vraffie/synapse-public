@@ -8,7 +8,7 @@ The desktop opens on the **Control Center**, a plain-language, dark-themed overv
 
 ![Control Center with a parked approval, a failed step and running steps](img/control-center-overview.png)
 
-- Header with connection pill, a run switcher (from `GET /api/v1/runs`) and a prominent **Start run** button that opens the existing start forms.
+- Header with connection pill, a run switcher (the newest 100 runs from `GET /api/v1/runs?limit=100`, refreshed every third poll; when a full page comes back, a disabled last entry says older runs exist: list them with `agentctl runs --cursor` and paste the ID in the Runs view) and a prominent **Start run** button that opens the existing start forms.
 - Five tiles from real data: run status, agents working n/N, checks (or steps) done n/N, messages exchanged, approval gate. "Checks passed" is only shown when some steps are identifiable as review or verification steps; otherwise the tile says "Steps done".
 - **Execution topology**: one card per run task, layered by dependency, with status badge (IDLE, RUNNING, DONE, FAILED, WAITING), solid edges for dependencies and parallel fan-out, and purple dashed feedback edges only from a step in `changes_required` back to its prerequisites. Flow animation runs only while a step is running and the view is visible, and is off under reduced motion (`SYNAPSE_REDUCED_MOTION=1` or the `ui/reduced_motion` setting). Click a card to inspect it. With no runs it shows "No runs yet — start one".
 - Phase strip, agent roster with progress bars, and a detail pane for the selected step (uses `GET /api/v1/runs/{id}/agent` when available).
