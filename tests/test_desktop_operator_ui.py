@@ -162,7 +162,7 @@ def test_badge_autoselect_and_notification_for_new_request(tmp_path):
         spin(c.app, lambda: w.approvals_list.count() == 2)
         assert w.pending_count == 1
         assert w.tabs.tabText(w.tabs.indexOf(w.approvals_tab)) == 'Approvals (1)'
-        assert 'Pending approvals: 1' in w.console_status.pending.text()
+        assert w.console_status.pending_button.text() == 'Approvals: 1'
         assert w._selected_approval_id() == 'a1'  # newest *pending*, not the newest row
         assert w.approve_button.isEnabled()
         assert w.notifier.messages == []  # the backlog is not announced
@@ -228,20 +228,42 @@ def test_notification_uses_tray_when_available_and_limits_fields():
 
 # --- status bar ------------------------------------------------------------------------------------------
 
-def test_status_bar_shows_socket_health_api_and_connection(tmp_path):
+def test_status_bar_shows_live_signals_and_keeps_static_facts_in_diagnostics(tmp_path):
     c = Console(tmp_path, version='9.9.9')
     try:
         w = c.window
         s = w.console_status
-        assert s.socket.text() == f"Socket: {tmp_path / 'agentd.sock'}"
-        assert API_VERSION in s.api.text()
-        spin(c.app, lambda: s.connection.text() == 'Connection: connected')
-        assert s.health.text() == 'Health: ok'
-        assert s.api.text() == f'API: {API_VERSION} (daemon 9.9.9)'
-        w._connection_changed('reconnecting', 3, 4.0)
-        assert 'reconnecting (attempt 3, retry in 4s)' in s.connection.text()
+        spin(c.app, lambda: s.connection.text() == 'Connected')
+        assert s.health.text() == 'Health: OK'
+        assert s.retry.isHidden()
+        # socket path and versions are not permanent fields any more; they are in the tooltip and diagnostics
+        assert str(tmp_path / 'agentd.sock') in s.connection.toolTip()
+        assert f'API: {API_VERSION} (daemon 9.9.9)' in s.connection.toolTip()
+        assert str(tmp_path / 'agentd.sock') in s.diagnostics_text()
+        assert 'token' not in s.diagnostics_text().lower()
+        w._connection_changed('reconnecting', 1, 4.0)
+        assert s.connection.text() == 'Reconnecting (4s)…'
+        assert not s.retry.isHidden()
         assert s.health.text() == 'Health: unreachable'
-        assert 'token' not in s.socket.text().lower()
+        w._connection_changed('reconnecting', 5, 15.0)
+        assert s.connection.text() == 'Daemon offline'
+        w._connection_changed('connected', 0, 0.0)
+        assert s.retry.isHidden()
+    finally:
+        c.close()
+
+
+def test_status_bar_retry_and_approvals_are_clickable(tmp_path):
+    c = Console(tmp_path)
+    try:
+        w = c.window
+        from PySide6.QtTest import QSignalSpy
+        asked = QSignalSpy(w.console_status.retry_requested)
+        w.console_status.retry.click()
+        w.console_status.pending_button.click()
+        assert asked.count() == 1
+        assert w.tabs.currentWidget() is w.approvals_tab
+        assert w.console_status.pending_button.accessibleName() == 'Pending approvals'
     finally:
         c.close()
 
@@ -255,7 +277,7 @@ def test_status_bar_reports_outage(tmp_path):
     poller.max_backoff = 0.05
     window = MainWindow(tmp_path, poller=poller)
     try:
-        spin(app, lambda: 'reconnecting' in window.console_status.connection.text())
+        spin(app, lambda: window.console_status.connection.text() != 'Connecting…' and window.console_status.connection.text() != 'Connected')
         assert window.console_status.health.text() == 'Health: unreachable'
     finally:
         window.close()
