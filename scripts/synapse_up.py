@@ -395,10 +395,10 @@ def up(args) -> int:
     worktrees.mkdir(exist_ok=True, mode=0o700)
     exe = usable_executable(find_claude(), home)
     tools = tuple(t for t in args.tools.split(",") if t)
-    write_config(cfg_path, exe, new, tools, worktrees)
+    merged = write_config(cfg_path, exe, new, tools, worktrees)
     extra: list[str] = []
     if account:
-        extra = ["--agent-config", str(write_account_profile(state, account, tools))]
+        extra = ["--agent-config", str(write_account_profile(state, account, tuple(merged["allowed_tools"])))]
     else:  # no account any more: a stale default would make clients name a profile the daemon does not have
         (state / "default-profile").unlink(missing_ok=True)
     pidfile = state / "daemon.pid"
