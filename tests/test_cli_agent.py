@@ -322,3 +322,27 @@ def test_request_attaches_the_422_reason_from_a_real_response(tmp_path, monkeypa
         s.close()
     assert caught.value.status == 422 and caught.value.reason == "profile is disabled"
     assert "profile is disabled" in str(caught.value)
+
+
+def test_manifest_commands_send_the_documented_routes(calls):
+    sha = "ab" * 32
+    base = "/api/v1/runs/run-1/candidate-manifests"
+    assert run("manifest-build", "run-1", "--source", "t1=2", "--idempotency-key", "k", "--correlation-id", "c") == 0
+    endpoint, kw = calls[-1]
+    assert endpoint == base and json.loads(kw["body"]) == {"sources": {"t1": 2}} and kw["idempotency_key"] == "k"
+    assert run("manifest-build", "run-1") == 0 and json.loads(calls[-1][1]["body"]) == {}
+    assert run("manifest-list", "run-1") == 0 and calls[-1] == (base, {})
+    assert run("manifest-show", "run-1", sha) == 0 and calls[-1] == (base + "/" + sha, {})
+    assert run("manifest-recheck", "run-1", sha) == 0
+    assert calls[-1][0] == base + "/" + sha + "/recheck" and calls[-1][1]["body"] == b"" and calls[-1][1]["idempotency_key"]
+    assert run("manifest-approve", "run-1", sha, "--environment", "DEV") == 0
+    endpoint, kw = calls[-1]
+    assert endpoint == base + "/" + sha + "/approval"
+    assert json.loads(kw["body"]) == {"environment": "DEV", "policy_version": "1", "ttl_seconds": 3600}
+    for bad in (["manifest-show", "run-1", "XYZ"], ["manifest-approve", "run-1", sha, "--environment", "PROD"],
+                ["manifest-build", "run-1", "--source", "t1"], ["manifest-build", "run-1", "--source", "t1=0"],
+                ["manifest-build", "../x"]):
+        n = len(calls)
+        with pytest.raises(SystemExit):
+            run(*bad)
+        assert len(calls) == n

@@ -147,7 +147,8 @@ def _request(state_dir: Path, endpoint: str, *, body: bytes | None = None,
         else:
             method = "POST"
             expected = 201 if endpoint == "/api/v1/workflows" else 200 if endpoint.endswith("/decision") else 202
-            if endpoint.split("?", 1)[0].endswith(("/agent-abandon", "/agent-worktree-remove", "/agent-worktree-commit")):
+            if endpoint.split("?", 1)[0].endswith(("/agent-abandon", "/agent-worktree-remove", "/agent-worktree-commit")) \
+                    or "/candidate-manifests" in endpoint:
                 expected = 200
             if endpoint == "/api/v1/agent-runs":
                 expected = (200, 201)  # 201 new start, 200 idempotent replay
@@ -163,7 +164,7 @@ def _request(state_dir: Path, endpoint: str, *, body: bytes | None = None,
         if response.status not in (expected if isinstance(expected, tuple) else (expected,)):
             until = response.getheader("X-Approver-Locked-Until") if response.status == 403 else None
             raise DaemonHTTPError(response.status, until if until and re.fullmatch(r"[0-2][0-9]:[0-5][0-9]", until) else None,
-                                  _refusal_reason(response) if response.status == 422 else None)
+                                  _refusal_reason(response) if response.status in (409, 422) else None)
         data = response.read(_MAX_RESPONSE + 1)
         if len(data) > _MAX_RESPONSE:
             raise RuntimeError("daemon response exceeds size limit")
@@ -452,6 +453,75 @@ def _add_agent_parsers(commands) -> None:
     commit.add_argument("--correlation-id", type=_command_header)
 
 
+def _add_manifest_parsers(commands) -> None:
+    def common(p, key=True):
+        p.add_argument("run_id")
+        if key:
+            p.add_argument("--idempotency-key", type=_command_header)
+            p.add_argument("--correlation-id", type=_command_header)
+    build = commands.add_parser("manifest-build", help="build the candidate manifest v2 of a finished multi-repository run")
+    common(build)
+    build.add_argument("--source", action="append", default=[], metavar="TASK=ATTEMPT",
+                       help="use this attempt of a writer task (default: its latest completed attempt); repeatable")
+    commands.add_parser("manifest-list", help="list a run's candidate manifests with their invalidations").add_argument("run_id")
+    show = commands.add_parser("manifest-show", help="show one candidate manifest, its invalidations and diffs")
+    show.add_argument("run_id")
+    show.add_argument("manifest_sha256", type=_sha256_arg)
+    recheck = commands.add_parser("manifest-recheck", help="re-verify a manifest (records baseline_moved or candidate_invalid)")
+    common(recheck)
+    recheck.add_argument("manifest_sha256", type=_sha256_arg)
+    approve = commands.add_parser("manifest-approve", help="request a deploy approval bound to a live manifest (rechecked first); "
+                                  "the owner decides it with approval-decide")
+    common(approve)
+    approve.add_argument("manifest_sha256", type=_sha256_arg)
+    approve.add_argument("--environment", required=True, choices=("DEV", "STAGING"))
+    approve.add_argument("--policy-version", default="1")
+    approve.add_argument("--ttl-seconds", type=_integer(1, 3600), default=3600)
+
+
+def _sha256_arg(value: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise argparse.ArgumentTypeError("must be 64 lowercase hex characters")
+    return value
+
+
+def _manifest_command(args, parser) -> int:
+    import uuid
+    if not args.run_id.strip() or len(args.run_id) > 256 or "/" in args.run_id or args.run_id in (".", ".."):
+        parser.error("run ID must be a nonempty path segment up to 256 characters")
+    base = "/api/v1/runs/" + quote(args.run_id, safe="") + "/candidate-manifests"
+    def post(endpoint, body):
+        return _request(args.state_dir, endpoint, body=json.dumps(body).encode("utf-8"),
+                        idempotency_key=args.idempotency_key or str(uuid.uuid4()),
+                        correlation_id=args.correlation_id or str(uuid.uuid4()))
+    try:
+        if args.command == "manifest-build":
+            sources = {}
+            for item in args.source:
+                task, _, attempt = item.partition("=")
+                if not task or not attempt.isdecimal() or int(attempt) < 1 or task in sources:
+                    parser.error("--source must be TASK=ATTEMPT (attempt 1 or more), once per task")
+                sources[task] = int(attempt)
+            result = post(base, {"sources": sources} if sources else {})
+        elif args.command == "manifest-list":
+            result = _request(args.state_dir, base)
+        elif args.command == "manifest-show":
+            result = _request(args.state_dir, base + "/" + args.manifest_sha256)
+        elif args.command == "manifest-recheck":
+            result = _request(args.state_dir, base + "/" + args.manifest_sha256 + "/recheck", body=b"",
+                              idempotency_key=args.idempotency_key or str(uuid.uuid4()),
+                              correlation_id=args.correlation_id or str(uuid.uuid4()))
+        else:
+            result = post(base + "/" + args.manifest_sha256 + "/approval",
+                          {"environment": args.environment, "policy_version": args.policy_version,
+                           "ttl_seconds": args.ttl_seconds})
+    except (OSError, ValueError, RuntimeError, http.client.HTTPException) as exc:
+        print(f"agentctl: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
 def _agent_command(args, parser) -> int:
     import uuid
     if args.command != "agent-start" and (not args.run_id.strip() or len(args.run_id) > 256 or "/" in args.run_id
@@ -610,6 +680,7 @@ def main(argv: list[str] | None = None) -> int:
     approvals.add_argument("--limit", type=_integer(1, 1000), default=100)
     _add_runs_parser(commands)
     _add_agent_parsers(commands)
+    _add_manifest_parsers(commands)
     publish = commands.add_parser("publish-workflow", help="publish a workflow definition from JSON")
     publish.add_argument("file", type=Path, help="regular JSON workflow file")
     queue = commands.add_parser("queue-run", help="create a queued run")
@@ -661,6 +732,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command in ("agent-start", "agent-show", "agent-cancel", "agent-abandon", "agent-worktree-remove",
                         "agent-worktree-commit"):
         return _agent_command(args, parser)
+    if args.command.startswith("manifest-"):
+        return _manifest_command(args, parser)
     if args.command == "approver-unlock":
         return _approver_unlock(args.state_dir)
     if args.command == "approver-init":

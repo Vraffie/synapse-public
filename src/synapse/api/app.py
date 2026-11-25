@@ -24,6 +24,7 @@ from synapse.api.workflow_commands import PublishCommand, RunCommand, workflow_c
 from synapse.api.mock_commands import mock_command_router
 from synapse.api.agent_commands import (AbandonAgent, CancelAgent, CommitWorktree, ReadAgent, RemoveWorktree, StartAgent,
                                       agent_command_router)
+from synapse.api.manifest_commands import manifest_router
 from synapse.api.openapi_contracts import install_openapi_contracts
 
 EventReader = Callable[[int, int], list[dict[str, Any]]]
@@ -42,7 +43,10 @@ def create_app(*, token: str, read_events: EventReader, poll_seconds: float = 0.
                remove_agent_worktree: RemoveWorktree | None = None,
                commit_agent_worktree: CommitWorktree | None = None,
                list_profiles: ListProfiles | None = None, set_profile_cooldown: SetCooldown | None = None,
-               clear_profile_cooldown: ClearCooldown | None = None) -> FastAPI:
+               clear_profile_cooldown: ClearCooldown | None = None,
+               build_manifest: Callable | None = None, list_manifests: Callable | None = None,
+               show_manifest: Callable | None = None, recheck_manifest: Callable | None = None,
+               request_manifest_approval: Callable | None = None) -> FastAPI:
     """Create an operator-only app for serving on a protected Unix socket.
 
     The daemon must provide a reader that is safe to call on the ASGI event
@@ -108,6 +112,8 @@ def create_app(*, token: str, read_events: EventReader, poll_seconds: float = 0.
     app.include_router(agent_command_router(start_agent_run, read_agent_run, cancel_agent_run, abandon_agent_run,
                                             remove_agent_worktree, commit_agent_worktree))
     app.include_router(profile_router(list_profiles, set_profile_cooldown, clear_profile_cooldown))
+    app.include_router(manifest_router(build_manifest, list_manifests, show_manifest, recheck_manifest,
+                                       request_manifest_approval))
     app.include_router(approval_router(read_approvals))
     app.include_router(approval_decision_router(decide_approval, audit_denied_decision, preauthenticate_decision))
     app.include_router(message_query_router(read_threads, read_messages))
