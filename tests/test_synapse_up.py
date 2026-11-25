@@ -246,7 +246,7 @@ def test_default_account_declares_a_profile_starts_the_daemon_with_it_and_record
     monkeypatch.setattr(up, "spawn", lambda argv, log, pidfile: started.append(argv) or 1)
     assert up.main(["up", str(workspace_dir / "api"), "--no-desktop", "--tools", "Read,Edit"]) == 0
     profiles = json.loads((fake_env / "agent-profiles.json").read_text())["profiles"]
-    assert profiles == [{"id": "claude-work", "provider": "claude", "allowed_tools": ["Read", "Edit"],
+    assert profiles == [{"id": "claude-work", "provider": "claude", "allowed_tools": ["Edit", "Read"],
                          "permission_mode": "acceptEdits", "max_concurrency": 2, "enabled": True,
                          "claude_config_dir": str(work)}]
     assert (fake_env / "default-profile").read_text() == "claude-work\n"
@@ -328,3 +328,17 @@ def test_two_repositories_with_the_same_directory_name_are_refused(workspace_dir
     other = make_repo(tmp_path / "elsewhere" / "api")
     assert up.main(["up", str(workspace_dir / "api"), "--no-desktop"]) == 0
     assert up.main(["up", str(other), "--no-desktop"]) == 1
+
+
+def test_account_profile_carries_the_merged_operator_allowlist_not_just_this_runs_tools(workspace_dir, fake_env, tmp_path, monkeypatch):
+    work = tmp_path / "cw"
+    work.mkdir(mode=0o700)
+    account = tmp_path / "account"
+    account.write_text("claude-work %s\n" % work)
+    monkeypatch.setenv("SYNAPSE_DEFAULT_ACCOUNT", str(account))
+    monkeypatch.setattr(up, "alive", lambda pidfile: False)
+    monkeypatch.setattr(up, "spawn", lambda argv, log, pidfile: 1)
+    assert up.main(["up", str(workspace_dir / "api"), "--no-desktop", "--tools", "Read,Write"]) == 0
+    assert up.main(["up", str(workspace_dir / "api"), "--no-desktop", "--tools", "Read,Edit"]) == 0
+    tools = json.loads((fake_env / "agent-profiles.json").read_text())["profiles"][0]["allowed_tools"]
+    assert sorted(tools) == ["Edit", "Read", "Write"]
