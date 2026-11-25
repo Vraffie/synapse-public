@@ -135,8 +135,9 @@ def test_health_documents_only_reachable_error_statuses():
     assert set(paths["/api/v1/system/health"]["get"]["responses"]) == {"200", "401"}
     # The profile list takes no parameters or body, so it has no reachable 422 either.
     assert set(paths["/api/v1/profiles"]["get"]["responses"]) == {"200", "401", "500", "503"}
+    assert set(paths["/api/v1/repos"]["get"]["responses"]) == {"200", "401", "500", "503"}
     for route, operations in paths.items():
-        if route in ("/api/v1/system/health", "/api/v1/profiles"):
+        if route in ("/api/v1/system/health", "/api/v1/profiles", "/api/v1/repos"):
             continue
         for operation in operations.values():
             assert {"401", "422", "500"} <= set(operation["responses"]), route
