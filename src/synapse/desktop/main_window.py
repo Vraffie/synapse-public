@@ -65,9 +65,11 @@ class MainWindow(RunsMixin, MessagesMixin, ApprovalsMixin, EventsMixin, QMainWin
         self.shortcut_actions = {}
         self._build_menus()
         self.pending_changed.connect(self._show_pending)
+        self.console_status.approvals_requested.connect(self._open_approvals_tab)
         self.poller = poller or Poller(state_dir)
         self.poller.health.connect(self.health_label.setText)
         self.poller.health_info.connect(self.console_status.set_health)
+        self.console_status.retry_requested.connect(self.poller.request_refresh)
         self.poller.connection.connect(self._connection_changed)
         self.poller.cursor_notice.connect(self.cursor_notice.setText)
         self.poller.event.connect(self._add_event)
@@ -160,6 +162,9 @@ class MainWindow(RunsMixin, MessagesMixin, ApprovalsMixin, EventsMixin, QMainWin
         self.show_developer(self.events_tab)
         self.event_search.setFocus()
         self.event_search.selectAll()
+
+    def _open_approvals_tab(self):
+        self.show_developer(self.approvals_tab)
 
     def _show_pending(self, count):
         index = self.tabs.indexOf(self.approvals_tab)
