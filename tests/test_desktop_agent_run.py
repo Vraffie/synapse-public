@@ -870,3 +870,59 @@ def test_a_default_account_that_is_in_cooldown_or_unknown_is_not_preselected(con
         form.set_default_profile(bad)
         c.fill()
         assert form.profile.currentData() is None
+
+
+REPOS = {'repos': [
+    {'id': 'product-config', 'baseline_refs': ['refs/heads/develop'], 'default_baseline_ref': 'refs/heads/develop', 'protected_paths': 0},
+    {'id': 'portfolio', 'baseline_refs': ['refs/heads/develop'], 'default_baseline_ref': 'refs/heads/develop', 'protected_paths': 0},
+    {'id': 'bad id', 'baseline_refs': [], 'default_baseline_ref': None, 'protected_paths': 0},
+    'junk']}
+
+
+def tick(form, *ids):
+    for i in range(form.repos_list.count()):
+        item = form.repos_list.item(i)
+        item.setCheckState(agent_form.Qt.CheckState.Checked if item.data(agent_form.Qt.ItemDataRole.UserRole) in ids
+                           else agent_form.Qt.CheckState.Unchecked)
+
+
+def test_registered_repositories_list_is_hidden_until_the_daemon_lists_them(console):
+    c = console(profiles=PROFILES)
+    form = c.form
+    assert form.repos_list.isHidden()
+    form.set_repos(REPOS)
+    assert form.repos_list.count() == 2 and not form.repos_list.isHidden()  # unsafe ids and junk rows are dropped
+    assert form.repos_list.item(0).text() == 'product-config  (develop)'
+    form.set_repos(None)
+    assert form.repos_list.count() == 0 and form.repos_list.isHidden()
+
+
+def test_ticked_repositories_make_one_task_that_writes_all_and_ignore_the_path_fields(console):
+    c = console(profiles=PROFILES)
+    form = c.form
+    form.set_repos(REPOS)
+    c.fill()
+    form.repo.setCurrentText('')  # no path needed
+    pick(form, 'claude-work')
+    tick(form, 'product-config', 'portfolio')
+    assert not form.repo.isEnabled() and not form.base_ref.isEnabled() and form.submit_button.isEnabled()
+    submission = form.build_submission()
+    body = json.loads(submission.body)
+    assert 'repo' not in body and 'base_ref' not in body and 'prompt' not in body
+    assert body['repos'] == [{'repo_id': 'product-config'}, {'repo_id': 'portfolio'}] and body['profile'] == 'claude-work'
+    task, = body['tasks']
+    assert task['id'] == 'main' and task['repos'] == [{'repo_id': i, 'access': 'write'} for i in ('product-config', 'portfolio')]
+    assert 'Repositories (2' in agent_form.summary_text(submission.payload)
+    tick(form)
+    assert form.repo.isEnabled() and form.base_ref.isEnabled()
+
+
+def test_a_refresh_keeps_the_ticked_repositories_and_bad_ids_never_validate(console):
+    c = console(profiles=PROFILES)
+    form = c.form
+    form.set_repos(REPOS)
+    tick(form, 'portfolio')
+    form.set_repos(REPOS)
+    assert form.selected_repo_ids() == ['portfolio']
+    payload, problems = agent_form.validate({**form.fields(), 'repo_ids': ['a', 'a']})
+    assert payload is None and any('distinct ids' in p for p in problems)

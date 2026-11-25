@@ -42,6 +42,7 @@ def create_app(*, token: str, read_events: EventReader, poll_seconds: float = 0.
                cancel_agent_run: CancelAgent | None = None, abandon_agent_run: AbandonAgent | None = None,
                remove_agent_worktree: RemoveWorktree | None = None,
                commit_agent_worktree: CommitWorktree | None = None,
+               list_repos: Callable | None = None,
                list_profiles: ListProfiles | None = None, set_profile_cooldown: SetCooldown | None = None,
                clear_profile_cooldown: ClearCooldown | None = None,
                build_manifest: Callable | None = None, list_manifests: Callable | None = None,
@@ -110,7 +111,7 @@ def create_app(*, token: str, read_events: EventReader, poll_seconds: float = 0.
     app.include_router(workflow_command_router(publish_workflow, create_run))
     app.include_router(mock_command_router(start_mock, cancel_mock, resume_mock))
     app.include_router(agent_command_router(start_agent_run, read_agent_run, cancel_agent_run, abandon_agent_run,
-                                            remove_agent_worktree, commit_agent_worktree))
+                                            remove_agent_worktree, commit_agent_worktree, list_repos))
     app.include_router(profile_router(list_profiles, set_profile_cooldown, clear_profile_cooldown))
     app.include_router(manifest_router(build_manifest, list_manifests, show_manifest, recheck_manifest,
                                        request_manifest_approval))

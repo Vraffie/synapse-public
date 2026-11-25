@@ -16,6 +16,7 @@ Generated from the contracts in `src/synapse/api/openapi_contracts.py`; regenera
 - Runs: `GET /api/v1/profiles`
 - Runs: `DELETE /api/v1/profiles/{profile_id}/cooldown`
 - Runs: `POST /api/v1/profiles/{profile_id}/cooldown`
+- Runs: `GET /api/v1/repos`
 - Runs: `GET /api/v1/runs`
 - Runs: `POST /api/v1/runs`
 - Runs: `GET /api/v1/runs/{run_id}`
@@ -267,6 +268,75 @@ Content-Type must be application/json.
 #### 422
 
 Validation error: a parameter or body field is outside its documented bounds.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 500
+
+Internal error (the body never contains traces or file paths).
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+#### 503
+
+A dependency is temporarily unavailable; retry later.
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {},
+  "correlation_id": "string",
+  "detail": null
+}
+```
+
+### `GET /api/v1/repos`
+
+Get Repos.
+
+**Auth:** operator bearer token (`Authorization: Bearer <token>`).
+
+**Responses**
+
+#### 200
+
+Success (or idempotent replay of an earlier command).
+
+```json
+{
+  "repos": [
+    {
+      "id": "string",
+      "baseline_refs": [
+        "string"
+      ],
+      "default_baseline_ref": "string",
+      "protected_paths": 1
+    }
+  ]
+}
+```
+
+#### 401
+
+Missing or invalid operator bearer token.
 
 ```json
 {

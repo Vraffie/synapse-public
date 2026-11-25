@@ -528,6 +528,11 @@ class AgentRunService:
             "  SELECT 1 FROM task_attempts a WHERE a.task_id=t.id AND a.state NOT IN ('completed','failed','cancelled'))"
             ") WHERE p=?", (profile_id,)).fetchone()[0]
 
+    def list_repos(self) -> dict:
+        """Operator view of the registry's object entries (ADR 026 D1): ids and baselines, never filesystem paths."""
+        return {"repos": [{"id": e.id, "baseline_refs": list(e.baseline_refs), "default_baseline_ref": e.default_baseline_ref,
+                           "protected_paths": len(e.protected_paths)} for e in self.repo_registry.entries]}
+
     def list_profiles(self) -> dict:
         """Operator view of the registry: never credentials, executable paths or the base profile's settings."""
         if self.registry is None:

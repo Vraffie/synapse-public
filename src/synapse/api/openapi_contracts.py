@@ -149,6 +149,9 @@ RESPONSES = {
     ("/api/v1/runs/{run_id}/agent-abandon", "post"): (200, _object({"run_id": STRING, "state": {"type": "string", "const": "failed"}, "cancelled_tasks": INTEGER})),
     ("/api/v1/runs/{run_id}/agent-worktree-remove", "post"): (200, _object({"run_id": STRING, "removed": {"type": "boolean"}, "tasks": {"type": "array", "items": _object({"task_id": STRING, "removed": {"type": "boolean"}})}})),
     ("/api/v1/runs/{run_id}/agent-worktree-commit", "post"): (200, _object({"run_id": STRING, "tasks": {"type": "array", "items": _object({"task_id": STRING, "branch": STRING, "head": STRING, "paths": INTEGER})}})),
+    ("/api/v1/repos", "get"): (200, _object({"repos": {"type": "array", "items": _object({
+        "id": STRING, "baseline_refs": {"type": "array", "items": STRING}, "default_baseline_ref": _nullable(),
+        "protected_paths": INTEGER})}})),
     ("/api/v1/profiles", "get"): (200, _object({"profiles": {"type": "array", "items": _object({
         "id": STRING, "provider": STRING, "enabled": {"type": "boolean"}, "max_concurrency": INTEGER,
         "load": _nullable("integer"), "cooldown_remaining_seconds": {"type": "number"},
@@ -183,7 +186,7 @@ def install_openapi_contracts(app):
                     errors.update({404, 503})
                 if path == "/api/v1/approvals" or (path == "/api/v1/runs" and method == "get"):
                     errors.add(503)
-                if path == "/api/v1/profiles":
+                if path in ("/api/v1/profiles", "/api/v1/repos"):
                     errors = {401, 500, 503}  # no input to validate
                 elif path.startswith("/api/v1/profiles/"):  # not idempotency-keyed, no state conflicts (see profile_commands)
                     errors.add(503)
