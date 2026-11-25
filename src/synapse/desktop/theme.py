@@ -17,10 +17,10 @@ from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QGuiApplication, QPalette
 
 _DARK_TOKENS = {
-    "canvas": "#111214", "surface": "#17181b", "elevated": "#1e2025",
-    "border_subtle": "#24262c", "border_strong": "#343740",
-    "text_primary": "#e6e8ec", "text_secondary": "#9499a6", "text_muted": "#848996",
-    "accent_primary": "#e6e8ec", "on_primary": "#111214", "focus": "#5b8def", "selection": "#252a36",
+    "canvas": "#2a2c30", "surface": "#313338", "elevated": "#3a3d43",
+    "border_subtle": "#43464d", "border_strong": "#585c66",
+    "text_primary": "#eceef2", "text_secondary": "#c0c4cd", "text_muted": "#adb2bd",
+    "accent_primary": "#e6e8ec", "on_primary": "#1c1d20", "focus": "#6b9bf2", "selection": "#3b4252",
     "running": "#60a5fa", "running_tint": "#172538", "done": "#4ade80", "done_tint": "#142a1e",
     "waiting": "#fbbf24", "waiting_tint": "#2e2312", "failed": "#f87171", "failed_tint": "#2e1618",
 }
