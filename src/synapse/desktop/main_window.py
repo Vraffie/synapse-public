@@ -7,6 +7,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import QLabel, QMainWindow, QTabWidget, QVBoxLayout, QWidget
 
+from synapse.desktop.agent_form import summary_text
 from synapse.desktop.control_center import ControlCenter
 from synapse.desktop.approvals_view import APPROVALS_TAB_TITLE, ApprovalsMixin
 from synapse.desktop.connection import Poller
@@ -17,6 +18,7 @@ from synapse.default_profile import read_default_profile
 from synapse.desktop.runs_view import RunsMixin
 from synapse.desktop.shortcuts import SHORTCUTS, ShortcutsDialog
 from synapse.desktop.status_bar import ConsoleStatusBar
+from synapse.desktop.toast import ToastBar
 from synapse.desktop.workbench import SegmentedSwitcher
 
 
@@ -71,7 +73,11 @@ class MainWindow(RunsMixin, MessagesMixin, ApprovalsMixin, EventsMixin, QMainWin
         layout.addWidget(self.cursor_notice)
         for label in (self.health_label, self.connection_detail, self.cursor_notice):
             label.setVisible(False)  # the status bar and the offline alert now carry this; kept for tests and diagnostics
-        layout.addWidget(self.views)
+        layout.addWidget(self.views, 1)
+        self.toast = ToastBar()
+        layout.addWidget(self.toast)
+        self.toast.action_clicked.connect(self._cancel_countdown)
+        self._countdown_form = None
         root = QWidget()
         root.setLayout(layout)
         self.setCentralWidget(root)
@@ -107,7 +113,11 @@ class MainWindow(RunsMixin, MessagesMixin, ApprovalsMixin, EventsMixin, QMainWin
         poller.runs_list.connect(cc.set_runs)
         poller.run_feed.connect(self._feed_shown)
         cc.run_selected.connect(self._cc_pick_run)
-        cc.start_requested.connect(self.show_start_dialog)
+        cc.start_requested.connect(self._new_run)
+        cc.composer.start_countdown.connect(self._composer_countdown)
+        cc.composer.start_countdown_ended.connect(self._countdown_ended)
+        self.start_panel.agent_form.start_countdown.connect(self._dialog_countdown)
+        self.start_panel.agent_form.start_countdown_ended.connect(self._countdown_ended)
         cc.developer_requested.connect(lambda: self.show_developer())
         cc.approve_requested.connect(lambda: self.decide_from_control_center("approved"))
         cc.reject_requested.connect(lambda: self.decide_from_control_center("rejected"))
@@ -159,6 +169,11 @@ class MainWindow(RunsMixin, MessagesMixin, ApprovalsMixin, EventsMixin, QMainWin
         act_menu = menus.addMenu("&Approvals")
         act_menu.addAction(self.shortcut_actions["approve"])
         act_menu.addAction(self.shortcut_actions["reject"])
+        dev_menu = menus.addMenu("&Developer")
+        mock = QAction("Run Mock &Fixture…", self)
+        mock.triggered.connect(self.show_mock_fixture)
+        dev_menu.addAction(mock)
+        self.mock_fixture_action = mock
         help_menu = menus.addMenu("&Help")
         help_menu.addAction(self.shortcut_actions["shortcuts"])
 
@@ -177,6 +192,38 @@ class MainWindow(RunsMixin, MessagesMixin, ApprovalsMixin, EventsMixin, QMainWin
         self.show_developer(self.events_tab)
         self.event_search.setFocus()
         self.event_search.selectAll()
+
+    def _new_run(self):
+        """+ New Run: go to the launch bar (the prompt is the start of a run; Configure… holds the advanced options)."""
+        self.views.setCurrentWidget(self.control_center)
+        self.control_center.composer.prompt.setFocus()
+
+    def _composer_countdown(self, line: str):
+        self._countdown_form = self.control_center.composer
+        self.toast.show_text(line, self._countdown_detail(self._countdown_form))
+
+    def _dialog_countdown(self, line: str):
+        self._countdown_form = self.start_panel.agent_form
+        self.toast.show_text(line, self._countdown_detail(self._countdown_form))
+
+    @staticmethod
+    def _countdown_detail(form) -> str:
+        submission = form._countdown_submission
+        return summary_text(submission.payload) if submission is not None else ""
+
+    def _countdown_ended(self):
+        self.toast.clear()
+        self._countdown_form = None
+
+    def _cancel_countdown(self):
+        if self._countdown_form is not None:
+            self._countdown_form.cancel_start()
+
+    def show_mock_fixture(self):
+        """Developer -> Run Mock Fixture…: reveal the fixture controls and open the start dialog on the mock page."""
+        self.set_mock_ui(True)
+        self.start_panel.mode.setCurrentIndex(0)
+        self.show_start_dialog()
 
     def _switch_view(self, index: int):
         self.views.setCurrentWidget(self.control_center if index == 0 else self.tabs)

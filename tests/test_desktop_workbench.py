@@ -176,3 +176,27 @@ def test_both_themes_style_the_workbench(app, dark):
     for name in ("QFrame#toolbar", "QFrame#telemetry", "QFrame#pane", "QSplitter::handle", "QPushButton#segment:checked"):
         assert name in sheet
     assert p["canvas"] in sheet and p["border_subtle"] in sheet
+
+
+def test_launch_bar_toast_and_configure(app, tmp_path, monkeypatch):
+    from synapse.desktop import agent_form
+    win = window(app, tmp_path)
+    try:
+        composer = win.control_center.composer
+        assert composer.bar_widget.minimumHeight() >= 40 and composer.configure_button.text() == "Configure…"
+        assert not composer.hint.isVisible() and not composer.status.isVisible()  # captions take no room while empty
+        composer.set_profiles(None)
+        composer.repo.setCurrentText("/work/repo")
+        composer.prompt.setPlainText("do it")
+        monkeypatch.setattr(agent_form, "START_DELAY_MS", 5000)
+        composer.submit_button.click()
+        assert win.toast.isVisible() and "Run starts in 5 s" in win.toast.label.text()
+        win.toast.action.click()
+        assert not win.toast.isVisible() and not composer._counting
+        composer.configure()
+        assert composer.configure_dialog.isVisible() and composer.options.isVisible()
+        composer.configure_dialog.close()
+        win._new_run()
+        assert win.views.currentWidget() is win.control_center
+    finally:
+        win.close()

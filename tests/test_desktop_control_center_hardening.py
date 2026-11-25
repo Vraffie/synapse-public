@@ -109,7 +109,7 @@ def test_identical_snapshots_rebuild_topology_once(app):
 
 
 def test_composer_keeps_text_typed_while_pending(app, tmp_path, monkeypatch):
-    monkeypatch.setattr(agent_form, 'ask_confirm', lambda *a: True)
+    monkeypatch.setattr(agent_form, 'START_DELAY_MS', 0)
     box = prompt_composer.PromptComposer(QSettings(str(tmp_path / 'c.ini'), QSettings.Format.IniFormat))
     box.repo.setCurrentText('/work/repo')
     box.submit_requested.connect(lambda _s: None)

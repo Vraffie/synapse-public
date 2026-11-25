@@ -11,6 +11,7 @@ The older keys (bg, panel, cyan, ...) stay as aliases of the tokens so views not
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QGuiApplication, QPalette
@@ -93,6 +94,7 @@ def base_point_size() -> float:
     return max(size if size > 0 else 10.0, 9.0)
 
 
+@lru_cache(maxsize=1)
 def mono_family() -> str:
     """The operational monospace face: the first installed of MONO_FAMILIES, else the system fixed font."""
     try:
@@ -142,6 +144,7 @@ QLabel#h2 {{ font-size: {title:.1f}pt; font-weight: 600; }}
 QLabel#eyebrow {{ color: {p['text_secondary']}; font-size: {dense:.1f}pt; font-weight: 600; }}
 QLabel#muted, QLabel#caption {{ color: {p['text_secondary']}; }}
 QLabel#caption {{ font-size: {dense:.1f}pt; }}
+QLabel#caption[over="true"] {{ color: {p['failed']}; font-weight: 600; }}
 QLabel#mono, QPlainTextEdit#mono, QTextEdit#mono {{ font-family: "{mono}"; font-size: {dense:.1f}pt; }}
 QLabel#metricValue {{ font-size: {title:.1f}pt; font-weight: 600; }}
 QLabel#pill {{ border: 1px solid {p['border_strong']}; border-radius: 4px; padding: 1px 6px; color: {p['text_secondary']}; font-size: {dense:.1f}pt; }}
@@ -174,6 +177,7 @@ QFrame#toolbar, QFrame#telemetry, QFrame#launchBar, QFrame#drawer {{ background:
 QFrame#pane {{ background: {p['surface']}; border: none; border-radius: 0px; }}
 QFrame#pane QScrollArea, QFrame#pane QScrollArea > QWidget > QWidget, QFrame#drawer QScrollArea, QFrame#drawer QScrollArea > QWidget > QWidget {{ background: {p['surface']}; }}
 QFrame#paneHead {{ background: {p['surface']}; border: none; border-bottom: 1px solid {p['border_subtle']}; }}
+QFrame#toast {{ background: {p['running_tint']}; border: none; border-top: 1px solid {p['running']}; border-radius: 0px; }}
 QFrame#hairline {{ background: {p['border_subtle']}; border: none; }}
 QSplitter::handle {{ background: {p['border_subtle']}; }}
 QLabel#stateBadge {{ font-weight: 600; }}

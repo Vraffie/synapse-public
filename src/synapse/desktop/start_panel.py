@@ -7,6 +7,7 @@ owner computes; the owner maps each request to a poller command.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 from PySide6.QtCore import Signal
@@ -16,6 +17,11 @@ from PySide6.QtWidgets import QComboBox, QGroupBox, QHBoxLayout, QLabel, QPushBu
 from synapse.desktop.agent_form import AgentRunForm
 
 MOCK_FIXTURE = "mock-fixture"
+
+
+def dev_mode() -> bool:
+    """SYNAPSE_DEV=1 shows the mock-fixture controls from the start; otherwise Developer -> Run Mock Fixture… reveals them."""
+    return os.environ.get("SYNAPSE_DEV", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 @dataclass(frozen=True)
@@ -54,6 +60,13 @@ class StartRunPanel(QGroupBox):
         layout = QVBoxLayout(self)
         layout.addWidget(self.mode)
         layout.addWidget(self.stack)
+        self.set_mock_available(dev_mode())
+
+    def set_mock_available(self, available: bool):
+        """The mock fixture page is a developer tool: hidden (agent page only) unless enabled."""
+        self.mode.setVisible(available)
+        if not available:
+            self.mode.setCurrentIndex(1)
 
     def _form_row(self):
         """Extension point: a richer start form adds its input widgets here, before the button."""
