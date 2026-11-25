@@ -16,6 +16,9 @@ Details live in [agent-runs](agent-runs.md), [agentctl](agentctl.md), [install](
   that profile when you give no `--profile`, and the desktop preselects it (you can still pick another). The daemon is
   unchanged: its built-in `default` profile is still what a request naming no profile means, and the profile file only
   holds a path, never a credential. Remove the file and rerun `up` to go back; `up` then deletes `default-profile`.
+- With no REPO, `up` registers your default repositories: the absolute paths, one per line (`#` for comments), in
+  `~/.config/synapse/default-repos` (or the file named by `SYNAPSE_DEFAULT_REPOS`). The list is yours and is not part of
+  this repository; each path must be a git checkout, and nested repositories are refused as usual.
 - Check: `agentctl --state-dir ~/.local/state/synapse health` prints `{"status": "ok"}`.
 - Keep the state directory path short (about 100 characters or fewer): the daemon's Unix socket `agentd.sock`
   lives in it, and a longer path fails with `AF_UNIX path too long`, visible only in the daemon log.

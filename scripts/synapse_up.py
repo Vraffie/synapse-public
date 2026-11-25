@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """One-command local start for real, sandboxed agent runs on this machine.
 
-    python scripts/synapse_up.py up REPO [--tools Read,Glob,Grep,Edit] [--no-desktop] [--dry-run]
+    python scripts/synapse_up.py up [REPO] [--tools Read,Glob,Grep,Edit] [--no-desktop] [--dry-run]
     python scripts/synapse_up.py workspace FOLDER
     python scripts/synapse_up.py up --workspace FOLDER --repo NAME [--repo NAME ...] [--dry-run] [...]
     python scripts/synapse_up.py down
@@ -15,6 +15,9 @@ If ~/.config/synapse/default-account (or $SYNAPSE_DEFAULT_ACCOUNT) holds one lin
 `up` declares that Claude account as profile ID (see docs/operations/agent-profiles.md), starts the daemon with it and
 records ID as the default profile that agentctl and the desktop use when none is named. Also private, also not in
 this repository.
+`up` with no REPO and no --workspace registers your default repositories: the absolute paths, one per line ('#' starts a
+comment), in $SYNAPSE_DEFAULT_REPOS or ~/.config/synapse/default-repos. The list is yours and private; it is not
+part of this repository.
 
 What `up` does (idempotent; safe to run again for another repo):
   1. creates the private state dir (default ~/.local/state/synapse, mode 0700; SYNAPSE_STATE overrides);
@@ -293,8 +296,30 @@ def write_account_profile(state: Path, account: tuple[str, Path], tools: tuple[s
     return profiles
 
 
+def default_repos_file() -> Path:
+    return Path(os.environ.get("SYNAPSE_DEFAULT_REPOS") or Path.home() / ".config" / "synapse" / "default-repos")
+
+
+def default_repos() -> list[Path]:
+    """The operator's own default repositories (a private file outside this repository), each checked like a REPO argument."""
+    path = default_repos_file()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        raise UpError("give REPO or --workspace FOLDER --repo NAME, or list your default repositories (absolute paths, "
+                      "one per line) in %s" % _show(str(path))) from None
+    repos = [Path(line.strip()) for line in lines if line.strip() and not line.strip().startswith("#")]
+    if not repos:
+        raise UpError("%s lists no repositories" % _show(str(path)))
+    if any(not r.is_absolute() for r in repos):
+        raise UpError("%s must hold absolute paths" % _show(str(path)))
+    return [check_repo(r) for r in repos]
+
+
 def chosen_repos(args) -> list[Path]:
     """Validate the requested repos before anything is created or written."""
+    if args.workspace is None and not args.repo and not args.repo_names:
+        return default_repos()
     if args.workspace is None:
         if not args.repo or args.repo_names:
             raise UpError("give either REPO or --workspace FOLDER --repo NAME [--repo NAME ...]")
