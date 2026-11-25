@@ -137,18 +137,30 @@ decides with `approval-decide` and `X-Approver-Token`). The environment must be 
 (`persistence/approval_environment.py`, currently `STAGING` only; `DEV` and anything else is 422 until the allowlist
 is extended in its own reviewed change). The route only puts the environment in the approval's `target`: the ADR 022
 environment binding (`approval_environment_binding`, checked by `verify_approval_for_environment`) is not wired here
-yet and belongs to the deploy slice. Repeating a request with the same `Idempotency-Key` returns the earlier approval
-(`Idempotency-Replayed: true`) without a new recheck, but only while the manifest has no recorded invalidation (else
-409 `manifest_invalidated`); the same key with another environment, `policy_version` or `ttl_seconds` is 409. Manifest
-approval keys are namespaced (`manifest:` + key, so at most 247 characters), so they can never reuse the approval id of
-a spawn gate (`gate:<task_id>`) or any other requester. The operation is fixed to
+yet and belongs to the deploy slice. Idempotency: right before the approval is requested the service stores a
+receipt of the whole request (run, manifest, environment, `policy_version`, `ttl_seconds`) in `idempotency_keys`
+(principal `local-operator`, operation `manifest.approval`). The replay lookup, the recheck and the request run under
+one lock, so concurrent requests with one key get one approval and replays. Repeating a request with the same
+`Idempotency-Key` returns the earlier approval (`Idempotency-Replayed: true`) without a new recheck, but only while the
+manifest has no recorded invalidation (else 409 `manifest_invalidated`); the same key with another manifest,
+environment, `policy_version` or `ttl_seconds` is 409. Manifest approval keys are namespaced (`manifest:` + key, so
+at most 247 characters; a longer key is 422 before any git runs), so they can never reuse the approval id of a spawn
+gate (`gate:<task_id>`) or any other requester. The operation is fixed to
 `deploy`: this route cannot create an `agent.run` or any other approval. It audits `agent.manifest_built`,
 `agent.manifest_rechecked` and `agent.manifest_refused` (code only, no paths). Nothing here deploys anything; the deploy
-service is a later slice. Build, recheck and the approval's recheck run the blocking builder in a worker thread on its
-own SQLite connection (the daemon's connection stays on the event loop), one at a time (a lock held for the whole
-call). Each request has an overall deadline (120 s, including the wait for the lock); when it passes the route answers
-503 `candidate_unverifiable:deadline` and records no invalidation, while the thread keeps the lock until git returns (git calls
-carry their own timeouts).
+service is a later slice.
+
+Build, recheck and the approval's recheck run the blocking builder in a worker thread on its own SQLite connection
+(the daemon's connection stays on the event loop), one at a time (a lock held for the whole call). Before opening
+that connection the thread re-runs the startup check on the database file (user-owned, mode without group/other
+bits, one link, no symlink; `check_private_database`) and answers 503 if it fails. Each request has an overall
+deadline (120 s, including the wait for the lock); when it passes the route answers 503
+`candidate_unverifiable:deadline` (audited as `agent.manifest_refused` with code `deadline`) and the thread keeps
+running, holding the lock until git returns (git calls carry their own timeouts). A timed-out request is therefore
+not a no-op: the late builder can still index a manifest or record `baseline_moved` / `candidate_invalid`, exactly as
+an in-time one would. Whatever it did is audited when it finishes (`agent.manifest_built`, `agent.manifest_rechecked`
+or `agent.manifest_refused` with `"late": true`); a late recheck never requests an approval. Use `manifest-list` to see
+the outcome.
 
 Invalid values abort startup before any state is touched. Without `repos`/`worktree_root` (or with
 `enabled: false`, or no config) `POST /api/v1/agent-runs` returns **503** "Agent runs are not

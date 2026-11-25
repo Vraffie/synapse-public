@@ -17,7 +17,7 @@ from synapse.application import candidate_manifest_v2 as v2
 from synapse.application.approval_requests import DaemonApprovalRequester
 from synapse.application.approval_service import Actor, ApprovalAccessDenied, ApprovalService
 from synapse.daemon import manifest_builder as mb
-from synapse.daemon.manifest_builder import ManifestBuilder, ManifestRefused, request_manifest_approval
+from synapse.daemon.manifest_builder import ManifestBuilder, ManifestRefused
 from synapse.persistence import candidate_manifests as store
 from synapse.persistence.approval_binding import ApprovalNotGranted, DenialReason, verify_approval_for_execution
 from synapse.persistence.approval_query import read_approvals
@@ -25,6 +25,17 @@ from synapse.persistence.migrations import apply_migrations, open_database
 from synapse.persistence.state_store import StateConflict
 
 from test_multi_repo_runs import REPO_IDS, ROOT, World, git, head  # noqa: F401  (shared harness)
+
+
+def request_manifest_approval(builder, requester, *, manifest_sha256, operation, target, policy_version,
+                              idempotency_key, correlation_id, ttl=timedelta(hours=1)):
+    """What ManifestService.request_approval does, without HTTP or threads: recheck first, then request."""
+    manifest = builder.recheck(manifest_sha256)
+    return requester.request_approval(run_id=manifest.run_id, operation=operation, target=target,
+                                      candidate_sha256=manifest_sha256, policy_version=policy_version,
+                                      expires_at=(datetime.now(timezone.utc) + ttl).isoformat(),
+                                      idempotency_key=idempotency_key, correlation_id=correlation_id)
+
 
 A, B, C = "a" * 40, "b" * 40, "c" * 40
 

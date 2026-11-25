@@ -32,6 +32,7 @@ def headers(key="k1"):
 @pytest.fixture
 def w(tmp_path):
     world = World(tmp_path)
+    world.path.chmod(0o600)  # the service re-runs the daemon's private-file check before each builder connection
     result = world.start(world.request([world.task(prompt=PROMPT)]))
     world.run_id = result.response["run_id"]
     world.task_id = result.response["tasks"][0]["task_id"]
@@ -401,4 +402,108 @@ def test_request_deadline_is_503_and_the_lock_serialises(w, monkeypatch):
     results = asyncio.run(main())
     assert [(e.status, e.message) for e in results] == [(503, "candidate_unverifiable:deadline")] * 2
     assert overlap[0] is False
-    assert store.invalidations(w.db, sha) == []  # a deadline proves nothing: nothing is recorded
+    assert store.invalidations(w.db, sha) == []  # the late rechecks passed: nothing is recorded
+    payloads = [json.loads(r[1]) for r in w.db.execute(
+        "SELECT type,payload_json FROM events WHERE run_id=? AND type LIKE 'agent.manifest_re%' ORDER BY rowid",
+        (w.run_id,))]
+    assert [p.get("code") for p in payloads if p.get("code")] == ["deadline", "deadline"]
+    late = [p for p in payloads if p.get("late")]  # only the first request's thread ran; it passed, late
+    assert len(late) == 1 and late[0]["manifest_sha256"] == sha
+
+
+def slow_service(w, monkeypatch, target, seconds, then=None):
+    original = getattr(mb, target)
+
+    def slow(*a, **k):
+        time.sleep(seconds)
+        if then is not None:
+            raise then
+        return original(*a, **k)
+    monkeypatch.setattr(mb, target, slow)
+    return ManifestService(w.db, w.builder, DaemonApprovalRequester(w.db), deadline_seconds=0.2)
+
+
+def run_until_unlocked(service, coro):
+    async def main():
+        try:
+            return await coro
+        except AgentRunError as exc:
+            return exc
+        finally:
+            while service._lock.locked():
+                await asyncio.sleep(0.02)
+    return asyncio.run(main())
+
+
+def manifest_events(w):
+    return [(r[0], json.loads(r[1])) for r in w.db.execute(
+        "SELECT type,payload_json FROM events WHERE run_id=? AND type LIKE 'agent.manifest%' ORDER BY rowid", (w.run_id,))]
+
+
+def test_a_build_that_finishes_after_the_deadline_is_audited_as_built(w, monkeypatch):
+    service = slow_service(w, monkeypatch, "verify_manifest_candidates", 0.5)
+    out = run_until_unlocked(service, service.build(w.run_id, None))
+    assert (out.status, out.message) == (503, "candidate_unverifiable:deadline")
+    (record,) = store.run_manifests(w.db, w.run_id)  # the late builder still indexed it
+    events = manifest_events(w)
+    assert [(t, p.get("code"), p.get("late")) for t, p in events] == [
+        ("agent.manifest_refused", "deadline", None), ("agent.manifest_built", None, True)]
+    assert events[1][1]["manifest_sha256"] == record.manifest_sha256
+
+
+def test_a_slow_invalid_candidate_is_recorded_and_audited_late(w, monkeypatch):
+    sha = build(w).json()["manifest_sha256"]
+    service = slow_service(w, monkeypatch, "verify_manifest_candidates", 0.5,
+                           then=mb.ManifestRefused("candidate_invalid", "diff_mismatch"))
+    out = run_until_unlocked(service, service.request_approval(w.run_id, sha, "STAGING", "1", 3600, "slow", "c"))
+    assert (out.status, out.message) == (503, "candidate_unverifiable:deadline")
+    assert store.invalidations(w.db, sha) == ["candidate_invalid"]  # a late builder can still record this
+    tail = [(t, p.get("action"), p.get("code"), p.get("late")) for t, p in manifest_events(w)][-2:]
+    assert tail == [("agent.manifest_refused", "approval", "deadline", None),
+                    ("agent.manifest_refused", "approval", "candidate_invalid", True)]
+    assert w.db.execute("SELECT count(*) FROM approval_requests").fetchone()[0] == 0
+
+
+def test_an_overlong_idempotency_key_is_422_before_any_recheck(w, monkeypatch):
+    sha = build(w).json()["manifest_sha256"]
+    calls = []
+    monkeypatch.setattr(ManifestBuilder, "recheck", lambda *a, **k: calls.append(1))
+    service = ManifestService(w.db, w.builder, DaemonApprovalRequester(w.db))
+    with pytest.raises(AgentRunError) as caught:
+        asyncio.run(service.request_approval(w.run_id, sha, "STAGING", "1", 3600, "k" * 248, "c"))
+    assert (caught.value.status, caught.value.message, calls) == (422, "Invalid approval request", [])
+
+    async def go(c):  # the longest allowed key (256 - len("manifest:")) still works end to end
+        monkeypatch.undo()
+        return await post_approval(c, w, sha, "k" * 247, APPROVAL)
+    assert drive(w, go).status_code == 200
+
+
+def test_replay_survives_a_slow_requester(w, monkeypatch):
+    sha = build(w).json()["manifest_sha256"]
+    original = DaemonApprovalRequester.request_approval
+
+    def delayed(self, **kw):
+        time.sleep(1.1)  # expiry was computed before this; the store stamps requested_at after it
+        return original(self, **kw)
+    monkeypatch.setattr(DaemonApprovalRequester, "request_approval", delayed)
+
+    async def go(c):
+        first = await post_approval(c, w, sha, "slow", APPROVAL)
+        again = await post_approval(c, w, sha, "slow", APPROVAL)
+        return first, again
+    first, again = drive(w, go)
+    assert first.status_code == 200 and again.status_code == 200, again.text
+    assert again.headers["idempotency-replayed"] == "true" and again.json() == first.json()
+
+
+def test_concurrent_requests_with_one_key_replay(w):
+    sha = build(w).json()["manifest_sha256"]
+
+    async def go(c):
+        return await asyncio.gather(*(post_approval(c, w, sha, "same", APPROVAL) for _ in range(3)))
+    results = drive(w, go)
+    assert [r.status_code for r in results] == [200, 200, 200], [r.text for r in results]
+    assert len({r.json()["approval_id"] for r in results}) == 1
+    assert sorted(r.headers["idempotency-replayed"] for r in results) == ["false", "true", "true"]
+    assert w.db.execute("SELECT count(*) FROM approval_requests").fetchone()[0] == 1
