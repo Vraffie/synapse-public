@@ -5,7 +5,7 @@
 # because the source is a local, per-commit tarball that does not exist until it is exported;
 # build.sh replaces it with the actual digest before makepkg verifies it.
 pkgname=synapse-agent-control
-pkgver=0.1.0
+pkgver=0.9.0
 pkgrel=1
 pkgdesc='Local-first multi-agent orchestration daemon, operator CLI and desktop shell'
 arch=(any)

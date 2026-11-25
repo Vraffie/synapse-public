@@ -254,10 +254,17 @@ Covered by the opt-in tests in `tests/test_claude_cli_real.py`.
 ## Version probe
 
 `probe()` runs `<executable> --version` (scrubbed environment, no stdin, 5 s timeout) and reports
-`healthy` only for a version in `VERIFIED_CLI_VERSIONS` (currently `2.1.329`), `unverified_version` for any
+`healthy` only for a version in `VERIFIED_CLI_VERSIONS` (currently `2.1.329` and `2.1.332`), `unverified_version` for any
 other parseable version, and `unavailable` when the profile is disabled or the binary is missing, fails or
 prints something unparseable. The result is advisory: it does not block execution, and unknown stream-json
 shapes still fail closed in the parser. Add a version to the tuple only after re-running the opt-in real tests.
+
+## Real-binary results, claude 2.1.332 (2026-11-25, Linux)
+
+`SYNAPSE_REAL_CLAUDE=1 python -m pytest tests/test_claude_cli_real.py` passed in full against claude 2.1.332 (14 tests, about
+90 seconds), so `2.1.332` is in `VERIFIED_CLI_VERSIONS`. Live runs through `agentctl` on the same version (read-only,
+edit and commit, timeout, cancel, an approval gate and a sandboxed start) are written up in [daily use](daily-use.md).
+One recorded stream-json fixture per verified version is still not kept; unknown shapes fail closed in the parser.
 
 ## Real-binary results, claude 2.1.329 (2026-11-20, Linux)
 

@@ -91,7 +91,7 @@ _MAX_PROMPT_BYTES = 100_000  # below Linux MAX_ARG_STRLEN (128 KiB)
 # (see docs/operations/claude-cli-provider.md). Other versions are reported by probe() as
 # "unverified_version"; that is advisory and does not block execution, and unknown stream
 # shapes still fail closed in the parser.
-VERIFIED_CLI_VERSIONS = ("2.1.329",)
+VERIFIED_CLI_VERSIONS = ("2.1.329", "2.1.332")
 _VERSION_RE = re.compile(r"^(\d{1,4}\.\d{1,4}\.\d{1,4})(?:\s|$)")
 _VERSION_TIMEOUT_SECONDS = 5.0
 

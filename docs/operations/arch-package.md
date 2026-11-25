@@ -20,12 +20,12 @@ packaging/arch/build.sh /some/dir  # or into a directory you choose
 
 `build.sh` exports the **current commit** with `git archive` (uncommitted changes are not packaged), computes the tarball's SHA-256, writes it into a scratch copy of the `PKGBUILD` and runs `makepkg -fd` there. The repository's `PKGBUILD` has `sha256sums=('SKIP')` only because that tarball is local and per-commit and does not exist until it is exported; the build substitutes the real digest before `makepkg` verifies it. `-d` skips dependency resolution: building a pure-Python wheel needs only the makedepends (`python-build`, `python-installer`, `python-setuptools`, `python-wheel`), which must already be installed. No sudo and no network are used.
 
-To build by hand: put a `synapse-agent-control-0.1.0.tar.gz` (top directory `synapse-agent-control-0.1.0/`) next to the `PKGBUILD` and `.install` file, set its checksum, run `makepkg`.
+To build by hand: put a `synapse-agent-control-0.9.0.tar.gz` (top directory `synapse-agent-control-0.9.0/`) next to the `PKGBUILD` and `.install` file, set its checksum, run `makepkg`.
 
 ## Install, enable, verify
 
 ```sh
-sudo pacman -U synapse-agent-control-0.1.0-1-any.pkg.tar.zst    # installs the missing deps from the repos
+sudo pacman -U synapse-agent-control-0.9.0-1-any.pkg.tar.zst    # installs the missing deps from the repos
 systemctl --user daemon-reload
 systemctl --user enable --now synapse-daemon.service            # as the user who will use it
 agentctl --state-dir ~/.local/state/synapse health
