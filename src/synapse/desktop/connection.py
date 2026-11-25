@@ -93,6 +93,7 @@ class Poller(QThread):
     agent_detail = Signal(str, object, object)  # run id, generation, sanitized detail
     agent_detail_error = Signal(str, object, str)  # run id, generation, 'unavailable' | 'failed'
     multirepo_view = Signal(str, object, object)  # run id, generation, multirepo_model.build_view() dict or None (hide)
+    repos_list = Signal(object)  # raw GET /api/v1/repos answer (registered repositories); None: 404/503, hide the list
     profiles_list = Signal(object)  # raw GET /api/v1/profiles answer for the run-start pickers; None: explicit 404/503 (unavailable)
     profiles_failed = Signal(str)  # the profiles could not be loaded (not 404/503): short fixed reason, pickers stay disabled
     runs_list = Signal(object)  # recent runs (GET /api/v1/runs) for the Control Center switcher
@@ -439,6 +440,18 @@ class Poller(QThread):
             self._profiles_loaded = False
             self.profiles_failed.emit("unexpected answer or no connection")
 
+    def _poll_repos(self):
+        """Best-effort: the registered repositories for the multi-repository picker. Failures keep the last list."""
+        try:
+            answer = self.fetch(self.state_dir, multirepo_routes.registry())
+            if isinstance(answer, dict) and isinstance(answer.get("repos"), list):
+                self.repos_list.emit(answer)
+        except DaemonHTTPError as exc:
+            if exc.status in (404, 503):
+                self.repos_list.emit(None)
+        except Exception:
+            pass  # never show exception text
+
     def _poll_control_center(self, run_id, generation, threads):
         """Best-effort reads for the Control Center; any failure is silent (the view keeps its last data)."""
         self._poll_cc_approvals()
@@ -599,6 +612,7 @@ class Poller(QThread):
                 break
             if not self._profiles_loaded or self._cycle % FEED_EVERY == 0:
                 self._poll_profiles()
+                self._poll_repos()
             approval_cursor, approval_generation = self._selected_approval_page()
             try:
                 page = self.fetch(self.state_dir, "/api/v1/approvals?" + urlencode({"after": approval_cursor, "limit": 100}))

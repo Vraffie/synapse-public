@@ -184,6 +184,8 @@ class RunsMixin:
         self.poller.run_snapshot.connect(self._show_run)
         self.poller.run_error.connect(self._run_unavailable)
         self.poller.agent_started.connect(self._agent_started)
+        self.poller.repos_list.connect(self.start_panel.agent_form.set_repos)
+        self.poller.repos_list.connect(self.control_center.composer.set_repos)
         self.poller.profiles_list.connect(self.start_panel.agent_form.set_profiles)
         self.poller.profiles_list.connect(self.control_center.composer.set_profiles)
         self.poller.profiles_failed.connect(self.start_panel.agent_form.set_profiles_failed)

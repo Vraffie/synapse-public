@@ -19,7 +19,7 @@ from uuid import uuid4
 
 from PySide6.QtCore import QSettings, Qt, Signal
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton,
     QSpinBox, QVBoxLayout, QWidget,
 )
 
@@ -46,6 +46,8 @@ PROFILE_LOADING = "Loading accounts…"
 PROFILE_UNAVAILABLE = "Not available on this daemon (the daemon's default account will be used)"
 DEFAULT_ACCOUNT_TEXT = "Claude account: daemon default (no account was chosen)"
 _PROFILE = re.compile(r"[A-Za-z0-9._-]{1,64}")  # the daemon's profile id pattern
+_REPO_ID = re.compile(r"[A-Za-z0-9._-]{1,128}")  # a registry repository id (ADR 026)
+MAX_REPO_IDS = 16
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _CREDENTIAL_URL = re.compile(r"://[^/\s]*@")
 _REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/@+~^-]*")
@@ -104,15 +106,23 @@ def utf8_len(text: str) -> int | None:
 def validate(fields: dict) -> tuple[dict | None, list[str]]:
     """Return (payload, []) or (None, problems). `fields` holds the raw form values."""
     problems = []
+    repo_ids = list(fields.get("repo_ids") or ())
+    if repo_ids and (len(repo_ids) > MAX_REPO_IDS or len(set(repo_ids)) != len(repo_ids)
+                     or any(not isinstance(i, str) or _REPO_ID.fullmatch(i) is None for i in repo_ids)):
+        problems.append("Registered repositories must be 1-%d distinct ids." % MAX_REPO_IDS)
     repo = str(fields.get("repo", "")).strip()
-    if not repo:
+    if repo_ids:
+        repo = ""  # a run over registered repositories names them by id; the path and base ref fields are not used
+    elif not repo:
         problems.append("Repository is required.")
     elif len(repo) > MAX_REPO or _CONTROL.search(repo):
         problems.append("Repository must be a single line of at most %d characters." % MAX_REPO)
     elif _CREDENTIAL_URL.search(repo):
         problems.append("Repository must not embed credentials (user:password@host).")
     ref = str(fields.get("base_ref", "")).strip()
-    if not ref:
+    if repo_ids:
+        ref = ""
+    elif not ref:
         problems.append("Base ref is required.")
     elif len(ref) > MAX_REF or _REF.fullmatch(ref) is None or ref.startswith("-") or ".." in ref or "//" in ref or ref.endswith((".lock", "/", ".")):
         problems.append("Base ref must be a branch, tag or commit name starting with a letter or digit, without spaces, "
@@ -157,19 +167,41 @@ def validate(fields: dict) -> tuple[dict | None, list[str]]:
         return None, problems
     payload = {"repo": repo, "base_ref": ref, "prompt": prompt, "allowed_tools": tools, "permission_mode": mode,
                "timeout_seconds": timeout, "approval_step": step}
+    if repo_ids:
+        payload["repo_ids"] = repo_ids
     if profile is not None:
         payload["profile"] = profile
     return payload, []
 
 
+def wire_payload(payload: dict) -> dict:
+    """The POST body. A run over registered repositories (ADR 026) is one task that writes all of them."""
+    ids = payload.get("repo_ids")
+    if not ids:
+        return payload
+    task = {"id": "main", "prompt": payload["prompt"], "allowed_tools": payload["allowed_tools"],
+            "repos": [{"repo_id": i, "access": "write"} for i in ids]}
+    if payload["approval_step"]:
+        task["approval_step"] = payload["approval_step"]
+    body = {"repos": [{"repo_id": i} for i in ids], "tasks": [task], "permission_mode": payload["permission_mode"],
+            "timeout_seconds": payload["timeout_seconds"]}
+    if payload.get("profile") is not None:
+        body["profile"] = payload["profile"]
+    return body
+
+
 def encode_payload(payload: dict) -> bytes:
+    payload = wire_payload(payload)
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
 
 
 def summary_text(payload: dict) -> str:
     prompt = payload["prompt"]
     shown = prompt if len(prompt) <= 400 else prompt[:400] + "..."
-    lines = [f"Repository: {payload['repo']}", f"Base ref: {payload['base_ref']}",
+    where = ([f"Repositories ({len(payload['repo_ids'])}, one task writes all of them): {', '.join(payload['repo_ids'])}",
+              "Base ref: each repository's default baseline branch"] if payload.get("repo_ids")
+             else [f"Repository: {payload['repo']}", f"Base ref: {payload['base_ref']}"])
+    lines = [*where,
              f"Claude account: {payload['profile']} (what you chose)" if payload.get("profile") else DEFAULT_ACCOUNT_TEXT,
              f"Permission mode: {payload['permission_mode']}", f"Allowed tools: {', '.join(payload['allowed_tools'])}",
              f"Timeout: {payload['timeout_seconds']} s", f"Prompt ({len(prompt)} chars, sha256 {prompt_digest(prompt)[:16]}):", shown]
@@ -234,6 +266,11 @@ class AgentRunForm(QWidget):
         self.repo.addItems(load_recent(self.settings))
         self.repo.setCurrentText("")
         self.base_ref = QLineEdit("main")
+        self.repos_list = QListWidget()  # the operator's registered repositories (GET /api/v1/repos); hidden until known
+        self.repos_list.setMaximumHeight(96)
+        self.repos_list.setToolTip("Tick one or more registered repositories to run one agent over all of them. "
+                                   "The Repository and Base ref fields are then not used.")
+        self.repos_list.setVisible(False)
         self.profile = QComboBox()
         self._profile_state = "loading"  # loading | unavailable | loaded
         self._default_profile = None  # the operator's default account (default-profile file), preselected once
@@ -278,6 +315,7 @@ class AgentRunForm(QWidget):
         self._last = None  # (body, key, correlation) of the submission awaiting its outcome
         self._pending = False
         self._connect_signals()
+        self.repos_list.itemChanged.connect(self._repos_changed)
         self._update_submit()
 
     def _make_prompt(self) -> QPlainTextEdit:
@@ -291,6 +329,7 @@ class AgentRunForm(QWidget):
         tools_row = self.tools_row
         form = QFormLayout()
         form.addRow("Repository", self.repo)
+        form.addRow("Registered repositories", self.repos_list)
         form.addRow("Claude account", self.profile)
         form.addRow("Base ref", self.base_ref)
         form.addRow("Prompt", self.prompt)
@@ -306,6 +345,37 @@ class AgentRunForm(QWidget):
         layout.addWidget(self.submit_button)
         layout.addWidget(self.problems)
         layout.addWidget(self.status)
+
+    def set_repos(self, raw):
+        """The daemon's registered repositories ({"repos": [{id, default_baseline_ref, ...}]}); None or junk hides the list."""
+        rows = raw.get("repos") if isinstance(raw, dict) else None
+        keep = set(self.selected_repo_ids())
+        self.repos_list.blockSignals(True)
+        self.repos_list.clear()
+        for row in rows if isinstance(rows, list) else ():
+            rid = row.get("id") if isinstance(row, dict) else None
+            if not isinstance(rid, str) or _REPO_ID.fullmatch(rid) is None or self.repos_list.count() >= MAX_REPO_IDS:
+                continue
+            base = row.get("default_baseline_ref")
+            base = base[len("refs/heads/"):] if isinstance(base, str) and base.startswith("refs/heads/") else ""
+            item = QListWidgetItem(f"{rid}  ({base})" if base and len(base) <= 80 and base.isprintable() else rid)
+            item.setData(Qt.ItemDataRole.UserRole, rid)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if rid in keep else Qt.CheckState.Unchecked)
+            self.repos_list.addItem(item)
+        self.repos_list.blockSignals(False)
+        self.repos_list.setVisible(self.repos_list.count() > 0)
+        self._repos_changed()
+
+    def selected_repo_ids(self) -> list[str]:
+        return [self.repos_list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.repos_list.count())
+                if self.repos_list.item(i).checkState() == Qt.CheckState.Checked]
+
+    def _repos_changed(self, *_):
+        multi = bool(self.selected_repo_ids())
+        self.repo.setEnabled(not multi)
+        self.base_ref.setEnabled(not multi)
+        self._update_submit()
 
     def _profile_activated(self, _index: int):
         self._profile_chosen_by_user = True  # the operator picked an entry: the default no longer overrides it
@@ -415,6 +485,7 @@ class AgentRunForm(QWidget):
         return {"repo": self.repo.currentText(), "base_ref": self.base_ref.text(), "prompt": self.prompt.toPlainText(),
                 "allowed_tools": [t for t, box in self.tool_boxes.items() if box.isChecked()],
                 "permission_mode": self.mode.currentText(), "timeout_seconds": self.timeout.value(), "approval_step": step,
+                "repo_ids": self.selected_repo_ids(),
                 "profile": self.profile.currentData(), "profile_required": self._profile_required(),
                 "profile_state": self._profile_state}
 

@@ -120,6 +120,7 @@ class PromptComposer(AgentRunForm):
         self.options = QWidget()
         form = QFormLayout(self.options)
         form.setContentsMargins(0, 0, 0, 0)
+        form.addRow("Registered repositories", self.repos_list)
         form.addRow("Base ref", self.base_ref)
         form.addRow("Allowed tools", self.tools_row)
         form.addRow("Permission mode", self.mode)
@@ -163,6 +164,7 @@ class PromptComposer(AgentRunForm):
         self.prompt.notice.connect(self.notice_label.setText)
         self.prompt.textChanged.connect(self.update_state)
         self.repo.currentTextChanged.connect(self.update_state)
+        self.repos_list.itemChanged.connect(self.update_state)
         for box in self.tool_boxes.values():
             box.toggled.connect(self.update_state)
         for widget in (self.base_ref, self.approval_operation, self.approval_target):

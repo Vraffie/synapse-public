@@ -327,6 +327,12 @@ CASES[(MANIFESTS, "get")] = _get_cases(MANIFESTS.replace("{run_id}", "r1"), "lis
 CASES[(MANIFESTS + "/{manifest_sha256}", "get")] = _get_cases(MANIFESTS.replace("{run_id}", "r1") + "/" + SHA, "show_manifest", "run")
 COOLDOWN = "/api/v1/profiles/{profile_id}/cooldown"
 COOLDOWN_HEADERS = {**AUTH, "X-Correlation-ID": "corr-1", "Content-Type": "application/json"}
+CASES[("/api/v1/repos", "get")] = {
+    200: ({"list_repos": lambda: {"repos": [{"id": "a", "baseline_refs": ["refs/heads/main"],
+                                              "default_baseline_ref": "refs/heads/main", "protected_paths": 0}]}}, {}),
+    500: ({"list_repos": raising(RuntimeError(SECRET))}, {}),
+    503: ({"list_repos": None}, {}),
+}
 CASES[("/api/v1/profiles", "get")] = {
     200: ({}, {}),
     500: ({"list_profiles": raising(RuntimeError(SECRET))}, {}),

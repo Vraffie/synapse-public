@@ -38,7 +38,8 @@ class MainWindow(RunsMixin, MessagesMixin, ApprovalsMixin, EventsMixin, QMainWin
         self._init_events_state()
         self.events_tab = self._build_events_tab()
         self.runs_tab = self._build_runs_tab()
-        self.start_panel.agent_form.set_default_profile(read_default_profile(state_dir))  # the operator's default account
+        default_profile = read_default_profile(state_dir)  # the operator's default account, for every start form
+        self.start_panel.agent_form.set_default_profile(default_profile)
         self.messages_tab = self._build_messages_tab()
         self.approvals_tab = self._build_approvals_tab()
         self.tabs = QTabWidget()
@@ -48,6 +49,7 @@ class MainWindow(RunsMixin, MessagesMixin, ApprovalsMixin, EventsMixin, QMainWin
         self.tabs.addTab(self.approvals_tab, APPROVALS_TAB_TITLE)
         self.tabs.setCurrentWidget(self.approvals_tab)  # approvals first: it is what needs the operator
         self.control_center = ControlCenter()
+        self.control_center.composer.set_default_profile(default_profile)
         self.views = QTabWidget()  # top level: Control Center (default) and Developer (the technical tabs)
         self.views.addTab(self.control_center, "Control Center")
         self.views.addTab(self.tabs, "Developer")

@@ -182,3 +182,20 @@ def test_run_switcher_lists_a_full_page_and_says_older_runs_exist(app):
     assert combo.count() == 4 and all(combo.model().item(i).isEnabled() for i in range(combo.count()))
     center.set_runs(runs[:control_model.RUNS_SHOWN - 1])  # one short of a full page: nothing is hidden, no note
     assert all(combo.model().item(i).isEnabled() for i in range(combo.count()))
+
+
+def test_main_window_preselects_the_default_account_in_the_prompt_bar_too(tmp_path, monkeypatch):
+    """The bar at the bottom of the Control Center is the form operators use most; it needs the default too."""
+    from synapse.desktop import main_window as mw
+    monkeypatch.setattr(mw, "read_default_profile", lambda state_dir: "claude-work")
+    from PySide6.QtWidgets import QApplication
+    QApplication.instance() or QApplication([])
+    state = tmp_path / "s"
+    state.mkdir(mode=0o700)
+    window = mw.MainWindow(state)
+    try:
+        window.control_center.composer.set_profiles({"profiles": [{"id": "claude-work", "enabled": True, "cooldown_remaining_seconds": 0.0}]})
+        assert window.control_center.composer.profile.currentData() == "claude-work"
+    finally:
+        window.close()
+        window.deleteLater()

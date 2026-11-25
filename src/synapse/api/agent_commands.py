@@ -139,8 +139,15 @@ def _schema():
 def agent_command_router(start: StartAgent | None, read: ReadAgent | None, cancel: CancelAgent | None,
                          abandon: AbandonAgent | None = None,
                          remove_worktree: RemoveWorktree | None = None,
-                         commit_worktree: CommitWorktree | None = None) -> APIRouter:
+                         commit_worktree: CommitWorktree | None = None,
+                         list_repos: Callable[[], dict] | None = None) -> APIRouter:
     router = APIRouter(dependencies=[Security(HTTPBearer())])
+
+    @router.get("/api/v1/repos")
+    async def get_repos():
+        if list_repos is None:
+            raise HTTPException(503, detail="Agent runs unavailable")
+        return list_repos()
 
     def respond(result, status, correlation):
         return JSONResponse(result.response, status_code=status,
