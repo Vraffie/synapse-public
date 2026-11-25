@@ -170,6 +170,24 @@ QStatusBar QLabel, QStatusBar QToolButton, QStatusBar QPushButton {{ font-size: 
 QMenuBar {{ background: {p['surface']}; border-bottom: 1px solid {p['border_subtle']}; }}
 QMenu {{ background: {p['elevated']}; border: 1px solid {p['border_strong']}; }}
 QMenu::item:selected, QMenuBar::item:selected {{ background: {p['selection']}; }}
+QFrame#toolbar, QFrame#telemetry, QFrame#launchBar, QFrame#drawer {{ background: {p['surface']}; border: none; border-radius: 0px; }}
+QFrame#pane {{ background: {p['surface']}; border: none; border-radius: 0px; }}
+QFrame#pane QScrollArea, QFrame#pane QScrollArea > QWidget > QWidget, QFrame#drawer QScrollArea, QFrame#drawer QScrollArea > QWidget > QWidget {{ background: {p['surface']}; }}
+QFrame#paneHead {{ background: {p['surface']}; border: none; border-bottom: 1px solid {p['border_subtle']}; }}
+QFrame#hairline {{ background: {p['border_subtle']}; border: none; }}
+QSplitter::handle {{ background: {p['border_subtle']}; }}
+QLabel#stateBadge {{ font-weight: 600; }}
+QPushButton#segment {{ background: {p['elevated']}; border: 1px solid {p['border_strong']}; border-radius: 0px; padding: 3px 10px; }}
+QPushButton#segment:checked {{ background: {p['accent_primary']}; color: {p['on_primary']}; border-color: {p['accent_primary']}; }}
+QPushButton#segment:focus {{ border: 2px solid {p['focus']}; padding: 2px 9px; }}
+QWidget#segmented QPushButton:first-child, QWidget#segmented QPushButton#segment:first {{ border-top-left-radius: 4px; border-bottom-left-radius: 4px; }}
+QFrame#drawer QTabBar::tab {{ background: transparent; border: none; border-bottom: 2px solid transparent; padding: 5px 12px; }}
+QFrame#drawer QTabBar::tab:selected {{ border-bottom: 2px solid {p['text_primary']}; color: {p['text_primary']}; background: transparent; border-top: none; }}
+QScrollBar:vertical {{ background: transparent; width: 10px; margin: 0; }}
+QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 0; }}
+QScrollBar::handle {{ background: {p['border_strong']}; border-radius: 4px; min-height: 24px; min-width: 24px; margin: 2px; }}
+QScrollBar::handle:hover {{ background: {p['text_muted']}; }}
+QScrollBar::add-line, QScrollBar::sub-line, QScrollBar::add-page, QScrollBar::sub-page {{ background: none; border: none; width: 0; height: 0; }}
 QToolTip {{ background: {p['elevated']}; color: {p['text_primary']}; border: 1px solid {p['border_strong']}; }}
 """
 

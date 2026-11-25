@@ -1,4 +1,5 @@
-"""Layout tests: with the sample fixture, the pending approval card and its decision buttons are inside the visible viewport."""
+"""Layout tests: with the sample fixture, the approval banner is pinned under the telemetry strip with its decision buttons visible,
+and nothing overflows horizontally at common sizes and larger fonts."""
 import os
 import re
 import sys
@@ -40,42 +41,42 @@ def scaled(center, factor):
     QApplication.processEvents()
 
 
-def visible_rect(center):
-    scroll = center.findChild(QScrollArea)
-    return QRect(scroll.viewport().mapTo(center, QPoint(0, 0)), scroll.viewport().size())
+def inside(center, widget):
+    box = QRect(widget.mapTo(center, QPoint(0, 0)), widget.size())
+    return center.rect().contains(box), box
 
 
 @pytest.mark.parametrize('width,height', SIZES)
-def test_gate_card_and_buttons_inside_viewport(app, width, height):
+def test_banner_and_buttons_inside_window(app, width, height):
     center = shown(app, width, height)
     try:
-        assert center.gate.decidable
-        view = visible_rect(center)
-        for widget in (center.gate_frame, center.approve_button, center.reject_button, center.gate_status):
-            box = QRect(widget.mapTo(center, QPoint(0, 0)), widget.size())
-            assert view.contains(box), (widget.objectName(), box, view)
+        assert center.gate.decidable and center.banner.isVisible()
+        for widget in (center.gate_frame, center.approve_button, center.reject_button, center.gate_title):
+            ok, box = inside(center, widget)
+            assert ok, (widget.objectName(), box, center.rect())
         assert center.approve_button.isEnabled() and center.reject_button.isEnabled()
+        # pinned: directly under the telemetry strip, above the split panes
+        assert center.banner.mapTo(center, QPoint(0, 0)).y() >= center.telemetry.mapTo(center, QPoint(0, 0)).y() + center.telemetry.height()
+        assert center.banner.mapTo(center, QPoint(0, 0)).y() < center.main_split.mapTo(center, QPoint(0, 0)).y()
     finally:
         center.close()
 
 
 @pytest.mark.parametrize('width,height', SIZES)
-def test_no_horizontal_scroll_and_topology_fits(app, width, height):
+def test_no_horizontal_overflow_and_graph_fits_or_scrolls(app, width, height):
     center = shown(app, width, height)
     try:
-        scroll = center.findChild(QScrollArea)
-        assert scroll.horizontalScrollBar().maximum() == 0
+        assert center.minimumSizeHint().width() <= width
+        for scroll in center.findChildren(QScrollArea):
+            assert scroll.horizontalScrollBar().maximum() == 0, scroll.objectName()
         topo = center.topology
-        assert topo.verticalScrollBar().maximum() <= 0
         viewport = topo.viewport().rect()
-        if topo.horizontalScrollBar().maximum() <= 0:  # otherwise the legibility floor kicks in and the graph scrolls sideways
+        if topo.horizontalScrollBar().maximum() <= 0 and topo.verticalScrollBar().maximum() <= 0:
             for item in topo.node_items.values():
                 assert viewport.contains(topo.mapFromScene(item.sceneBoundingRect()).boundingRect())
-        else:
-            assert width < 1000
-        # the page scrolls to the end, so the topology is reachable
-        scroll.verticalScrollBar().setValue(scroll.verticalScrollBar().maximum())
-        app.processEvents()
+        # panes split about 55 / 45
+        sizes = center.main_split.sizes()
+        assert 0.45 < sizes[0] / sum(sizes) < 0.65
     finally:
         center.close()
 
@@ -85,17 +86,22 @@ def test_decision_buttons_still_fail_closed_without_approval(app):
     try:
         center.set_approvals([])
         assert not center.approve_button.isEnabled() and not center.reject_button.isEnabled()
+        assert not center.banner.isVisible()  # no pending gate: the banner takes no space
+        assert center.banner.height() == 0 or not center.banner.isVisible()
     finally:
         center.close()
 
 
 @pytest.mark.parametrize('factor', [1.2, 1.5, 1.8, 2.0])
-def test_no_horizontal_scroll_with_wider_font_at_900(app, factor):
+def test_wider_font_keeps_banner_buttons_and_strip_usable_at_900(app, factor):
     center = shown(app, 900, 700)
     try:
         scaled(center, factor)
-        scroll = center.findChild(QScrollArea)
-        assert scroll.horizontalScrollBar().maximum() == 0
         assert center.gate.decidable and center.approve_button.isVisible()
+        for scroll in center.findChildren(QScrollArea):
+            assert scroll.horizontalScrollBar().maximum() == 0
+        ok, box = inside(center, center.approve_button)
+        assert ok, box
+        assert center.telemetry.width() <= center.width()
     finally:
         center.close()

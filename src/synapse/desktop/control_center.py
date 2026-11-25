@@ -10,20 +10,41 @@ from datetime import datetime, timezone
 from html import escape
 
 from PySide6.QtCore import QSignalBlocker, Qt, Signal
+from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
-    QSizePolicy, QVBoxLayout, QWidget,
+    QButtonGroup, QComboBox, QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QPlainTextEdit, QProgressBar, QPushButton,
+    QScrollArea, QSizePolicy, QSplitter, QToolButton, QVBoxLayout, QWidget,
 )
 
-from synapse.desktop import control_model, narrative, theme
+from synapse.desktop import control_model, icons, narrative, theme
 from synapse.desktop.prompt_composer import PromptComposer
 from synapse.desktop.topology_view import TopologyView
+from synapse.desktop.workbench import ApprovalBanner, Drawer, SegmentedSwitcher, TelemetryStrip, hairline
 
 MAX_FEED = 60
 MAX_FEED_BUFFER = 400
 MAX_MESSAGE_IDS = 20000
 MAX_DROPPED_KEYS = 20000  # trimmed feed keys remembered so a re-delivered row is not counted as dropped twice
 NO_RUN = "No run selected"
+FILTERS = (("all", "All"), ("decisions", "Decisions & Tools"), ("errors", "Errors"))
+BAD_AFTER = {"failed", "rejected", "expired", "revoked", "cancelled", "canceled", "blocked", "timed_out"}
+RUN_TONE = {"running": "running", "completed": "done", "succeeded": "done", "failed": "failed", "cancelled": "failed",
+            "waiting_for_approval": "waiting", "paused": "waiting"}
+
+
+def feed_kind(event) -> str:
+    """Which Activity filter an event belongs to: decision (approvals), tool (agent work), error, or other."""
+    kind = event.get("type") if isinstance(event, dict) else ""
+    kind = kind if isinstance(kind, str) else ""
+    payload = event.get("payload") if isinstance(event, dict) and isinstance(event.get("payload"), dict) else {}
+    after = payload.get("after")
+    if "refused" in kind or "failed" in kind or (isinstance(after, str) and after in BAD_AFTER):
+        return "error"
+    if kind.startswith("approval.") or kind.startswith("task.approval_"):
+        return "decision"
+    if kind.startswith("agent.") or kind.startswith("task_attempt."):
+        return "tool"
+    return "other"
 
 
 def stamp_key(value) -> tuple:
@@ -67,23 +88,44 @@ def run_choice_label(run: dict) -> str:
     return " · ".join(parts)
 
 
-def _panel(title: str, trailing: QWidget | None = None):
+def _pane(title: str, trailing: QWidget | None = None):
+    """A pane of the split workspace: full-bleed surface, a 30 px header with a title, no border of its own (the splitter's
+    1 px handles are the only lines between panes)."""
     frame = QFrame()
-    frame.setObjectName("panel")
+    frame.setObjectName("pane")
     layout = QVBoxLayout(frame)
-    top = QHBoxLayout()
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(0)
+    head = QFrame()
+    head.setObjectName("paneHead")
+    head.setFixedHeight(30)
+    top = QHBoxLayout(head)
+    top.setContentsMargins(12, 0, 8, 0)
     heading = QLabel(title)
     heading.setObjectName("h2")
-    heading.setWordWrap(True)  # long titles and hints wrap instead of widening the page
     top.addWidget(heading)
     top.addStretch(1)
     if trailing is not None:
-        if isinstance(trailing, QLabel):
-            trailing.setWordWrap(True)
-            trailing.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         top.addWidget(trailing)
-    layout.addLayout(top)
-    return frame, layout
+    layout.addWidget(head)
+    body = QVBoxLayout()
+    body.setContentsMargins(12, 8, 12, 8)
+    layout.addLayout(body, 1)
+    return frame, body
+
+
+def swatch(colour: str, dashed: bool = False) -> QPixmap:
+    """A 22x8 sample of an edge style for the legend: colour AND line style (dashed / solid) carry the meaning, with a label."""
+    pm = QPixmap(22, 8)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    pen = QPen(QColor(colour), 2)
+    if dashed:
+        pen.setStyle(Qt.PenStyle.DashLine)
+    painter.setPen(pen)
+    painter.drawLine(0, 4, 22, 4)
+    painter.end()
+    return pm
 
 
 def _label(text="", name=None, wrap=True, rich=False):
@@ -133,6 +175,7 @@ class ControlCenter(QWidget):
     reject_requested = Signal()
     cancel_requested = Signal()
     node_selected = Signal(str)
+    inspect_requested = Signal()
 
     def __init__(self, parent=None, settings=None):
         super().__init__(parent)
@@ -150,6 +193,8 @@ class ControlCenter(QWidget):
         self.gate = control_model.gate_for_run([], "")
         self._note, self._note_key = "", None
         self._feed: dict = {}
+        self._kinds: dict = {}
+        self.metric_rows: list = []
         self._feed_sig = None
         self._dropped: dict = {}
         self._dropped_forgotten = 0
@@ -163,76 +208,108 @@ class ControlCenter(QWidget):
 
     # ---- construction ---------------------------------------------------------------------------
     def _build(self):
-        header = QHBoxLayout()
-        titles = QVBoxLayout()
-        titles.addWidget(_label("SYNAPSE / OPERATIONS", "eyebrow"))
-        titles.addWidget(_label("Agent Control Center", "h1"))
-        titles.addWidget(_label("See what your agents are doing, step by step, and decide when they need a person.", "muted"))
-        header.addLayout(titles, 1)
-        self.connection_pill = _label("Connecting", "pill")
+        p = self.p
+        # toolbar (44 px): run selector + New Run | live state + repo pill | view switcher
+        toolbar = QFrame()
+        toolbar.setObjectName("toolbar")
+        toolbar.setFixedHeight(44)
+        row = QHBoxLayout(toolbar)
+        row.setContentsMargins(12, 0, 12, 0)
+        row.setSpacing(8)
         self.run_combo = QComboBox()
         self.run_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.run_combo.setMinimumContentsLength(14)  # a long run label elides instead of widening the page
-        self.run_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.run_combo.setMinimumWidth(120)
+        self.run_combo.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.run_combo.setMinimumWidth(220)
+        self.run_combo.setMaximumWidth(380)
         self.run_combo.setAccessibleName("Selected run")
         self.run_combo.activated.connect(self._combo_activated)
-        self.start_button = QPushButton("▶ Start run")
-        self.start_button.setObjectName("primary")
-        self.start_button.clicked.connect(self.start_requested)
-        self.developer_button = QPushButton("Developer view")
-        self.developer_button.clicked.connect(self.developer_requested)
-        controls = QVBoxLayout()
-        row, buttons_row = QHBoxLayout(), QHBoxLayout()  # two short rows keep the header narrow enough for any font
-        for widget in (self.connection_pill, self.run_combo):
-            row.addWidget(widget)
-        buttons_row.addStretch(1)
-        for widget in (self.start_button, self.developer_button):
-            buttons_row.addWidget(widget)
-        controls.addLayout(row)
-        controls.addLayout(buttons_row)
-        header.addLayout(controls)
+        self.new_run_button = QPushButton("New Run")
+        self.new_run_button.setIcon(icons.icon("plus"))
+        self.new_run_button.setAccessibleName("New run")
+        self.new_run_button.setToolTip("Configure and start a new run (Ctrl+N)")
+        self.new_run_button.clicked.connect(self.start_requested)
+        self.state_icon = QLabel()
+        self.state_badge = _label("No run", "stateBadge", False)
+        self.state_badge.setAccessibleName("Run state")
+        self.repo_pill = _label("", "pill", False)
+        self.repo_pill.setVisible(False)
+        self.repo_pill.setAccessibleName("Repository and branch")
+        self.switcher = SegmentedSwitcher()
+        self.switcher.switched.connect(self._switched)
+        row.addWidget(self.run_combo)
+        row.addWidget(self.new_run_button)
+        row.addStretch(1)
+        row.addWidget(self.state_icon)
+        row.addWidget(self.state_badge)
+        row.addWidget(self.repo_pill)
+        row.addStretch(1)
+        row.addWidget(self.switcher)
+        self.connection_text = "Connecting"
 
-        self.tiles = []
-        tile_row = QHBoxLayout()
-        for _ in range(5):
-            frame = QFrame()
-            frame.setObjectName("metric")
-            box = QVBoxLayout(frame)
-            title, value, caption = _label("", "caption", False), _label("", "metricValue", False), _label("", "caption", False)
-            for widget in (title, value, caption):
-                widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)  # clip, never force the page wider
-                box.addWidget(widget)
-            tile_row.addWidget(frame, 1)
-            self.tiles.append((title, value, caption))
+        self.telemetry = TelemetryStrip()
+        self.banner = ApprovalBanner()
+        self.gate_frame = self.banner  # the gate card is now the banner (same labels and buttons as before)
+        self.gate_title, self.gate_body, self.gate_context, self.gate_status = self.banner.title, self.banner.body, self.banner.context, self.banner.status
+        self.gate_payload = self.banner.payload
+        self.approve_button, self.reject_button = self.banner.approve, self.banner.reject
+        self.approve_button.clicked.connect(self.approve_requested)
+        self.reject_button.clicked.connect(self.reject_requested)
+        self.banner.inspect_requested.connect(self.inspect_requested)
 
+        # topology pane (left, 55%): full-bleed graph with zoom controls in its header
         self.topology = TopologyView()
+        self.topology.fill = True
+        self.topology.setMinimumHeight(140)
         self.topology.node_clicked.connect(self.select)
-        legend = _label("<b style='color:%s'>━━</b> Depends on &nbsp; <b style='color:%s'>━━</b> Works in parallel &nbsp; "
-                        "<b style='color:%s'>┄┄</b> Sent back for changes &nbsp; <b style='color:%s'>━━</b> Blocked &nbsp; "
-                        "<span style='color:%s'>●</span> Needs your approval"
-                        % (self.p["edge"], self.p["cyan"], self.p["purple"], self.p["red"], self.p["amber"]), "caption", rich=True)
+        zoom = QHBoxLayout()
+        zoom.setSpacing(2)
+        zoom.setContentsMargins(0, 0, 0, 0)
+        for name, text, handler in (("minus", "Zoom out", self.topology.zoom_out), ("plus", "Zoom in", self.topology.zoom_in),
+                                    ("fit", "Fit to view (Ctrl+0)", self.topology.reset_zoom)):
+            button = QToolButton()
+            button.setIcon(icons.icon(name))
+            button.setToolTip(text)
+            button.setAccessibleName(text)
+            button.clicked.connect(handler)
+            zoom.addWidget(button)
+            setattr(self, "zoom_" + name, button)
+        zoom_box = QWidget()
+        zoom_box.setLayout(zoom)
         self.topology_hint = QLabel("Click a step to inspect it")
         self.topology_hint.setTextFormat(Qt.TextFormat.PlainText)
-        self.topology_hint.setObjectName("pill")
-        topo_panel, topo_layout = _panel("Execution topology", self.topology_hint)
+        self.topology_hint.setObjectName("caption")
+        hint_and_zoom = QWidget()
+        hz = QHBoxLayout(hint_and_zoom)
+        hz.setContentsMargins(0, 0, 0, 0)
+        hz.addWidget(self.topology_hint)
+        hz.addWidget(zoom_box)
+        topo_panel, topo_layout = _pane("Topology", hint_and_zoom)
+        topo_layout.setContentsMargins(0, 0, 0, 0)
         topo_layout.addWidget(self.topology, 1)
-        topo_layout.addWidget(legend)
+        legend = QHBoxLayout()
+        legend.setContentsMargins(12, 4, 12, 6)
+        legend.setSpacing(6)
+        for colour, dashed, text in ((p["edge"], False, "Depends on"), (p["running"], False, "Works in parallel"),
+                                     (p["purple"], True, "Sent back for changes"), (p["failed"], False, "Blocked")):
+            sample = QLabel()
+            sample.setPixmap(swatch(colour, dashed))
+            sample.setAccessibleName("")
+            legend.addWidget(sample)
+            legend.addWidget(_label(text, "caption", False))
+            legend.addSpacing(8)
+        legend.addStretch(1)
+        topo_layout.addLayout(legend)
 
-        self.phase_text = _label("", "muted", False)
-        phase_panel, phase_layout = _panel("Execution phases", self.phase_text)
-        self.phases = _label("", rich=True)
-        phase_layout.addWidget(self.phases)
-
-        roster_panel, roster_layout = _panel("Agent roster", _label("Select a step", "muted", False))
-        self.roster_grid = QGridLayout()
-        roster_layout.addLayout(self.roster_grid)
-        self.roster_note = _label("", "caption")
-        roster_layout.addWidget(self.roster_note)
-        self.roster_cards: dict = {}
-
+        # inspector pane (right top): the selected agent
+        self.selected_icon = QLabel()
         self.selected_pill = _label("Idle", "pill", False)
-        sel_panel, sel_layout = _panel("Selected agent", self.selected_pill)
+        pill_box = QWidget()
+        pb = QHBoxLayout(pill_box)
+        pb.setContentsMargins(0, 0, 0, 0)
+        pb.addWidget(self.selected_icon)
+        pb.addWidget(self.selected_pill)
+        sel_panel, sel_layout = _pane("Inspector", pill_box)
         self.sel_name = _label("", "h2")
         self.sel_state = _label("", rich=True)
         self.sel_links = _label("", rich=True)
@@ -243,81 +320,134 @@ class ControlCenter(QWidget):
         self.details_button.clicked.connect(self.show_details)
         self.stop_button = QPushButton("Stop this run…")
         self.stop_button.setObjectName("danger")
+        self.stop_button.setIcon(icons.icon("stop", p["failed"], p["failed"]))
         self.stop_button.clicked.connect(self.cancel_requested)
         self.stop_button.setVisible(False)
+        inspector_body = QWidget()
+        ib = QVBoxLayout(inspector_body)
+        ib.setContentsMargins(0, 0, 0, 0)
         for widget in (self.sel_name, self.sel_state, self.sel_links, self.sel_summary, self.sel_changes):
-            sel_layout.addWidget(widget)
+            ib.addWidget(widget)
+        ib.addStretch(1)
+        inspector_scroll = self._scroll(inspector_body)
+        sel_layout.addWidget(inspector_scroll, 1)
         buttons = QHBoxLayout()
         buttons.addWidget(self.details_button)
         buttons.addStretch(1)
         buttons.addWidget(self.stop_button)
         sel_layout.addLayout(buttons)
 
-        gate_pill = _label("Fails closed", "pill", False)
-        gate_panel, gate_layout = _panel("Approval & safety gates", gate_pill)
-        self.gate_frame = QFrame()
-        self.gate_frame.setObjectName("gate")
-        box = QVBoxLayout(self.gate_frame)
-        self.gate_title = _label("", "gateTitle")
-        self.gate_body = _label("")
-        self.gate_context = _label("")
-        self.approve_button = QPushButton("Approve")
-        self.approve_button.setObjectName("primary")
-        self.reject_button = QPushButton("Reject")
-        self.reject_button.setObjectName("danger")
-        self.approve_button.clicked.connect(self.approve_requested)
-        self.reject_button.clicked.connect(self.reject_requested)
-        buttons = QHBoxLayout()
-        buttons.addWidget(self.approve_button)
-        buttons.addWidget(self.reject_button)
-        buttons.addStretch(1)
-        self.gate_status = _label("", "caption")
-        for widget in (self.gate_title, self.gate_body, self.gate_context):
-            box.addWidget(widget)
-        box.addLayout(buttons)
-        box.addWidget(self.gate_status)
-        gate_layout.addWidget(self.gate_frame)
-
-        feed_panel, feed_layout = _panel("Agent communication", _label("What is happening, in plain words", "muted", False))
+        # activity pane (right bottom): the stream, with a filter
+        self.filter = "all"
+        self.filter_group = QButtonGroup(self)
+        self.filter_buttons = {}
+        filters = QWidget()
+        fl = QHBoxLayout(filters)
+        fl.setContentsMargins(0, 0, 0, 0)
+        fl.setSpacing(0)
+        for key, text in FILTERS:
+            button = QPushButton(text.replace("&", "&&"))  # '&&' shows one ampersand (a lone '&' is a mnemonic)
+            button.setObjectName("segment")
+            button.setCheckable(True)
+            button.setFixedHeight(24)
+            button.setAccessibleName(f"Show {text}")
+            button.setProperty("filter_key", key)
+            self.filter_group.addButton(button)
+            fl.addWidget(button)
+            self.filter_buttons[key] = button
+        self.filter_buttons["all"].setChecked(True)
+        self.filter_group.buttonClicked.connect(self._filter_clicked)
+        feed_panel, feed_layout = _pane("Activity", filters)
         self.feed_box = QVBoxLayout()
-        self.feed_box.setSpacing(6)
-        feed_layout.addLayout(self.feed_box)
+        self.feed_box.setSpacing(4)
+        feed_body = QWidget()
+        feed_wrap = QVBoxLayout(feed_body)
+        feed_wrap.setContentsMargins(0, 0, 0, 0)
+        feed_wrap.addLayout(self.feed_box)
+        feed_wrap.addStretch(1)
+        self.feed_scroll = self._scroll(feed_body)
+        feed_layout.addWidget(self.feed_scroll, 1)
 
-        left, right = QVBoxLayout(), QVBoxLayout()
-        for panel in (topo_panel, phase_panel, roster_panel):
-            left.addWidget(panel)
-        left.addStretch(1)
-        for panel in (sel_panel, feed_panel):
-            right.addWidget(panel)
-        right.addStretch(1)
-        columns = QHBoxLayout()
-        columns.addLayout(left, 17)
-        columns.addLayout(right, 10)
+        # drawer: Phases | Roster
+        self.phase_text = _label("", "muted", False)
+        self.phases = _label("", rich=True)
+        phases_page = QWidget()
+        pl = QVBoxLayout(phases_page)
+        pl.setContentsMargins(12, 6, 12, 6)
+        pl.addWidget(self.phases)
+        pl.addStretch(1)
+        self.roster_grid = QGridLayout()
+        self.roster_grid.setSpacing(6)
+        self.roster_note = _label("", "caption")
+        roster_body = QWidget()
+        rl = QVBoxLayout(roster_body)
+        rl.setContentsMargins(12, 6, 12, 6)
+        rl.addLayout(self.roster_grid)
+        rl.addWidget(self.roster_note)
+        rl.addStretch(1)
+        self.roster_cards = {}
+        self.bottom_drawer = Drawer({"Phases": phases_page, "Roster": self._scroll(roster_body)})
 
-        content = QWidget()
-        content.setObjectName("controlCenter")
-        inner = QVBoxLayout(content)
-        inner.addLayout(header)
-        inner.addWidget(gate_panel)  # the decision card sits right under the header, full width: never pushed below the fold
-        inner.addLayout(tile_row)
-        inner.addLayout(columns)
+        right = QSplitter(Qt.Orientation.Vertical)
+        right.addWidget(sel_panel)
+        right.addWidget(feed_panel)
+        right.setSizes([38, 62])
+        right.setChildrenCollapsible(False)
+        self.right_split = right
+        main = QSplitter(Qt.Orientation.Horizontal)
+        main.addWidget(topo_panel)
+        main.addWidget(right)
+        main.setSizes([55, 45])
+        main.setChildrenCollapsible(False)
+        self.main_split = main
+        for splitter in (main, right):
+            splitter.setHandleWidth(1)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        for widget in (toolbar, hairline(), self.telemetry, hairline(), self.banner):
+            outer.addWidget(widget)
+        outer.addWidget(main, 1)
+        outer.addWidget(hairline())
+        outer.addWidget(self.bottom_drawer)
+        self.composer.prompt.setMinimumHeight(40)
+        self.composer.prompt.setMaximumHeight(72)
+        composer_frame = QFrame()
+        composer_frame.setObjectName("launchBar")
+        cl = QVBoxLayout(composer_frame)
+        cl.setContentsMargins(12, 6, 12, 6)
+        cl.addWidget(self.composer)
+        outer.addWidget(hairline())
+        outer.addWidget(composer_frame)
+        self.setMinimumSize(900, 520)
+
+    @staticmethod
+    def _scroll(widget: QWidget) -> QScrollArea:
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setWidget(content)
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(scroll, 1)
-        self.composer.prompt.setMinimumHeight(56)
-        self.composer.prompt.setMaximumHeight(72)  # a compact prompt box leaves the content area room for the gate card
-        composer_frame = QFrame()
-        composer_frame.setObjectName("panel")
-        QVBoxLayout(composer_frame).addWidget(self.composer)
-        outer.addWidget(composer_frame)
+        scroll.setWidget(widget)
+        return scroll
+
+    def set_repo_pill(self, text: str):
+        """Repository / branch shown beside the run state (client-side knowledge; the daemon's run data does not carry it)."""
+        text = narrative.clean(text, 60)
+        self.repo_pill.setText(text)
+        self.repo_pill.setVisible(bool(text))
+
+    def _switched(self, index: int):
+        if index == 1:
+            self.switcher.set_current(0)  # the window flips views; this page stays "Control Center" until it is shown again
+            self.developer_requested.emit()
+
+    def _filter_clicked(self, button):
+        self.filter = button.property("filter_key")
+        self.refresh_feed()
 
     # ---- data in --------------------------------------------------------------------------------
     def set_connection(self, text: str):
-        self.connection_pill.setText(narrative.clean(text, 60))
+        self.connection_text = narrative.clean(text, 60)
+        self.switcher.setToolTip(self.connection_text)
 
     def set_runs(self, runs):
         """Fill the run switcher from GET /api/v1/runs; the current run stays selectable even if it is not listed."""
@@ -401,7 +531,7 @@ class ControlCenter(QWidget):
                     if len(self._message_ids) > MAX_MESSAGE_IDS:
                         del self._message_ids[next(iter(self._message_ids))]
                 self._feed_add("m" + message["id"], (str(message.get("created_at") or ""),
-                                                     narrative.narrate_message(message, self._names), f"Message id: {message['id'][:64]}"))
+                                                     narrative.narrate_message(message, self._names), f"Message id: {message['id'][:64]}"), "other")
         self._trim_feed()
         self.refresh()
 
@@ -414,7 +544,7 @@ class ControlCenter(QWidget):
             if not isinstance(seq, str) or not seq:
                 return
         self._feed_add(f"e{seq}", (str(event.get("occurred_at") or ""), narrative.narrate_event(event, self._names),
-                                   f"Event {seq}: {narrative.clean(event.get('type'), 64)}"))
+                                   f"Event {seq}: {narrative.clean(event.get('type'), 64)}"), feed_kind(event))
         self._trim_feed()
         self.refresh_feed()
 
@@ -422,6 +552,7 @@ class ControlCenter(QWidget):
         if len(self._feed) > MAX_FEED_BUFFER:
             for key in sorted(self._feed, key=lambda k: stamp_key(self._feed[k][0]))[:len(self._feed) - MAX_FEED_BUFFER]:
                 del self._feed[key]
+                self._kinds.pop(key, None)
                 self._dropped[key] = None
                 if len(self._dropped) > MAX_DROPPED_KEYS:
                     del self._dropped[next(iter(self._dropped))]
@@ -431,9 +562,10 @@ class ControlCenter(QWidget):
         """Distinct feed rows not shown: trimmed from the buffer or older than the visible window; a re-delivered row counts once."""
         return self._dropped_forgotten + len(self._dropped) + max(0, len(self._feed) - MAX_FEED)
 
-    def _feed_add(self, key, value):
+    def _feed_add(self, key, value, kind="other"):
         self._dropped.pop(key, None)  # a trimmed row that came back (reconnect re-delivery) is in the buffer again
         self._feed[key] = value
+        self._kinds[key] = kind
 
     # ---- selection ------------------------------------------------------------------------------
     def _default_selection(self) -> str:
@@ -454,10 +586,7 @@ class ControlCenter(QWidget):
     def refresh(self):
         layout = self.layout_model
         self.gate = control_model.gate_for_run(self.rows, self.run_id) if self.run_id else control_model.gate_for_run([], "")
-        for (title, value, caption), (t, v, c) in zip(self.tiles, control_model.metrics(self.run, layout, self.message_count, self.rows)):
-            title.setText(t)
-            value.setText(v)
-            caption.setText(c)
+        self._render_telemetry()
         self.topology.empty_text = ("Pick a run above, or start a new one" if self.run_combo.count() and self.run_combo.itemData(0) is not None
                                     and not self.run_id else ("Loading run…" if self.run_id and self.run is None
                                     else ("This run has no steps yet" if self.run_id else "No runs yet — start one")))
@@ -472,18 +601,32 @@ class ControlCenter(QWidget):
         self._render_gate()
         self.refresh_feed()
 
+    def _render_telemetry(self):
+        self.metric_rows = control_model.metrics(self.run, self.layout_model, self.message_count, self.rows)
+        status, agents, steps, messages, _gate = self.metric_rows
+        state = (self.run or {}).get("state") if self.run else None
+        pending = sum(1 for r in control_model.run_approvals(self.rows, self.run_id) if r.get("state") == "requested") if self.run_id else 0
+        tone = "waiting" if self.gate.state == "pending" else RUN_TONE.get(str(state), "idle" if not self.run else "running")
+        label = "Checks" if steps[0] == "Checks passed" else "Steps"
+        self.telemetry.set_values(status[1], agents[1].replace(" ", ""), f"{label}: {steps[1].replace(' ', '')}", messages[1], pending, tone)
+        self.state_icon.setPixmap(icons.state_icon(tone).pixmap(icons.SIZE, icons.SIZE))
+        self.state_badge.setText(status[1] if self.run else "No run")
+        self.state_icon.setVisible(bool(self.run))
+        self.state_icon.setAccessibleName("")
+
     def _render_phases(self):
         layout = self.layout_model
-        colors = {"complete": self.p["green"], "active": self.p["cyan"], "blocked": self.p["red"], "pending": self.p["muted"]}
-        marks = {"complete": "✓", "active": "▶", "blocked": "⚠", "pending": ""}
+        colors = {"complete": self.p["done"], "active": self.p["running"], "blocked": self.p["failed"], "pending": self.p["text_secondary"]}
+        words = {"complete": "complete", "active": "active", "blocked": "blocked", "pending": "pending"}
         spans = []
         for phase in layout.phases:
             names = ", ".join(layout.nodes[i].name for i in phase.task_ids[:3]) + (" +%d" % (len(phase.task_ids) - 3) if len(phase.task_ids) > 3 else "")
-            spans.append(f"<span style='color:{colors[phase.status]}'>[{marks[phase.status]} {phase.index + 1} · {escape(names)}]</span>".replace("[ ", "["))
-        self.phases.setText("&nbsp; ".join(spans) if spans else "Phases appear once a run has steps.")
+            spans.append(f"<span style='color:{colors[phase.status]}'>Phase {phase.index + 1} ({words[phase.status]}): {escape(names)}</span>")
+        self.phases.setText("<br>".join(spans) if spans else "Phases appear once a run has steps.")
         active = next((p for p in layout.phases if p.status in ("active", "blocked")), None)
         self.phase_text.setText(f"{active.label} of {len(layout.phases)}" if active else
                                 ("All steps complete" if layout.phases and all(p.status == "complete" for p in layout.phases) else "Awaiting task"))
+        self.bottom_drawer.summary.setText(self.phase_text.text())
 
     def _render_roster(self):
         layout = self.layout_model
@@ -505,17 +648,23 @@ class ControlCenter(QWidget):
             card.setCursor(Qt.CursorShape.PointingHandCursor)
             card.setToolTip(narrative.safe_tip(f"{node.name}: {narrative.task_sentence(node.state)}"))
             box = QVBoxLayout(card)
-            name = _label(f"<b>{escape(node.name)}</b> <span style='color:{self.p[theme.TONES[node.tone]]}'>● {escape(node.badge.title())}</span>",
-                          wrap=True, rich=True)
+            head = QHBoxLayout()
+            icon = QLabel()
+            icon.setPixmap(icons.state_icon(node.tone if node.tone in theme.STATES else "idle").pixmap(icons.SIZE, icons.SIZE))
+            icon.setAccessibleName("")
+            name = _label(f"<b>{escape(node.name)}</b> {escape(node.badge.title())}", wrap=True, rich=True)
+            head.addWidget(icon)
+            head.addWidget(name, 1)
             detail = _label(f"Step {node.phase + 1} · {narrative.task_sentence(node.state)}", "caption")
             bar = QProgressBar()
             bar.setRange(0, 100)
             bar.setValue(node.progress)
             bar.setTextVisible(False)
-            for widget in (name, detail, bar):
+            box.addLayout(head)
+            for widget in (detail, bar):
                 box.addWidget(widget)
             card.picked.connect(self.select)
-            self.roster_grid.addWidget(card, position // 2, position % 2)
+            self.roster_grid.addWidget(card, position // 4, position % 4)
             self.roster_cards[task_id] = card
         self.roster_note.setText(
             ("Progress bars reflect each step's state, not a measured percentage. " if layout.order else "")
@@ -527,12 +676,14 @@ class ControlCenter(QWidget):
         if node is None:
             self.sel_name.setText("Nothing selected")
             self.selected_pill.setText("Idle")
+            self.selected_icon.setPixmap(icons.state_icon("idle").pixmap(icons.SIZE, icons.SIZE))
             self.sel_state.setText("Select a step in the topology or roster to see what it does.")
             for label in (self.sel_links, self.sel_summary, self.sel_changes):
                 label.setText("")
             return
         self.sel_name.setText(node.name)
         self.selected_pill.setText(node.badge.title())
+        self.selected_icon.setPixmap(icons.state_icon(node.tone if node.tone in theme.STATES else "idle").pixmap(icons.SIZE, icons.SIZE))
         self.sel_state.setText(f"<b>Current state:</b> this step {narrative.task_sentence(node.state)}."
                                + (f" It has been tried {node.attempts} times." if node.attempts > 1 else ""))
         waits = ", ".join(node.waits_for) or "nothing (it starts the run)"
@@ -550,10 +701,21 @@ class ControlCenter(QWidget):
 
     def _render_gate(self):
         gate = self.gate
-        self.gate_title.setText({"pending": "⏳ ", "approved": "✓ ", "rejected": "✗ ", "expired": "⌛ ", "none": "\U0001f512 "}.get(gate.state, "") + gate.title)
+        self.gate_title.setText(gate.title)
         self.gate_body.setText(gate.body)
+        self.banner.setToolTip(narrative.safe_tip(gate.body))
+        row = gate.row or {}
+        agent = narrative.clean(row.get("agent_id") or row.get("requested_by") or row.get("principal"), 60)
+        operation = narrative.clean(row.get("operation"), 60)
+        target = narrative.clean(row.get("target"), 120)
+        self.gate_payload.setText(f"{operation} {target}".strip() if gate.decidable else "")
+        self.gate_payload.setVisible(bool(self.gate_payload.text()))
+        self.banner.icon.setPixmap(icons.state_icon({"pending": "waiting", "approved": "done", "rejected": "failed", "expired": "failed"}.get(gate.state, "idle")).pixmap(icons.SIZE, icons.SIZE))
+        self.banner.inspect.setVisible(gate.decidable)
+        self.banner.approve.setVisible(gate.decidable)
+        self.banner.reject.setVisible(gate.decidable)
         stat = narrative.clean(((self.detail or {}).get("worktree") or {}).get("diff_stat"), 300)
-        self.gate_context.setText(f"What the agent changed so far: {stat}\nYou will see the full changes before you decide." if gate.decidable and stat else "")
+        self.gate_context.setText(f"What the agent changed so far: {stat}" if gate.decidable and stat else "")
         self.gate_context.setVisible(bool(self.gate_context.text()))
         self.approve_button.setEnabled(gate.decidable)
         self.reject_button.setEnabled(gate.decidable)
@@ -562,11 +724,15 @@ class ControlCenter(QWidget):
         default = {"none": "Locked until an agent asks.", "pending": "Waiting for you.", "approved": "Decision recorded: approved.",
                    "rejected": "Decision recorded: rejected.", "expired": "Expired: treated as not approved."}.get(gate.state, "")
         self.gate_status.setText(self._note or default)
+        self.gate_status.setVisible(bool(self._note))
+        self.banner.show_for(gate.decidable or bool(self._note))
 
     def refresh_feed(self):
-        entries = sorted(self._feed.values(), key=lambda e: stamp_key(e[0]), reverse=True)[:MAX_FEED]
+        wanted = {"all": None, "decisions": ("decision", "tool"), "errors": ("error",)}[self.filter]
+        pairs = [(k, v) for k, v in self._feed.items() if wanted is None or self._kinds.get(k, "other") in wanted]
+        entries = [v for _k, v in sorted(pairs, key=lambda kv: stamp_key(kv[1][0]), reverse=True)][:MAX_FEED]
         dropped = self.dropped_count()
-        signature = (tuple(entries), dropped)
+        signature = (tuple(entries), dropped, self.filter)
         if signature == self._feed_sig:
             return
         self._feed_sig = signature
@@ -576,16 +742,19 @@ class ControlCenter(QWidget):
                 widget.setParent(None)
                 widget.deleteLater()
         if not entries:
-            self.feed_box.addWidget(_label("Nothing has happened yet. Start or select a run to see what the agents are doing.", "muted"))
+            self.feed_box.addWidget(_label("Nothing has happened yet. Start or select a run to see what the agents are doing."
+                                           if self.filter == "all" and not self._feed else "Nothing matches this filter.", "muted"))
             return
         for stamp, text, tip in entries:
             frame = QFrame()
             frame.setObjectName("message")
             frame.setToolTip(narrative.safe_tip(tip))
-            box = QVBoxLayout(frame)
-            box.setContentsMargins(8, 5, 8, 5)
-            box.addWidget(_label(fmt_time(stamp), "caption", False))
-            box.addWidget(_label(text))
+            box = QHBoxLayout(frame)
+            box.setContentsMargins(8, 4, 8, 4)
+            stamp_label = _label(fmt_time(stamp), "mono", False)
+            stamp_label.setFont(theme.mono_font())
+            box.addWidget(stamp_label, 0, Qt.AlignmentFlag.AlignTop)
+            box.addWidget(_label(text), 1)
             self.feed_box.addWidget(frame)
         if dropped:
             self.feed_box.addWidget(_label(f"{dropped} older update{'s' if dropped != 1 else ''} not shown.", "muted"))

@@ -19,6 +19,7 @@ from synapse.desktop.control_model import NODE_H, NODE_W, GraphLayout
 MARGIN = 24
 MIN_HEIGHT = 260
 MAX_FIT_HEIGHT = 560
+ZOOM_MIN, ZOOM_MAX, ZOOM_STEP = 0.4, 3.0, 1.25
 FRAME_MS = 50
 EMPTY_TEXT = "No runs yet — start one"
 
@@ -149,6 +150,8 @@ class TopologyView(QGraphicsView):
         self.selected_id = ""
         self.empty_text = EMPTY_TEXT
         self.motion = not theme.reduced_motion()
+        self.fill = False  # True inside a split pane: take the pane's height instead of asking for one
+        self.zoom = 1.0  # relative to the fitted scale; 1.0 is "Fit"
         self._timer = QTimer(self)
         self._timer.setInterval(FRAME_MS)
         self._timer.timeout.connect(self._tick)
@@ -220,6 +223,19 @@ class TopologyView(QGraphicsView):
         super().hideEvent(event)
 
     # -- geometry --------------------------------------------------------------------------------
+    def set_zoom(self, zoom: float):
+        self.zoom = max(ZOOM_MIN, min(ZOOM_MAX, zoom))
+        self._refit()
+
+    def zoom_in(self):
+        self.set_zoom(self.zoom * ZOOM_STEP)
+
+    def zoom_out(self):
+        self.set_zoom(self.zoom / ZOOM_STEP)
+
+    def reset_zoom(self):
+        self.set_zoom(1.0)
+
     def _refit(self):
         self.resetTransform()
         if not self.layout_model.nodes:
@@ -229,8 +245,11 @@ class TopologyView(QGraphicsView):
         if view.width() < 50 or view.height() < 50:
             return
         scale = min(1.0, view.width() / rect.width(), view.height() / rect.height())
-        scale = max(scale, 0.55)  # beyond this, scroll instead of shrinking cards to illegibility
-        self._fit_height(rect, view.width())
+        if self.fill:
+            scale = max(scale, 0.3) * self.zoom
+        else:
+            scale = max(scale, 0.55) * self.zoom  # beyond this, scroll instead of shrinking cards to illegibility
+            self._fit_height(rect, view.width())
         self.scale(scale, scale)
         self.centerOn(rect.center().x(), rect.top() if rect.height() * scale > view.height() else rect.center().y())
 
