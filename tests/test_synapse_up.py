@@ -118,6 +118,7 @@ def fake_env(tmp_path, monkeypatch):
     """`up` without starting anything: the daemon reports healthy, no desktop, claude is a dummy file."""
     state = tmp_path / "state"
     monkeypatch.setenv("SYNAPSE_STATE", str(state))
+    monkeypatch.setenv("SYNAPSE_DEFAULT_REPOS", str(tmp_path / "no-default-repos"))  # never the real file
     exe = make_exe(tmp_path / "opt" / "claude")
     monkeypatch.setattr(up, "find_claude", lambda env=None: exe)
     monkeypatch.setattr(up, "alive", lambda pidfile: True)
@@ -231,3 +232,25 @@ def test_start_hint_has_required_flags_and_no_hardcoded_base_ref():
     src = (Path(__file__).resolve().parent.parent / "scripts" / "synapse_up.py").read_text()
     assert "--base-ref BASE_REF" in src and "--base-ref main" not in src
     assert "--idempotency-key" in src and "--correlation-id" in src
+
+
+def test_up_without_a_repo_registers_the_default_repositories(workspace_dir, fake_env, tmp_path, monkeypatch, capsys):
+    listing = tmp_path / "defaults"
+    listing.write_text("# my repos\n%s\n\n%s\n" % (workspace_dir / "api", workspace_dir))
+    monkeypatch.setenv("SYNAPSE_DEFAULT_REPOS", str(listing))
+    assert up.main(["up", str(workspace_dir / "api"), "--repo", "api"]) == 1  # a REPO or --repo still excludes the defaults
+    assert up.main(["up", "--no-desktop", "--dry-run"]) == 1  # api is nested in the workspace repo: refused like any other nesting
+    listing.write_text("# my repos\n%s\n" % (workspace_dir / "api"))
+    assert up.main(["up", "--no-desktop"]) == 0
+    data = json.loads((fake_env / "agent.json").read_text())
+    assert data["repos"] == [str(workspace_dir / "api")] and data["sandbox"] is True
+
+
+def test_default_repositories_need_a_private_list_of_absolute_git_paths(workspace_dir, fake_env, tmp_path, monkeypatch):
+    listing = tmp_path / "defaults"
+    monkeypatch.setenv("SYNAPSE_DEFAULT_REPOS", str(listing))
+    assert up.main(["up", "--no-desktop"]) == 1  # no file
+    for text in ("", "# only a comment\n", "relative/path\n", str(tmp_path / "not-a-repo") + "\n"):
+        listing.write_text(text)
+        assert up.main(["up", "--no-desktop"]) == 1
+    assert not fake_env.exists()
