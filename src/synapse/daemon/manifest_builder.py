@@ -13,8 +13,10 @@ Built by the daemon on an operator request (or a workflow node), never by an age
    baseline and the diff bytes must hash to ``diff_sha256``.
 4. Publish the diffs and the canonical manifest as immutable artifacts, then index it in ``candidate_manifests``.
 
-``recheck`` repeats 1 and 3 for an existing manifest (deploy approval request, decision, before deploy) and records
-``candidate_invalid`` when the candidate no longer passes. A git failure that proves nothing (git missing, timeout)
+Step 1 runs again after publishing and before the row is indexed, so a baseline that moves during a build refuses
+it. ``recheck`` repeats 1 and 3 for an existing manifest and records ``candidate_invalid`` when the candidate no
+longer passes. It runs when a deploy approval is requested (``request_manifest_approval``) and MUST run in the
+deploy pre-check (D9 step 2); the approval decision does NOT call it and refuses only on recorded invalidations. A git failure that proves nothing (git missing, timeout)
 refuses without invalidating. Everything here is blocking (git) and must run off the event loop.
 """
 from __future__ import annotations
@@ -246,6 +248,9 @@ class ManifestBuilder:
             if entry.repo_id in diffs:
                 self._publish_diff(manifest, entry, diffs[entry.repo_id])
         published = publish_manifest_v2(self.db, self.blobs, manifest, self.principal, "manifest-v2:" + digest)
+        # Close the build race: a baseline that moved while the candidates were verified and published must not
+        # yield a fresh manifest row (the 0019 trigger only stops it once an earlier manifest recorded the move).
+        check_baselines(self.db, self.manager, run_id, actor=self.principal)
         existing = store.load_manifest(self.db, digest)
         self.db.execute("BEGIN IMMEDIATE")
         try:
@@ -265,13 +270,19 @@ class ManifestBuilder:
                 "invalidated": store.invalidations(self.db, digest), "replayed": existing is not None}
 
     def _publish_diff(self, manifest: ManifestV2, entry: RepoEntry, diff: bytes) -> None:
-        result = publish_artifact(
-            self.db, self.blobs, chunks=[diff],
-            artifact_id=_artifact_id(DIFF_PROVENANCE_KIND, manifest.run_id, "diff-v2:%s" % entry.diff_sha256),
-            media_type="text/x-diff",
-            provenance={"kind": DIFF_PROVENANCE_KIND, "run_id": manifest.run_id, "repo_id": entry.repo_id,
-                        "baseline_sha": entry.baseline_sha, "candidate_sha": entry.candidate_sha},
-            principal=self.principal, idempotency_key="diff-v2:%s" % entry.diff_sha256)
+        # Scoped per run and repository: the same diff bytes in another run or repository is a different artifact
+        # (its provenance differs), never an idempotency conflict.
+        key = "diff-v2:%s:%s:%s" % (manifest.run_id, entry.repo_id, entry.diff_sha256)
+        try:
+            result = publish_artifact(
+                self.db, self.blobs, chunks=[diff],
+                artifact_id=_artifact_id(DIFF_PROVENANCE_KIND, manifest.run_id, key),
+                media_type="text/x-diff",
+                provenance={"kind": DIFF_PROVENANCE_KIND, "run_id": manifest.run_id, "repo_id": entry.repo_id,
+                            "baseline_sha": entry.baseline_sha, "candidate_sha": entry.candidate_sha},
+                principal=self.principal, idempotency_key=key)
+        except Exception:
+            raise ManifestRefused("artifact_publish_failed", "diff") from None  # fixed code, no store detail
         if result.response["sha256"] != entry.diff_sha256:
             raise ManifestRefused("candidate_invalid", "diff_mismatch")
 
@@ -286,9 +297,10 @@ class ManifestBuilder:
             raise ManifestRefused("candidate_invalid", "artifact_corrupt") from None
 
     def recheck(self, manifest_sha256: str, *, run_id: str | None = None) -> ManifestV2:
-        """Before a deploy approval is requested or decided, and before a deploy (D2 + D9): refuse an invalidated
-        manifest, re-run D2 (records ``baseline_moved``) and ``verify_manifest_candidates`` (a refusal records
-        ``candidate_invalid``; an unverifiable candidate is refused without a record)."""
+        """Before a deploy approval is requested, and (mandatory) in the deploy pre-check, D9 step 2: refuse an
+        invalidated manifest, re-run D2 (records ``baseline_moved``) and ``verify_manifest_candidates`` (a refusal
+        records ``candidate_invalid``; an unverifiable candidate is refused without a record). The approval decision
+        does not call this; it refuses only on invalidations already recorded."""
         manifest = self.load(manifest_sha256, run_id=run_id)
         if store.invalidations(self.db, manifest_sha256):
             raise ManifestRefused("manifest_invalidated")

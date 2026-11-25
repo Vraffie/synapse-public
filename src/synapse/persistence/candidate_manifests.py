@@ -3,7 +3,7 @@
 * ``candidate_manifests``: one insert-only row per v2 manifest of a multi-repository run, pointing at the immutable
   artifact that holds its canonical bytes. Triggers refuse a row whose artifact is not a v2 candidate manifest of
   the same run with the manifest hash as content address, a run without bindings or with other bindings, a seq out
-  of order, and any new manifest once the run's baselines moved.
+  of order, and any new manifest once one of the run's manifests carries a ``baseline_moved`` invalidation.
 * ``candidate_manifest_invalidations``: insert-only; a manifest with any row here can never again be approved (a
   trigger refuses the approval transition) or bound by a new approval request.
 
@@ -94,13 +94,13 @@ def invalidations(db: sqlite3.Connection, manifest_sha256: str) -> list[str]:
                                      "ORDER BY seq", (manifest_sha256,))]
 
 
-def is_invalidated(db: sqlite3.Connection, run_id: str, manifest_sha256: str) -> bool:
-    """True if ``manifest_sha256`` is a manifest of ``run_id`` with an invalidation row. Not a manifest: False."""
+def is_invalidated(db: sqlite3.Connection, manifest_sha256: str) -> bool:
+    """True if ``manifest_sha256`` has any invalidation row, whatever run asks (matched by manifest hash only, so an
+    approval row naming another run cannot hide an invalidation). No such row, or a pre-0019 database: False."""
     if not tables_present(db):
         return False
-    return db.execute("SELECT 1 FROM candidate_manifests m JOIN candidate_manifest_invalidations i "
-                      "ON i.manifest_sha256=m.manifest_sha256 WHERE m.manifest_sha256=? AND m.run_id=? LIMIT 1",
-                      (manifest_sha256, run_id)).fetchone() is not None
+    return db.execute("SELECT 1 FROM candidate_manifest_invalidations WHERE manifest_sha256=? LIMIT 1",
+                      (manifest_sha256,)).fetchone() is not None
 
 
 def baseline_moved(db: sqlite3.Connection, run_id: str) -> bool:

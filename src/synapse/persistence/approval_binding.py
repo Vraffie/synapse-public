@@ -156,7 +156,7 @@ def verify_approval_for_execution(connection: sqlite3.Connection, *, approval_id
             "expires_at,decided_at,decision_principal,requester_subject "
             "FROM approval_requests WHERE id=?", (approval_id,)
         ).fetchone()
-        invalidated = row is not None and is_manifest_invalidated(connection, row[0], row[3])
+        invalidated = row is not None and is_manifest_invalidated(connection, row[3])
     finally:
         connection.execute("COMMIT")
     if row is None:

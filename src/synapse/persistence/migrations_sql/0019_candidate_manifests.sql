@@ -36,6 +36,8 @@ WHEN NOT EXISTS (SELECT 1 FROM artifacts a WHERE a.id = NEW.artifact_id AND a.sh
   OR NEW.seq <> 1 + COALESCE((SELECT max(seq) FROM candidate_manifests WHERE run_id = NEW.run_id), 0)
 BEGIN SELECT RAISE(ABORT, 'invalid candidate manifest'); END;
 -- Baseline moved => the run is done producing manifests (owner decision): nothing is rebased, a new run starts.
+-- Exactly: refused once any manifest of the run has a 'baseline_moved' row. A run with no manifest yet has nothing
+-- to record; the builder's D2 check refuses it while the ref differs from the pinned SHA.
 CREATE TRIGGER candidate_manifests_baseline_moved BEFORE INSERT ON candidate_manifests
 WHEN EXISTS (SELECT 1 FROM candidate_manifest_invalidations i JOIN candidate_manifests m
              ON m.manifest_sha256 = i.manifest_sha256 WHERE m.run_id = NEW.run_id AND i.reason = 'baseline_moved')
@@ -65,7 +67,9 @@ BEGIN SELECT RAISE(ABORT, 'candidate manifest invalidations are insert-only'); E
 --    a 'deploy' approval may take; or
 --  * the agent_run_multi spawn gate: the approval_step (operation, target, policy_version, candidate_sha256 = the
 --    full spec hash, which covers bindings_sha256) recorded for a multi-repository task in the run's
---    agent.tasks_configured event. Never for operation 'deploy'.
+--    agent.tasks_configured event. Allowlisted: only operation 'agent.run' (MULTI_REPO_SPAWN_OPERATION in
+--    synapse.persistence.agent_tasks, which also refuses any other operation in a multi-repository approval_step;
+--    a test keeps the two in step), so no deploy-like name ('DEPLOY', 'deploy:DEV', ...) can use this branch.
 CREATE TRIGGER approval_multi_repo_binding BEFORE INSERT ON approval_requests
 WHEN EXISTS (SELECT 1 FROM run_repo_bindings WHERE run_id = NEW.run_id)
  AND NOT (
@@ -73,7 +77,7 @@ WHEN EXISTS (SELECT 1 FROM run_repo_bindings WHERE run_id = NEW.run_id)
             AND m.run_id = NEW.run_id)
     AND NOT EXISTS (SELECT 1 FROM candidate_manifest_invalidations i
                     WHERE i.manifest_sha256 = NEW.candidate_manifest_sha256))
-   OR (NEW.operation <> 'deploy'
+   OR (NEW.operation = 'agent.run'
        AND EXISTS (SELECT 1 FROM events e, json_each(e.payload_json, '$.tasks') t
                    WHERE e.run_id = NEW.run_id AND e.type = 'agent.tasks_configured' AND json_valid(e.payload_json)
                    AND json_type(t.value, '$.repos') = 'array'
@@ -82,10 +86,9 @@ WHEN EXISTS (SELECT 1 FROM run_repo_bindings WHERE run_id = NEW.run_id)
                    AND json_extract(t.value, '$.approval_step.target') = NEW.target
                    AND json_extract(t.value, '$.approval_step.policy_version') = NEW.policy_version)))
 BEGIN SELECT RAISE(ABORT, 'multi-repository approval must bind a live candidate manifest of the run'); END;
--- Decision backstop: an approval bound to an invalidated manifest of its run can never become approved.
+-- Decision backstop: an approval bound to an invalidated manifest can never become approved. Matched by manifest hash
+-- only (not joined on the approval's run), so no run_id on the approval row can hide an invalidation.
 CREATE TRIGGER approval_manifest_invalidated BEFORE UPDATE OF state ON approval_requests
 WHEN NEW.state = 'approved'
- AND EXISTS (SELECT 1 FROM candidate_manifests m JOIN candidate_manifest_invalidations i
-             ON i.manifest_sha256 = m.manifest_sha256
-             WHERE m.manifest_sha256 = OLD.candidate_manifest_sha256 AND m.run_id = OLD.run_id)
+ AND EXISTS (SELECT 1 FROM candidate_manifest_invalidations i WHERE i.manifest_sha256 = OLD.candidate_manifest_sha256)
 BEGIN SELECT RAISE(ABORT, 'manifest_invalidated'); END;

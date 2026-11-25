@@ -51,6 +51,10 @@ class AgentSpecError(ValueError):
 # carries the run's ``bindings_sha256`` so the full-spec hash (what an approval binds) covers the declared
 # repositories, their access modes AND their pinned baselines.
 MAX_SPEC_REPOS = 16
+# The only operation a multi-repository spawn-gate approval_step may name. Migration 0019's approval_multi_repo_binding
+# trigger allowlists exactly this string for its spawn-gate branch (a test keeps the two in step), so a deploy-like
+# operation can only ever bind a live candidate manifest.
+MULTI_REPO_SPAWN_OPERATION = "agent.run"
 _REPO_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _MULTI_SPEC_KEYS = {"prompt", "allowed_tools", "permission_mode", "timeout_seconds", "repos", "profile_id"}
 _MULTI_REQUIRED = {"prompt", "allowed_tools", "permission_mode", "timeout_seconds", "repos"}
@@ -224,6 +228,8 @@ def _approval_step(node: str, spec: dict[str, Any], recorded: dict[str, Any]) ->
     raw_step = spec["approval_step"]
     if not isinstance(raw_step, dict) or not {"operation", "target", "policy_version"} <= set(raw_step) <= _STEP_INPUT_KEYS:
         raise AgentSpecError("approval_step has missing or unknown fields")
+    if "repos" in recorded and raw_step["operation"] != MULTI_REPO_SPAWN_OPERATION:
+        raise AgentSpecError("a multi-repository approval_step operation must be %r" % MULTI_REPO_SPAWN_OPERATION)
     try:
         # The approval binds the WHOLE spec: candidate_sha256 is the full-spec hash.
         return ms.parse_approval_steps({node: {**raw_step, "candidate_sha256": spec_hash(recorded)}})[node]
@@ -302,6 +308,7 @@ def _check_shape(node: str, spec: Any) -> None:
     if "repos" in spec:
         step = spec["approval_step"]
         if step is not None and (ms.parse_approval_steps({node: step}) != {node: step}
+                                 or step["operation"] != MULTI_REPO_SPAWN_OPERATION
                                  or step["candidate_sha256"] != spec_hash(spec)):
             raise ValueError("bad approval step")
         return

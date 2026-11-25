@@ -200,7 +200,7 @@ class ApprovalService:
             def write(db):
                 if _timestamp(row[5]) <= datetime.now(timezone.utc):
                     raise StateConflict("Approval expired")
-                if decision == "approved" and is_manifest_invalidated(db, row[0], row[3]):
+                if decision == "approved" and is_manifest_invalidated(db, row[3]):
                     # ADR 026 D9: an invalidated candidate manifest can never be approved (a 0019 trigger agrees).
                     raise StateConflict("manifest_invalidated")
                 change = ApprovalChange(ApprovalId(approval_id), ApprovalState.REQUESTED, ApprovalState(decision), expected_version)

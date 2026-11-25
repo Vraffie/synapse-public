@@ -391,3 +391,201 @@ def test_migration_0019_upgrade_from_0018_keeps_data(tmp_path):
         assert [r[1] for r in db.execute("PRAGMA table_info(approval_requests)")] == before  # shape unchanged
     finally:
         db.close()
+
+
+# ------------------------------------------------------------------- security review regressions (manifest v2)
+def _move_main(w, text="<moved/>\n"):
+    (w.tmp / "repos" / "portfolio" / "config.xml").write_text(text)
+    git(w.repos["portfolio"], "commit", "-qam", "owner moves main")
+
+
+def test_baseline_moving_during_a_build_refuses_it(built, monkeypatch):
+    # the race: D2 passed, then the ref moved while the candidates were verified and published
+    w = built
+    real = mb.publish_manifest_v2
+
+    def publish_then_move(*a, **kw):
+        result = real(*a, **kw)
+        _move_main(w)
+        return result
+    monkeypatch.setattr(mb, "publish_manifest_v2", publish_then_move)
+    with pytest.raises(ManifestRefused) as e:
+        w.builder.build(w.run_id)
+    assert e.value.code == "baseline_moved"
+    assert store.run_manifests(w.db, w.run_id) == []  # no row indexed for the moved baseline
+
+
+def test_baseline_moving_during_a_rebuild_invalidates_the_existing_manifest(built, monkeypatch):
+    w = built
+    sha = w.builder.build(w.run_id)["manifest_sha256"]
+    real = mb.publish_manifest_v2
+
+    def publish_then_move(*a, **kw):
+        result = real(*a, **kw)
+        _move_main(w)
+        return result
+    monkeypatch.setattr(mb, "publish_manifest_v2", publish_then_move)
+    with pytest.raises(ManifestRefused, match="baseline_moved"):
+        w.builder.build(w.run_id)
+    assert store.invalidations(w.db, sha) == ["baseline_moved"]
+
+
+def test_baseline_moved_before_any_manifest_records_nothing(built):
+    # documented exactly: with no manifest yet there is nothing to invalidate; builds refuse while the ref differs,
+    # and a ref moved back to exactly the pinned SHA builds the manifest of the pinned baseline
+    w = built
+    pinned = head(w.repos["portfolio"], "main")
+    _move_main(w)
+    for _ in range(2):
+        with pytest.raises(ManifestRefused, match="baseline_moved"):
+            w.builder.build(w.run_id)
+    assert store.run_manifests(w.db, w.run_id) == []
+    git(w.repos["portfolio"], "reset", "-q", "--hard", pinned)
+    out = w.builder.build(w.run_id)
+    assert out["seq"] == 1 and w.builder.load(out["manifest_sha256"]).repos[0].baseline_sha == pinned
+
+
+def test_decision_refuses_only_recorded_invalidations_and_the_deploy_precheck_catches_a_move(built):
+    # documented behaviour: the decision runs no git; the mandatory deploy pre-check (recheck) does
+    w = built
+    sha = w.builder.build(w.run_id)["manifest_sha256"]
+    aid = request_manifest_approval(w.builder, DaemonApprovalRequester(w.db), manifest_sha256=sha, operation="deploy",
+                                   target="DEV", policy_version="1", idempotency_key="k1",
+                                   correlation_id="c").response["approval_id"]
+    _move_main(w)
+    assert _decide(w.db, sha, aid).response["state"] == "approved"  # nothing recorded the move yet
+    args = dict(approval_id=aid, run_id=w.run_id, operation="deploy", target="DEV", candidate_sha256=sha,
+                policy_version="1")
+    with pytest.raises(ManifestRefused, match="baseline_moved"):
+        w.builder.recheck(sha, run_id=w.run_id)  # D9 pre-check step 2
+    with pytest.raises(ApprovalNotGranted) as e:
+        verify_approval_for_execution(w.db, **args)
+    assert e.value.reason is DenialReason.MANIFEST_INVALIDATED
+
+
+def test_same_diff_in_two_runs_publishes_two_scoped_artifacts(built):
+    w = built
+    first = w.builder.build(w.run_id)
+    run2 = w.start(w.request([w.task(prompt=PROMPT)]), key="k2").response["run_id"]
+    assert run2 != w.run_id
+    second = ManifestBuilder(w.db, w.runtime.blobs, w.manager).build(run2)
+    m1, m2 = w.builder.load(first["manifest_sha256"]), w.builder.load(second["manifest_sha256"])
+    d1 = {r.repo_id: r.diff_sha256 for r in m1.repos if r.access == "write"}
+    assert d1 == {r.repo_id: r.diff_sha256 for r in m2.repos if r.access == "write"}  # same diff bytes
+    rows = w.db.execute("SELECT json_extract(provenance_json,'$.run_id'), json_extract(provenance_json,'$.repo_id') "
+                        "FROM artifacts WHERE json_extract(provenance_json,'$.kind')=?",
+                        (v1.DIFF_PROVENANCE_KIND,)).fetchall()
+    assert sorted(rows) == sorted((r, rid) for r in (w.run_id, run2) for rid in d1)
+    assert w.builder.build(run2)["replayed"] is True  # still idempotent per run
+
+
+def test_unexpected_diff_publish_error_is_a_fixed_refusal(built, monkeypatch):
+    w = built
+
+    def boom(*a, **kw):
+        raise RuntimeError("/secret/path leaked by the store")
+    monkeypatch.setattr(mb, "publish_artifact", boom)
+    with pytest.raises(ManifestRefused) as e:
+        w.builder.build(w.run_id)
+    assert (e.value.code, e.value.detail) == ("artifact_publish_failed", "diff") and "secret" not in str(e.value)
+    assert store.run_manifests(w.db, w.run_id) == []
+
+
+def test_diff_too_large_is_refused_at_build_and_at_verify(built):
+    w = built
+    with pytest.raises(ManifestRefused) as e:
+        mb.collect_manifest(w.db, w.manager, w.run_id, max_diff_bytes=16)
+    assert (e.value.code, e.value.detail) == ("candidate_invalid", "diff_too_large")
+    manifest = w.builder.load(w.builder.build(w.run_id)["manifest_sha256"])
+    with pytest.raises(ManifestRefused) as e:
+        mb.verify_manifest_candidates(w.db, w.manager, manifest, max_diff_bytes=16)
+    assert (e.value.code, e.value.detail) == ("candidate_invalid", "diff_too_large")
+
+
+def test_invalidation_is_matched_by_manifest_hash_not_by_the_approvals_run(built):
+    w = built
+    sha = w.builder.build(w.run_id)["manifest_sha256"]
+    w.builder.invalidate(sha, "operator", actor="owner")
+    # a legacy (single-repository) run can bind any candidate hash; naming the invalidated manifest must not help
+    w.db.execute("INSERT INTO workflow_versions VALUES('wf-legacy','1','{}','hash','now')")
+    w.db.execute("INSERT INTO runs VALUES('legacy','wf-legacy','1','created',0,'now','now')")
+    aid = DaemonApprovalRequester(w.db).request_approval(
+        run_id="legacy", operation="deploy", target="DEV", candidate_sha256=sha, policy_version="1",
+        expires_at=_expiry(), idempotency_key="legacy-1", correlation_id="c").response["approval_id"]
+    assert store.is_invalidated(w.db, sha) is True and store.is_invalidated(w.db, "9" * 64) is False
+    with pytest.raises(StateConflict, match="manifest_invalidated"):
+        _decide(w.db, sha, aid)
+    with pytest.raises(sqlite3.DatabaseError, match="manifest_invalidated"):
+        w.db.execute("UPDATE approval_requests SET state='approved',state_version=1 WHERE id=?", (aid,))
+
+
+def _spawn_gate_event(w, step, n):
+    payload = {"tasks": [{"repos": [{"repo_id": "portfolio", "access": "write"}], "approval_step": step}]}
+    w.db.execute("INSERT INTO events(id,aggregate_type,aggregate_id,run_id,type,schema_version,payload_json,"
+                 "occurred_at) VALUES(?,?,?,?,?,1,?,'now')",
+                 ("ev-gate-%d" % n, "run", w.run_id, w.run_id, "agent.tasks_configured", json.dumps(payload)))
+
+
+def test_spawn_gate_branch_is_an_allowlist_of_the_spawn_operation(built):
+    from synapse.persistence import agent_tasks as at
+    w = built
+    gate = "5" * 64  # stands in for a multi-repo task's full spec hash
+    requester = DaemonApprovalRequester(w.db)
+
+    def request(op, target="repos", policy="1", key=None):
+        return requester.request_approval(run_id=w.run_id, operation=op, target=target, candidate_sha256=gate,
+                                          policy_version=policy, expires_at=_expiry(),
+                                          idempotency_key=key or "gate-" + op, correlation_id="c")
+    # deploy and deploy-like names never use the spawn-gate branch, even when an approval_step names them
+    for n, op in enumerate(("deploy", "DEPLOY", "Deploy", "deploy:DEV", "deploy.DEV", "agent.run.deploy")):
+        _spawn_gate_event(w, {"operation": op, "target": "repos", "policy_version": "1", "candidate_sha256": gate}, n)
+        with pytest.raises(sqlite3.DatabaseError, match="live candidate manifest"):
+            request(op)
+    _spawn_gate_event(w, {"operation": at.MULTI_REPO_SPAWN_OPERATION, "target": "repos", "policy_version": "1",
+                          "candidate_sha256": gate}, 99)
+    # target or policy differing from the recorded approval_step is refused
+    with pytest.raises(sqlite3.DatabaseError, match="live candidate manifest"):
+        request(at.MULTI_REPO_SPAWN_OPERATION, target="other", key="t")
+    with pytest.raises(sqlite3.DatabaseError, match="live candidate manifest"):
+        request(at.MULTI_REPO_SPAWN_OPERATION, policy="2", key="p")
+    assert request(at.MULTI_REPO_SPAWN_OPERATION).response["state"] == "requested"
+
+
+def test_spawn_gate_trigger_and_code_name_the_same_operation(built):
+    from synapse.persistence import agent_tasks as at
+    w = built
+    (sql,) = w.db.execute("SELECT sql FROM sqlite_master WHERE name='approval_multi_repo_binding'").fetchone()
+    assert "NEW.operation = '%s'" % at.MULTI_REPO_SPAWN_OPERATION in sql and "<> 'deploy'" not in sql
+    # the spec parser refuses a multi-repository approval_step with any other operation
+    def spec(op):
+        t = {k: v for k, v in w.task(approval_step={"operation": op, "target": "repos", "policy_version": "1"}).items()
+             if k != "id"}
+        t["permission_mode"] = "acceptEdits"
+        return at.parse_task_specs({"edit": t}, operator_tools=("Read", "Edit"), max_timeout=60,
+                                   state_dir=str(w.state), bindings_sha256="7" * 64)
+    assert spec(at.MULTI_REPO_SPAWN_OPERATION).specs["edit"]["approval_step"]["operation"] == "agent.run"
+    for op in ("deploy", "DEPLOY", "deploy:DEV"):
+        with pytest.raises(at.AgentSpecError, match="must be 'agent.run'"):
+            spec(op)
+        with pytest.raises(Exception, match="specification was rejected"):  # the service answers 422
+            w.start(w.request([w.task(approval_step={"operation": op, "target": "repos"})]), key="bad-" + op)
+
+
+def test_decision_refuses_a_target_or_policy_mismatch(built):
+    w = built
+    sha = w.builder.build(w.run_id)["manifest_sha256"]
+    aid = request_manifest_approval(w.builder, DaemonApprovalRequester(w.db), manifest_sha256=sha, operation="deploy",
+                                   target="DEV", policy_version="1", idempotency_key="k1",
+                                   correlation_id="c").response["approval_id"]
+    service = ApprovalService(w.db, Humans())
+    base = dict(approval_id=aid, expected_version=0, decision="approved", operation="deploy", target="DEV",
+                candidate_sha256=sha, policy_version="1", correlation_id="c")
+    for n, change in enumerate(({"target": "PROD"}, {"policy_version": "2"}, {"operation": "DEPLOY"})):
+        with pytest.raises(StateConflict, match="binding differs"):
+            service.decide("approver", **{**base, **change, "idempotency_key": "m%d" % n})
+    assert service.decide("approver", **base, idempotency_key="ok").response["state"] == "approved"
+    args = dict(approval_id=aid, run_id=w.run_id, operation="deploy", target="DEV", candidate_sha256=sha,
+                policy_version="1")
+    for change in ({"target": "PROD"}, {"policy_version": "2"}):
+        with pytest.raises(ApprovalNotGranted):
+            verify_approval_for_execution(w.db, **{**args, **change})
