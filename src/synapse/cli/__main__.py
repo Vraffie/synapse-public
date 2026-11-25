@@ -5,6 +5,7 @@ import argparse
 import base64
 from datetime import datetime, timedelta, timezone
 import getpass
+import hashlib
 import http.client
 import json
 import os
@@ -382,6 +383,41 @@ def _runs_command(args) -> int:
     return 0
 
 
+_RESTARTABLE = ("recovering", "failed", "cancelled", "succeeded")
+
+
+def _restart_command(args, parser) -> int:
+    """New run from an old one's recorded request. The prompt is stored only as a hash, so it is passed again and checked."""
+    if not args.run_id or len(args.run_id) > 256 or "/" in args.run_id:
+        parser.error("run ID must be a nonempty path segment up to 256 characters")
+    try:
+        old = _request(args.state_dir, "/api/v1/runs/" + quote(args.run_id, safe="") + "/agent")
+        tasks = old.get("tasks") or []
+        if old.get("run_state") not in _RESTARTABLE or len(tasks) != 1:
+            print("agentctl: only a finished or recovering single-task agent run can be restarted", file=sys.stderr)
+            return 1
+        spec = tasks[0]["spec"]
+        prompt = _read_prompt(args.prompt_file)
+        if hashlib.sha256(prompt.encode("utf-8")).hexdigest() != spec["prompt_sha256"] and not args.allow_changed_prompt:
+            print("agentctl: the prompt differs from the old run's prompt (use --allow-changed-prompt to accept)", file=sys.stderr)
+            return 1
+        body = {"repo": spec["repo"], "base_ref": spec["base_ref"], "prompt": prompt, "allowed_tools": spec["allowed_tools"],
+                "permission_mode": spec["permission_mode"], "timeout_seconds": spec["timeout_seconds"]}
+        step = spec.get("approval_step")
+        if isinstance(step, dict) and step.get("operation") and step.get("target"):
+            body["approval_step"] = {k: step[k] for k in ("operation", "target", "ttl_seconds") if step.get(k) is not None}
+        print("old run %s is %s; its worktree change: %s" % (args.run_id, old["run_state"],
+              ((old.get("worktree") or {}).get("diff_stat") or "none recorded").strip()), file=sys.stderr)
+        result = _request(args.state_dir, "/api/v1/agent-runs", body=json.dumps(body, ensure_ascii=True).encode("utf-8"),
+                          idempotency_key=args.idempotency_key or str(uuid.uuid4()),
+                          correlation_id=args.correlation_id or str(uuid.uuid4()))
+    except (OSError, ValueError, RuntimeError, KeyError, http.client.HTTPException) as exc:
+        print(f"agentctl: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
 _PRUNE_AGE = re.compile(r"([1-9][0-9]{0,4})([hd])")
 _PRUNE_STATES = ("succeeded", "failed", "cancelled")
 
@@ -498,6 +534,14 @@ def _add_agent_parsers(commands) -> None:
     prune.add_argument("--older-than", default="7d", metavar="AGE",
                        help="minimum time since the run last changed, such as 12h or 7d (default 7d)")
     prune.add_argument("--dry-run", action="store_true", help="list what would be removed and remove nothing")
+    restart = commands.add_parser("agent-restart", help="start a NEW run with the same repo, base ref, tools and limits as a "
+                                  "stuck or finished single-task agent run (the old run is not touched)")
+    restart.add_argument("run_id")
+    restart.add_argument("--prompt-file", required=True,
+                         help="the prompt again (file, or - for stdin); it must match the old run's stored SHA-256")
+    restart.add_argument("--allow-changed-prompt", action="store_true", help="accept a prompt that differs from the old one")
+    restart.add_argument("--idempotency-key", type=_command_header)
+    restart.add_argument("--correlation-id", type=_command_header)
     commit = commands.add_parser("agent-worktree-commit", help="commit a FINISHED real agent run's edits onto its own "
                                  "branch (host-side; the sandboxed agent cannot commit; never touches your checkout)")
     commit.add_argument("run_id")
@@ -784,6 +828,8 @@ def main(argv: list[str] | None = None) -> int:
         return _runs_command(args)
     if args.command == "agent-worktree-prune":
         return _prune_command(args)
+    if args.command == "agent-restart":
+        return _restart_command(args, parser)
     if args.command in ("profiles", "profile-cooldown"):
         return _profile_command(args, parser)
     if args.command in ("agent-start", "agent-show", "agent-cancel", "agent-abandon", "agent-worktree-remove",
