@@ -41,6 +41,8 @@ Limits: the fingerprint is computed from the migrations shipped with the code, s
 3. Moves the current `synapse.sqlite` and any `-wal`/`-shm` to `synapse.sqlite.pre-restore-<UTC time>-<random>[-wal|-shm]`. The previous database is kept, never deleted; remove it yourself once satisfied.
 4. Publishes the restored file as `synapse.sqlite` (0600).
 
+Exact result cache rows (`result_cache`, migration 0020) are restored as they are in the backup: restore does not invalidate them, and entries recorded after the snapshot are gone. Nothing reads the cache at runtime yet; invalidating every entry on restore is listed as not done in [exact-cache-logic.md](exact-cache-logic.md).
+
 Stop the daemon first (the lock check is a safety net, not a substitute). On start the daemon applies any newer migrations to an older restored database as usual. Restoring a backup from a newer version of the code is refused; upgrade the code instead.
 
 ## Artifact blobs
