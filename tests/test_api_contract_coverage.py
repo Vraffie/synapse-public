@@ -166,7 +166,7 @@ def stubs():
             "diffs": [{"repo_id": "portfolio", "diff": "d", "truncated": False}]}),
         "recheck_manifest": _manifest_stub({"run_id": "r1", "manifest_sha256": SHA, "valid": True, "invalidations": []}),
         "request_manifest_approval": lambda run_id, *a, **k: (_manifest_stub(None)(run_id), _result({
-            "approval_id": "a1", "run_id": "r1", "manifest_sha256": SHA, "operation": "deploy", "target": "DEV",
+            "approval_id": "a1", "run_id": "r1", "manifest_sha256": SHA, "operation": "deploy", "target": "STAGING",
             "state": "requested", "state_version": 0, "expires_at": TS}))[1],
         "remove_agent_worktree": lambda run_id, force: {"run_id": run_id, "removed": True,
                                                         "tasks": [{"task_id": "t", "removed": True}]},
@@ -318,7 +318,7 @@ CASES[("/api/v1/approvals/{approval_id}/decision", "post")] = {
 MANIFESTS = "/api/v1/runs/{run_id}/candidate-manifests"
 for _route, _body_, _cb in (((MANIFESTS, "post"), {}, "build_manifest"),
                             ((MANIFESTS + "/{manifest_sha256}/recheck", "post"), None, "recheck_manifest"),
-                            ((MANIFESTS + "/{manifest_sha256}/approval", "post"), {"environment": "DEV"},
+                            ((MANIFESTS + "/{manifest_sha256}/approval", "post"), {"environment": "STAGING"},
                              "request_manifest_approval")):
     _cases = _post_cases(_route[0], _body_, _cb, 200, conflict=AgentRunError(409, "baseline_moved"), blank=True)
     _cases[404] = ({_cb: raising(RunNotFound())}, _cmd(_route[0].replace("{run_id}", "r1").replace("{manifest_sha256}", SHA), _body_))

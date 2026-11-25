@@ -16,6 +16,7 @@ import uuid
 from urllib.parse import quote, urlencode
 
 from synapse.persistence.migrations import default_migrations_dir
+from synapse.persistence.approval_environment import ALLOWED_ENVIRONMENTS
 
 _TOKEN = re.compile(rb"[A-Za-z0-9_-]{43}")
 _MAX_RESPONSE = 16 * 1024 * 1024
@@ -474,7 +475,8 @@ def _add_manifest_parsers(commands) -> None:
                                   "the owner decides it with approval-decide")
     common(approve)
     approve.add_argument("manifest_sha256", type=_sha256_arg)
-    approve.add_argument("--environment", required=True, choices=("DEV", "STAGING"))
+    approve.add_argument("--environment", required=True, choices=sorted(ALLOWED_ENVIRONMENTS),
+                         help="an ADR 022 allowlisted environment (" + ", ".join(sorted(ALLOWED_ENVIRONMENTS)) + ")")
     approve.add_argument("--policy-version", default="1")
     approve.add_argument("--ttl-seconds", type=_integer(1, 3600), default=3600)
 
@@ -499,8 +501,9 @@ def _manifest_command(args, parser) -> int:
             sources = {}
             for item in args.source:
                 task, _, attempt = item.partition("=")
-                if not task or not attempt.isdecimal() or int(attempt) < 1 or task in sources:
-                    parser.error("--source must be TASK=ATTEMPT (attempt 1 or more), once per task")
+                if (not task or not attempt.isdecimal() or not 1 <= int(attempt) <= 2**31 - 1 or task in sources
+                        or re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", task) is None):
+                    parser.error("--source must be TASK=ATTEMPT (attempt 1 to 2**31-1), once per task")
                 sources[task] = int(attempt)
             result = post(base, {"sources": sources} if sources else {})
         elif args.command == "manifest-list":

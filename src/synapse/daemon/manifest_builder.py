@@ -17,7 +17,9 @@ Step 1 runs again after publishing and before the row is indexed, so a baseline 
 it. ``recheck`` repeats 1 and 3 for an existing manifest and records ``candidate_invalid`` when the candidate no
 longer passes. It runs when a deploy approval is requested (``request_manifest_approval``) and MUST run in the
 deploy pre-check (D9 step 2); the approval decision does NOT call it and refuses only on recorded invalidations. A git failure that proves nothing (git missing, timeout)
-refuses without invalidating. Everything here is blocking (git) and must run off the event loop.
+refuses without invalidating. Everything here is blocking (git) and must run off the event loop; a builder uses its
+connection only from the thread that opened it (the daemon's ``ManifestService`` makes one per call, in a worker
+thread, on a private connection).
 """
 from __future__ import annotations
 

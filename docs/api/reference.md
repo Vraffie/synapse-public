@@ -1591,9 +1591,7 @@ Example:
 
 ```json
 {
-  "sources": {
-    "key": 1
-  }
+  "sources": {}
 }
 ```
 
@@ -1876,7 +1874,7 @@ Request Manifest Approval.
 
 | Field | Required | Constraints |
 | --- | --- | --- |
-| `environment` | yes | ["DEV", "STAGING"] |
+| `environment` | yes | ["STAGING"] |
 | `policy_version` | no | string, pattern=`^[A-Za-z0-9._-]{1,64}$`, default="1" |
 | `ttl_seconds` | no | integer, min=1, max=3600, default=3600 |
 
@@ -1884,7 +1882,7 @@ Example:
 
 ```json
 {
-  "environment": "DEV",
+  "environment": "STAGING",
   "policy_version": "1",
   "ttl_seconds": 3600
 }
@@ -1902,7 +1900,7 @@ Success (or idempotent replay of an earlier command).
   "run_id": "string",
   "manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
   "operation": "deploy",
-  "target": "DEV",
+  "target": "STAGING",
   "state": "string",
   "state_version": 1,
   "expires_at": "string"

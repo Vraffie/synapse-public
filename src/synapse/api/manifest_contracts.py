@@ -1,4 +1,5 @@
 """Response schemas of the candidate manifest routes (see manifest_commands.py); merged into RESPONSES."""
+from synapse.persistence.approval_environment import ALLOWED_ENVIRONMENTS
 
 
 def _object(properties):
@@ -30,6 +31,6 @@ MANIFEST_RESPONSES = {
         "invalidations": {"type": "array", "maxItems": 0}})),
     (_BASE + "/{manifest_sha256}/approval", "post"): (200, _object({
         "approval_id": _STRING, "run_id": _STRING, "manifest_sha256": _SHA, "operation": {"type": "string", "const": "deploy"},
-        "target": {"type": "string", "enum": ["DEV", "STAGING"]}, "state": _STRING, "state_version": _INTEGER,
+        "target": {"type": "string", "enum": sorted(ALLOWED_ENVIRONMENTS)}, "state": _STRING, "state_version": _INTEGER,
         "expires_at": _STRING})),
 }

@@ -8,15 +8,16 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Awaitable, Callable
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, HTTPException, Path, Request, Security
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from synapse.api.agent_commands import AgentRunError
 from synapse.api.workflow_commands import _body, _COMMAND_HEADERS, _headers
+from synapse.persistence.approval_environment import ALLOWED_ENVIRONMENTS
 from synapse.persistence.idempotency import IdempotencyConflict
 from synapse.persistence.run_snapshot import RunNotFound
 from synapse.persistence.state_store import StateConflict
@@ -29,7 +30,11 @@ RecheckManifest = Callable[[str, str], dict | Awaitable[dict]]
 # (run_id, manifest_sha256, environment, policy_version, ttl_seconds, idempotency_key, correlation_id) -> CommandResult
 RequestApproval = Callable[..., object | Awaitable[object]]
 
-ENVIRONMENTS = ("DEV", "STAGING")
+# The ADR 022 allowlist, and nothing else: widening it (for example to DEV) is its own reviewed change there.
+ENVIRONMENTS = tuple(sorted(ALLOWED_ENVIRONMENTS))
+MAX_ATTEMPT_NO = 2**31 - 1
+TaskId = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9._:-]{1,128}$")]
+AttemptNo = Annotated[int, Field(ge=1, le=MAX_ATTEMPT_NO)]
 _SHA = Path(pattern=r"^[0-9a-f]{64}$")
 _RUN = Path(min_length=1, max_length=256)
 
@@ -37,13 +42,14 @@ _RUN = Path(min_length=1, max_length=256)
 class BuildRequest(BaseModel):
     """``sources`` optionally names ``{writer_task_id: attempt_no}``; by default each writer's latest completed attempt."""
     model_config = ConfigDict(extra="forbid")
-    sources: dict[str, int] | None = Field(default=None, max_length=6)
+    sources: dict[TaskId, AttemptNo] | None = Field(default=None, max_length=6)
 
 
 class ApprovalRequestBody(BaseModel):
-    """The operation is always ``deploy`` (ADR 026 D9); the target is the environment."""
+    """The operation is always ``deploy`` (ADR 026 D9); the target is the environment, one of ADR 022's
+    ``ALLOWED_ENVIRONMENTS``. The ADR 022 environment binding itself is not written here (deploy slice)."""
     model_config = ConfigDict(extra="forbid")
-    environment: Literal["DEV", "STAGING"]
+    environment: Literal[ENVIRONMENTS] = Field(json_schema_extra={"enum": list(ENVIRONMENTS)})  # type: ignore[valid-type]
     policy_version: str = Field(default="1", strict=True, pattern=r"^[A-Za-z0-9._-]{1,64}$")
     ttl_seconds: int = Field(default=3600, strict=True, ge=1, le=3600)
 

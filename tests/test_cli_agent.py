@@ -335,11 +335,13 @@ def test_manifest_commands_send_the_documented_routes(calls):
     assert run("manifest-show", "run-1", sha) == 0 and calls[-1] == (base + "/" + sha, {})
     assert run("manifest-recheck", "run-1", sha) == 0
     assert calls[-1][0] == base + "/" + sha + "/recheck" and calls[-1][1]["body"] == b"" and calls[-1][1]["idempotency_key"]
-    assert run("manifest-approve", "run-1", sha, "--environment", "DEV") == 0
+    assert run("manifest-approve", "run-1", sha, "--environment", "STAGING") == 0
     endpoint, kw = calls[-1]
     assert endpoint == base + "/" + sha + "/approval"
-    assert json.loads(kw["body"]) == {"environment": "DEV", "policy_version": "1", "ttl_seconds": 3600}
+    assert json.loads(kw["body"]) == {"environment": "STAGING", "policy_version": "1", "ttl_seconds": 3600}
     for bad in (["manifest-show", "run-1", "XYZ"], ["manifest-approve", "run-1", sha, "--environment", "PROD"],
+                ["manifest-approve", "run-1", sha, "--environment", "DEV"],
+                ["manifest-build", "run-1", "--source", "t1=%d" % 2**31],
                 ["manifest-build", "run-1", "--source", "t1"], ["manifest-build", "run-1", "--source", "t1=0"],
                 ["manifest-build", "../x"]):
         n = len(calls)

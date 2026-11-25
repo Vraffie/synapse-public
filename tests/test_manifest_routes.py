@@ -2,12 +2,14 @@
 Real git in tmp_path, the fake CLI of test_multi_repo_runs, the real ManifestService; no real claude, no network."""
 import asyncio
 import json
+import time
 
 import httpx
 import pytest
 
+from synapse.api.agent_commands import AgentRunError
 from synapse.api.app import create_app
-from synapse.application.approval_requests import DaemonApprovalRequester
+from synapse.application.approval_requests import DaemonApprovalRequester, approval_id_for
 from synapse.daemon import manifest_builder as mb
 from synapse.daemon.manifest_builder import ManifestBuilder
 from synapse.daemon.manifest_service import ManifestService
@@ -19,7 +21,7 @@ from test_multi_repo_runs import World, git
 
 TOKEN = "m" * 43
 PROMPT = {"mode": "ok", "writes": {"portfolio": {"config.xml": "<p/>\n"}, "product-config": {"deep/x.xml": "<x/>\n"}}}
-APPROVAL = {"environment": "DEV"}
+APPROVAL = {"environment": "STAGING"}
 BASE = "/api/v1/runs/%s/candidate-manifests"
 
 
@@ -91,7 +93,7 @@ def test_build_list_show_recheck_and_approval(w):
         asked = await c.post(BASE % w.run_id + "/" + sha + "/approval", headers=headers("deploy-1"), json=APPROVAL)
         assert asked.status_code == 200, asked.text
         out = asked.json()
-        assert (out["operation"], out["target"], out["manifest_sha256"], out["state"]) == ("deploy", "DEV", sha, "requested")
+        assert (out["operation"], out["target"], out["manifest_sha256"], out["state"]) == ("deploy", "STAGING", sha, "requested")
         replay = await c.post(BASE % w.run_id + "/" + sha + "/approval", headers=headers("deploy-1"), json=APPROVAL)
         assert replay.json()["approval_id"] == out["approval_id"] and replay.headers["idempotency-replayed"] == "true"
         return out
@@ -172,8 +174,8 @@ def test_approval_body_is_strict(w):
     sha = build(w).json()["manifest_sha256"]
 
     async def go(c):
-        for body in ({}, {"environment": "PRODUCTION"}, {"environment": "DEV", "operation": "agent.run"},
-                     {"environment": "DEV", "ttl_seconds": 7200}, {"environment": "DEV", "policy_version": "a b"}):
+        for body in ({}, {"environment": "PRODUCTION"}, {"environment": "STAGING", "operation": "agent.run"},
+                     {"environment": "STAGING", "ttl_seconds": 7200}, {"environment": "STAGING", "policy_version": "a b"}):
             r = await c.post(BASE % w.run_id + "/" + sha + "/approval", headers=headers(), json=body)
             assert r.status_code == 422, body
         r = await c.post(BASE % w.run_id + "/" + sha + "/recheck", headers=headers(), json={"x": 1})
@@ -263,3 +265,140 @@ def test_recheck_of_a_moved_baseline_records_it(w):
         assert json.dumps(r.json()).count(w.root) == 0
     drive(w, go)
     assert store.invalidations(w.db, sha) == ["baseline_moved"]
+
+
+# ------------------------------------------------------------------------------- security review regressions
+def post_approval(c, w, sha, key, body):
+    return c.post(BASE % w.run_id + "/" + sha + "/approval", headers=headers(key), json=body)
+
+
+def test_dev_environment_is_refused_until_the_allowlist_has_it(w):
+    sha = build(w).json()["manifest_sha256"]
+
+    async def go(c):
+        r = await post_approval(c, w, sha, "dev", {"environment": "DEV"})
+        assert r.status_code == 422, r.text
+    drive(w, go)
+    assert w.db.execute("SELECT count(*) FROM approval_requests").fetchone()[0] == 0
+
+
+def test_service_refuses_an_environment_outside_the_allowlist(w):
+    # the service checks the ADR 022 allowlist itself, not only the route schema
+    sha = build(w).json()["manifest_sha256"]
+    service = ManifestService(w.db, w.builder, DaemonApprovalRequester(w.db))
+    with pytest.raises(AgentRunError) as caught:
+        asyncio.run(service.request_approval(w.run_id, sha, "DEV", "1", 3600, "dev", "trace"))
+    assert (caught.value.status, caught.value.message) == (422, "Invalid approval request")
+    assert w.db.execute("SELECT count(*) FROM approval_requests").fetchone()[0] == 0
+
+
+def test_replay_of_an_invalidated_manifest_approval_is_refused(w):
+    sha = build(w).json()["manifest_sha256"]
+
+    async def ask(c):
+        return await post_approval(c, w, sha, "r1", APPROVAL)
+    assert drive(w, ask).status_code == 200
+    w.builder.invalidate(sha, "candidate_invalid")
+    r = drive(w, ask)
+    assert (r.status_code, detail(r)) == (409, "manifest_invalidated")
+    assert r.headers.get("idempotency-replayed") is None
+
+
+def test_same_key_with_another_ttl_conflicts(w):
+    sha = build(w).json()["manifest_sha256"]
+
+    async def go(c):
+        a = await post_approval(c, w, sha, "a1", {"environment": "STAGING", "ttl_seconds": 3600})
+        same = await post_approval(c, w, sha, "a1", {"environment": "STAGING", "ttl_seconds": 3600})
+        other = await post_approval(c, w, sha, "a1", {"environment": "STAGING", "ttl_seconds": 5})
+        default = await post_approval(c, w, sha, "a1", {"environment": "STAGING"})  # default ttl is 3600
+        return a, same, other, default
+    a, same, other, default = drive(w, go)
+    assert a.status_code == 200 and same.status_code == 200 and same.headers["idempotency-replayed"] == "true"
+    assert same.json()["expires_at"] == a.json()["expires_at"]
+    assert (other.status_code, detail(other)) == (409, "Idempotency key conflicts with prior request")
+    assert default.status_code == 200 and default.json()["approval_id"] == a.json()["approval_id"]
+
+
+def test_manifest_approval_keys_cannot_collide_with_spawn_gate_keys(w):
+    sha = build(w).json()["manifest_sha256"]
+    key = "gate:" + w.task_id
+
+    async def go(c):
+        return await post_approval(c, w, sha, key, APPROVAL)
+    r = drive(w, go)
+    assert r.status_code == 200, r.text
+    approval_id = r.json()["approval_id"]
+    assert approval_id == approval_id_for(w.run_id, "manifest:" + key)
+    assert approval_id != approval_id_for(w.run_id, key)  # the id the spawn gate of this task would use
+
+
+def test_sources_are_bounded(w):
+    async def go(c):
+        out = []
+        for sources in ({w.task_id: 2**70}, {w.task_id: 2**31}, {w.task_id: 0}, {w.task_id: -1},
+                        {"x" * 129: 1}, {"bad task": 1}, {"": 1}):
+            r = await c.post(BASE % w.run_id, headers=headers(), json={"sources": sources})
+            out.append((r.status_code, detail(r)))
+        ok = await c.post(BASE % w.run_id, headers=headers(), json={"sources": {w.task_id: 2**31 - 1}})
+        return out, ok
+    out, ok = drive(w, go)
+    assert out == [(422, "Invalid request body")] * len(out)
+    assert (ok.status_code, detail(ok)) == (422, "no_source_attempt")  # in range, just not an attempt that exists
+
+
+def test_git_runs_off_the_event_loop(w, monkeypatch):
+    sha = build(w).json()["manifest_sha256"]
+    original = w.manager.commit_is_ancestor
+
+    def slow(*a, **k):
+        time.sleep(1.0)
+        return original(*a, **k)
+    monkeypatch.setattr(w.manager, "commit_is_ancestor", slow)
+
+    async def go(c):
+        ticks = []
+
+        async def ticker():
+            start = time.monotonic()
+            for _ in range(30):
+                await asyncio.sleep(0.05)
+                ticks.append(time.monotonic() - start)
+        t = asyncio.create_task(ticker())
+        await asyncio.sleep(0.06)
+        r = await c.post(BASE % w.run_id + "/" + sha + "/recheck", headers=headers("rc"))
+        await t
+        return r, max(b - a for a, b in zip(ticks, ticks[1:]))
+    r, gap = drive(w, go)
+    assert r.status_code == 200, r.text
+    assert gap < 0.5  # a blocked loop would show a gap of about one second
+
+
+def test_request_deadline_is_503_and_the_lock_serialises(w, monkeypatch):
+    sha = build(w).json()["manifest_sha256"]
+    original = w.manager.commit_is_ancestor
+    running, overlap = [0], [False]
+
+    def slow(*a, **k):
+        running[0] += 1
+        overlap[0] = overlap[0] or running[0] > 1
+        try:
+            time.sleep(0.6)
+            return original(*a, **k)
+        finally:
+            running[0] -= 1
+    monkeypatch.setattr(w.manager, "commit_is_ancestor", slow)
+    service = ManifestService(w.db, w.builder, DaemonApprovalRequester(w.db), deadline_seconds=0.3)
+
+    async def main():
+        first = asyncio.create_task(service.recheck(w.run_id, sha))
+        await asyncio.sleep(0.05)
+        second = asyncio.create_task(service.recheck(w.run_id, sha))
+        results = await asyncio.gather(first, second, return_exceptions=True)
+        while service._lock.locked():  # the timed-out thread still holds the lock until git returns
+            await asyncio.sleep(0.05)
+        return results
+    results = asyncio.run(main())
+    assert [(e.status, e.message) for e in results] == [(503, "candidate_unverifiable:deadline")] * 2
+    assert overlap[0] is False
+    assert store.invalidations(w.db, sha) == []  # a deadline proves nothing: nothing is recorded
