@@ -46,6 +46,10 @@ Set 2026-11-25. This track comes before any other open item. The goal is that th
 5. Per-profile concurrency limit. Only needed if agents run in parallel; skip it otherwise.
 6. A short daily-use document: start, stop, backup and restore, and what to do after a crash.
 
+Step 0 status (2026-11-25): PR #52 (manifest routes) merged, PR #43 closed as superseded by `main`'s ADR 026, backlog checked against the code (no stale checkboxes found; independent review enforcement stays open because ADR 025 is not wired into the daemon). PR #44 is being rebased onto migration 0020.
+
+Step 1 result (2026-11-25): one real Claude Code 2.1.332 edit run on a scratch repository (default profile, `acceptEdits`, tools Read/Glob/Grep/Edit, timeout 300 s) ran start, spawn, edit, `succeeded`, then `agent-worktree-commit`, in about 15 seconds with no manual database or process fixes; the operator token was not in the daemon log or the start output (those two files only). Not covered: the approval-gated path, timeout and cancel (step 2), and review (ADR 025 is not wired). Claude 2.1.332 worked, a data point for the supported-version item; the documented range and fixture are still open. The daemon state directory must be short enough for a Unix socket (`AF_UNIX path too long` otherwise, visible only in the daemon log); note it in the daily-use document.
+
 Known open item found while preparing this track: `tests/test_desktop_live_daemon.py::test_cancelled_run_is_shown_as_stopped` errored in a full-suite run on the PR #44 branch. The cause is not yet known and it is not yet checked against `main`.
 
 ## M0 — Architecture baseline (this repository)
