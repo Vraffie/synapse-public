@@ -76,3 +76,45 @@ def agent_subject(db: sqlite3.Connection, read_blob: BlobReader | None, run_id: 
                 "prompt_preview_truncated": truncated, "prompt_unavailable": unavailable,
                 "spec_sha256": candidate_sha256}
     return None
+
+
+def manifest_subject(db: sqlite3.Connection, read_blob: BlobReader | None, run_id: str,
+                     candidate_sha256: str) -> dict[str, Any] | None:
+    """The subject for an approval bound to a v2 candidate manifest of ``run_id`` (ADR 026 D9), or None when the
+    hash is not a manifest of that run. Shows every repository's pinned baseline and, for write repositories, the
+    candidate commit and change size, plus any invalidation. The repositories come from the stored, hash-verified
+    manifest bytes (null with ``manifest_unavailable`` when they cannot be read); never paths or file names."""
+    from synapse.application.candidate_manifest_v2 import manifest_v2_from_bytes
+    from synapse.persistence import candidate_manifests as cm
+    try:
+        if not cm.tables_present(db):
+            return None
+        record = cm.load_manifest(db, candidate_sha256)
+        if record is None or record.run_id != run_id:
+            return None
+        reasons = cm.invalidations(db, candidate_sha256)
+    except Exception:
+        return None
+    repos, unavailable = None, True
+    if read_blob is not None:
+        try:
+            manifest = manifest_v2_from_bytes(read_blob(candidate_sha256))
+            if manifest.manifest_sha256 == candidate_sha256 and manifest.run_id == run_id:
+                repos = [{"repo_id": r.repo_id, "access": r.access, "baseline_ref": r.baseline_ref,
+                          "baseline_sha": r.baseline_sha, "candidate_sha": r.candidate_sha,
+                          "changed_paths": r.changed_paths, "diff_bytes": r.diff_bytes} for r in manifest.repos]
+                unavailable = False
+        except Exception:
+            repos, unavailable = None, True
+    return {"kind": "candidate_manifest", "manifest_sha256": candidate_sha256, "seq": record.seq,
+            "bindings_sha256": record.bindings_sha256, "invalidated": reasons, "repos": repos,
+            "manifest_unavailable": unavailable}
+
+
+def approval_subject(db: sqlite3.Connection, read_blob: BlobReader | None, run_id: str, candidate_sha256: str, *,
+                     with_prompt: bool = True) -> dict[str, Any] | None:
+    """A candidate-manifest subject when the approval binds a manifest of the run, else the agent-run subject."""
+    found = manifest_subject(db, read_blob, run_id, candidate_sha256)
+    if found is not None:
+        return found
+    return agent_subject(db, read_blob, run_id, candidate_sha256, with_prompt=with_prompt)

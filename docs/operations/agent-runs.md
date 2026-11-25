@@ -82,6 +82,33 @@ task shows the approval subject kind `agent_run_multi` (repositories, access, pi
 (`evidence_multi_repo_unsupported`) until per-repository evidence lands. Single-repository runs are unchanged
 (operator-requested commit, no bindings rows).
 
+#### Candidate manifest v2 (ADR 026 D8, migration 0019)
+
+After a multi-repository run, the daemon (`daemon/manifest_builder.py`, `ManifestBuilder.build(run_id,
+sources=None)`; the HTTP route and `agentctl` command are B's lane) builds one manifest binding every repository
+of the run: read repositories with their pinned baseline, write repositories with the candidate commit, the
+source attempt, the diff hash and size, the changed-path count and the two passed validations. Steps, each a
+refusal with a fixed code: the pinned baselines are re-resolved, before collecting and again after publishing and before
+the row is indexed (`baseline_moved` invalidates every manifest the run already has; once one manifest carries
+it, the database refuses any new manifest of the run even if the ref is moved back: start a new run. A run with
+no manifest yet records nothing and refuses every build while the ref differs from the pinned SHA); each writer task's latest `completed` attempt
+(or the one named in `sources`) must have `done`/`unchanged` for every repository it writes (`no_source_attempt`,
+`candidate_invalid:commit_incomplete`); the commit rule is re-run on `diff-tree baseline candidate` from the
+object store (`candidate_invalid:<reason>`); at least one repository must differ (`no_changes`). Diffs over
+60,000 bytes are refused (`candidate_invalid:diff_too_large`). The bytes go to the artifact store and a row to
+`candidate_manifests`; the same candidates always give the same `manifest_sha256`.
+
+In a multi-repository run every approval must bind either a live manifest of the run (the only form a `deploy`
+approval can take) or a task's recorded `agent_run_multi` approval step; the database refuses anything else.
+The spawn-gate form is allowlisted to the operation `agent.run` (a multi-repository `approval_step` with any
+other operation is refused with 422). `ManifestBuilder.recheck` repeats the baseline and candidate checks and
+records `candidate_invalid` when the candidate no longer passes; it runs when a deploy approval is requested and
+must run in the deploy pre-check (ADR 026 D9 step 2), which is mandatory. The approval decision does **not**
+re-run git: it refuses only on invalidations already recorded. An invalidated manifest (matched by
+`manifest_sha256` alone) is refused at request, at decision (`manifest_invalidated`, also enforced by a trigger)
+and at execution (`verify_approval_for_execution` denies `manifest_invalidated`). Approvals bound to a manifest show
+the subject kind `candidate_manifest` (per-repository baseline and candidate commits, invalidation reasons).
+
 Invalid values abort startup before any state is touched. Without `repos`/`worktree_root` (or with
 `enabled: false`, or no config) `POST /api/v1/agent-runs` returns **503** "Agent runs are not
 configured"; read and cancel endpoints still work for existing runs.
@@ -316,5 +343,7 @@ reviewed yet.
 Tests use a fake executable. The opt-in `SYNAPSE_REAL_CLAUDE=1 python scripts/demo_agent.py` runs a
 read-only prompt (tools Read/Glob/Grep) and an approval-gated variant against a throwaway repo with the
 real `claude`; it consumes a small amount of Claude CLI subscription usage. Default `python scripts/demo_agent.py` uses the fake.
-Only one run at a time (shared with mock runs). No resume of `recovering` agent runs exists yet; only never-spawned attempts are re-queued at restart (ADR 024, `attempts_resumed` in `agent-show`). Finished worktrees are removed on request (above), never
+Known limit: `commit_range_diff` checks the repository config and then runs `git diff` in a separate call, so
+a same-uid process that rewrites `.git/config` in between is not caught (the diff hash is still re-checked on
+every recheck). Only one run at a time (shared with mock runs). No resume of `recovering` agent runs exists yet; only never-spawned attempts are re-queued at restart (ADR 024, `attempts_resumed` in `agent-show`). Finished worktrees are removed on request (above), never
 automatically.

@@ -13,6 +13,7 @@ from synapse.domain.approvals import ApprovalChange, ApprovalState
 from synapse.persistence.audit_chain import append_audit, flush_anchors
 from synapse.domain.contracts import ApprovalId, validate_id
 from synapse.persistence.approval_store import _timestamp, write_approval_request, write_approval_transition
+from synapse.persistence.candidate_manifests import is_invalidated as is_manifest_invalidated
 from synapse.persistence.idempotency import CommandResult, execute_idempotent
 from synapse.persistence.state_store import StateConflict
 
@@ -199,6 +200,9 @@ class ApprovalService:
             def write(db):
                 if _timestamp(row[5]) <= datetime.now(timezone.utc):
                     raise StateConflict("Approval expired")
+                if decision == "approved" and is_manifest_invalidated(db, row[3]):
+                    # ADR 026 D9: an invalidated candidate manifest can never be approved (a 0019 trigger agrees).
+                    raise StateConflict("manifest_invalidated")
                 change = ApprovalChange(ApprovalId(approval_id), ApprovalState.REQUESTED, ApprovalState(decision), expected_version)
                 version = write_approval_transition(db, change, principal=_principal(actor), reason=reason,
                                                     candidate_sha256=candidate_sha256, policy_version=policy_version)
