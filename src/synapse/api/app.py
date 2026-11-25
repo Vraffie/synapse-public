@@ -57,7 +57,7 @@ def create_app(*, token: str, read_events: EventReader, poll_seconds: float = 0.
     if poll_seconds <= 0:
         raise ValueError("poll_seconds must be positive")
     expected = ("Bearer " + token).encode("ascii")
-    app = FastAPI(title="Synapse local API", version="0.1.0", docs_url=None, redoc_url=None)
+    app = FastAPI(title="Synapse local API", version="0.9.0", docs_url=None, redoc_url=None)
 
     codes = {400: "bad_request", 401: "unauthorized", 403: "forbidden", 404: "not_found",
              405: "method_not_allowed", 409: "conflict", 413: "request_too_large",
